@@ -1,0 +1,9 @@
+.env
+.state.json
+.sessions.json
+.venv/
+__pycache__/
+*.pyc
+hook_fallback.py
+*.log
+test_hook_probe*.txt
