@@ -170,6 +170,19 @@ class SessionManager:
         self._claude_id_map[claude_session_id] = session.sid
         self._persist()
 
+    def detach_terminal(self, sid: str):
+        s = self._sessions.pop(sid, None)
+        if not s:
+            return
+        if s.topic_id and self._topic_map.get(s.topic_id) == sid:
+            del self._topic_map[s.topic_id]
+        if s.cwd and self._cwd_map.get(s.cwd) == sid:
+            del self._cwd_map[s.cwd]
+        if (s.claude_session_id
+                and self._claude_id_map.get(s.claude_session_id) == sid):
+            del self._claude_id_map[s.claude_session_id]
+        self._persist()
+
     def register_terminal(self, claude_session_id: str, topic_id: int,
                           cwd: str = "") -> Session:
         existing_sid = self._claude_id_map.get(claude_session_id)
@@ -397,6 +410,9 @@ class SessionManager:
         if etype in ("system", "init"):
             sid = event.get("session_id") or event.get("sessionId")
             if sid and sid != session.claude_session_id:
+                old = session.claude_session_id
+                if old and self._claude_id_map.get(old) == session.sid:
+                    del self._claude_id_map[old]
                 session.claude_session_id = sid
                 self._claude_id_map[sid] = session.sid
                 self._persist()
@@ -433,6 +449,9 @@ class SessionManager:
         elif etype == "result":
             sid = event.get("session_id") or event.get("sessionId")
             if sid and sid != session.claude_session_id:
+                old = session.claude_session_id
+                if old and self._claude_id_map.get(old) == session.sid:
+                    del self._claude_id_map[old]
                 session.claude_session_id = sid
                 self._claude_id_map[sid] = session.sid
 
