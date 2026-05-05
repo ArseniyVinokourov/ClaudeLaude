@@ -1,9 +1,43 @@
+# Secrets / runtime state
 .env
 .state.json
 .sessions.json
+
+# Python
 .venv/
 __pycache__/
 *.pyc
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.python-version
+
+# Project-specific
 hook_fallback.py
 *.log
 test_hook_probe*.txt
+temp/
+
+# Distribution artifacts
+*.tar.gz
+*.zip
+
+# Local Claude Code settings (per-developer)
+.claude/settings.local.json
+
+# IDE / editors
+.idea/
+.vscode/
+*.swp
+*.swo
+.*.swp
+.*.swo
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
+desktop.ini
