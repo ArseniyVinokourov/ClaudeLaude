@@ -45,6 +45,35 @@ What it does
    session, so Claude's own slash commands keep working.
 
 
+Next to Claude Cowork
+---------------------
+
+Cowork is Anthropic's GUI-automation agent for office work — files,
+spreadsheets, browser tasks. This bot is a different tool for a
+different person: a developer who lives in Claude Code and wants to
+keep driving sessions when stepping away from the keyboard.
+
+What this offers that Cowork doesn't:
+
+ - Telegram as the front-end. Already on every phone, no extra app,
+   no regional or app-store gating around Anthropic's mobile client.
+ - No added subscription. Reuses the Claude Code plan you already
+   pay for.
+ - True locality. Code never leaves the machine. Sessions are plain
+   JSONL in ~/.claude/projects, resumable from the terminal at any
+   point.
+ - Your Claude Code setup, mobile-accessible. Hooks, MCP servers,
+   sub-agents, slash commands, CLAUDE.md, skills — your whole local
+   configuration travels with the bot.
+ - Forum-Topic multi-session UI. One topic per project, swipe
+   between them; built for parallel sessions on a phone screen.
+ - Source you can change.
+
+Who it's for: a developer running Claude Code on a workstation who
+wants a phone-side cockpit for it. For GUI automation, browser
+workflows, or enterprise admin — that's Cowork.
+
+
 Quick install
 -------------
 

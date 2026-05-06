@@ -96,7 +96,7 @@ def _md_table_to_list(text: str) -> str:
                 title = f"**{header[0]} {val}**"
             else:
                 title = f"**{val}**"
-            details = [f"  {h}: {v}" for h, v in zip(header[1:], row[1:])]
+            details = [f"  {h}: {v}" for h, v in zip(header[1:], row[1:], strict=False)]
             result.append(title + "\n" + "\n".join(details))
         return "\n\n".join(result)
     return _MD_TABLE_RE.sub(_replace, text)
@@ -775,44 +775,72 @@ def _topic_url(topic_id):
 def cmd_sessions(chat_id, thread_id=None):
     all_sessions = [s for s in mgr._sessions.values()
                     if s.claude_session_id and s.topic_id]
-    all_sessions.sort(key=lambda s: s.started, reverse=True)
+    all_sessions.sort(key=lambda s: (not s.alive, -s.started))
     if not all_sessions:
         if not thread_id:
             _ephemeral(chat_id, "No sessions.", seconds=5)
         else:
             tg.send("No sessions.", chat_id, thread_id=thread_id)
         return
-    rows = []
-    for s in all_sessions:
-        age = int(time.time() - s.started)
-        mins = age // 60
+    blocks = []
+    buttons = []
+    now = time.time()
+    for i, s in enumerate(all_sessions):
+        age = int(now - s.started)
+        if age < 60:
+            age_str = "just now"
+        elif age < 3600:
+            age_str = f"{age // 60}m ago"
+        elif age < 86400:
+            age_str = f"{age // 3600}h ago"
+        else:
+            age_str = f"{age // 86400}d ago"
         icon = "\U0001f7e2" if s.alive else "⏹"
+        num = i + 1
         name = s.name if len(s.name) <= 25 else s.name[:22] + "…"
-        label = f"{icon} {name}"
+        blocks.append(
+            f"<b>{num}.</b> {icon} {tg.esc(name)} · <i>{age_str}</i>"
+        )
+        btn_label = f"{num}. {name}"
+        if len(btn_label) > 25:
+            btn_label = btn_label[:22] + "…"
         if s.claude_session_id:
-            rows.append([{"text": label, "callback_data": f"fork:{s.sid}"}])
+            buttons.append({"text": btn_label,
+                            "callback_data": f"fork:{s.sid}"})
         else:
             url = _topic_url(s.topic_id) if s.topic_id else None
             if url:
-                rows.append([{"text": label, "url": url}])
+                buttons.append({"text": btn_label, "url": url})
             else:
-                rows.append([{"text": label, "callback_data": "noop"}])
+                buttons.append({"text": btn_label,
+                                "callback_data": "noop"})
+    rows = [buttons[j:j+3] for j in range(0, len(buttons), 3)]
+    text = "\U0001f4cb <b>Sessions</b>\n\n" + "\n\n".join(blocks)
     if not thread_id:
-        mid = tg.send("\U0001f4cb <b>Sessions</b>", chat_id, buttons=rows)
+        mid = tg.send(text, chat_id, buttons=rows)
         if mid:
             def _cleanup():
                 time.sleep(15)
                 tg.delete(mid, chat_id)
             threading.Thread(target=_cleanup, daemon=True).start()
     else:
-        tg.send("\U0001f4cb <b>Sessions</b>", chat_id,
-                thread_id=thread_id, buttons=rows)
+        tg.send(text, chat_id, thread_id=thread_id, buttons=rows)
+
+
+_MD_INLINE = re.compile(r"[*_`]")
+
+
+def _strip_md(s: str) -> str:
+    """Strip leading markdown markers and inline emphasis chars from a preview."""
+    s = re.sub(r"^[#>\-*\s]+", "", s)
+    s = _MD_INLINE.sub("", s)
+    return " ".join(s.split())
 
 
 def _discover_resumable_sessions(limit=10):
     active_ids = {s.claude_session_id for s in mgr._sessions.values()
                   if s.alive and s.claude_session_id}
-    found = []
+    raw = []
     try:
         for d in os.listdir(CLAUDE_PROJECTS_DIR):
             proj_dir = os.path.join(CLAUDE_PROJECTS_DIR, d)
@@ -838,15 +866,28 @@ def _discover_resumable_sessions(limit=10):
                                 msg = obj.get("message", {})
                                 if isinstance(msg, dict):
                                     c = msg.get("content", "")
-                                    if isinstance(c, str) and c:
-                                        first_msg = c[:80]
+                                    if isinstance(c, list):
+                                        c = "".join(
+                                            b.get("text", "") for b in c
+                                            if isinstance(b, dict)
+                                            and b.get("type") == "text"
+                                        )
+                                    if isinstance(c, str) and c.strip():
+                                        first_msg = _strip_md(c)[:80]
                                 break
                 except Exception:
                     continue
                 if cwd and os.path.isdir(cwd):
-                    found.append((sid, cwd, first_msg, mtime))
+                    raw.append((sid, cwd, first_msg, mtime))
     except Exception:
         pass
+    # Dedup by (cwd, first_msg) — keep newest mtime per group
+    seen: dict[tuple, tuple] = {}
+    for sid, cwd, first_msg, mtime in raw:
+        key = (cwd, first_msg or "")
+        if key not in seen or mtime > seen[key][3]:
+            seen[key] = (sid, cwd, first_msg, mtime)
+    found = list(seen.values())
     found.sort(key=lambda x: x[3], reverse=True)
     return found[:limit]
 
@@ -856,7 +897,7 @@ def _do_resume(claude_session_id: str, chat_id, thread_id=None):
     if not fid:
         return
     existing = mgr.by_claude_session_id(claude_session_id)
-    if existing and existing.alive:
+    if existing and existing.alive and existing.is_bot_spawned:
         url = _topic_url(existing.topic_id) if existing.topic_id else None
         if url:
             _reply(chat_id, thread_id,
@@ -866,6 +907,8 @@ def _do_resume(claude_session_id: str, chat_id, thread_id=None):
             _reply(chat_id, thread_id,
                    f"ℹ️ Already active: <b>{tg.esc(existing.name)}</b>")
         return
+    if existing and not existing.is_bot_spawned:
+        mgr.detach_terminal(existing.sid)
     cwd = _resolve_session_cwd(claude_session_id)
     if not cwd or not os.path.isdir(cwd):
         _reply(chat_id, thread_id,
@@ -886,7 +929,7 @@ def _do_resume(claude_session_id: str, chat_id, thread_id=None):
     if not topic_id:
         _ephemeral(fid, "❌ Failed to create topic.", seconds=7)
         return
-    session = mgr.resume(claude_session_id, topic_id, name, cwd)
+    mgr.resume(claude_session_id, topic_id, name, cwd)
     send_to_topic(topic_id,
                   f"▶️ Resumed session\n"
                   f"cwd: <code>{tg.esc(cwd)}</code>\n"
@@ -914,12 +957,14 @@ def cmd_resume(args: str, chat_id, thread_id=None):
     pick_id = str(time.time_ns())[-10:]
     with state.lock:
         state.pending_resume_picks[pick_id] = sessions
-    lines = []
+    blocks = []
     buttons = []
     now = time.time()
-    for i, (sid, cwd, first_msg, mtime) in enumerate(sessions):
+    for i, (_sid, cwd, first_msg, mtime) in enumerate(sessions):
         age = now - mtime
-        if age < 3600:
+        if age < 60:
+            age_str = "just now"
+        elif age < 3600:
             age_str = f"{int(age/60)}m ago"
         elif age < 86400:
             age_str = f"{int(age/3600)}h ago"
@@ -932,16 +977,18 @@ def cmd_resume(args: str, chat_id, thread_id=None):
             if len(first_msg) > 50:
                 hint += "…"
         num = i + 1
-        lines.append(f"<b>{num}.</b> {tg.esc(proj)} ({age_str})")
+        head = f"<b>{num}.</b> {tg.esc(proj)} · <i>{age_str}</i>"
         if hint:
-            lines.append(f"   <i>{tg.esc(hint)}</i>")
+            blocks.append(f"{head}\n    <i>{tg.esc(hint)}</i>")
+        else:
+            blocks.append(head)
         btn_label = f"{num}. {proj}"
         if len(btn_label) > 25:
             btn_label = btn_label[:22] + "…"
         buttons.append({"text": btn_label,
                         "callback_data": f"r:{pick_id}:{i}"})
     rows = [buttons[j:j+3] for j in range(0, len(buttons), 3)]
-    text = "▶️ <b>Resume session:</b>\n\n" + "\n".join(lines)
+    text = "▶️ <b>Resume</b>\n\n" + "\n\n".join(blocks)
     mid = _reply(chat_id, thread_id, text, buttons=rows)
     if not thread_id and mid and chat_id:
         def _cleanup():
@@ -1316,6 +1363,12 @@ def _sync_pinned_help():
             set_pinned_help_id(None)
         else:
             return
+    # Convention: General has exactly one pinned message (this help).
+    # Clear everything before pinning the fresh one.
+    try:
+        tg._req("unpinAllChatMessages", {"chat_id": fid})
+    except Exception:
+        pass
     msg_id = tg.send(_PINNED_TEXT, fid, buttons=_MENU_ROWS)
     if msg_id:
         tg.pin(msg_id, fid)

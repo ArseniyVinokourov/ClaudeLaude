@@ -1,0 +1,21 @@
+target-version = "py310"
+line-length = 120
+
+[lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "W",   # pycodestyle warnings
+    "B",   # bugbear (likely-bug patterns)
+    "UP",  # pyupgrade (modern syntax)
+]
+ignore = [
+    "E501",  # line too long (we set 120, leave room for occasional overflow)
+    "E402",  # module-level import not at top (sometimes needed)
+    "E731",  # lambda assignment
+    "B008",  # function call in default arg
+    "B904",  # raise from in except (project doesn't bother)
+]
+
+[lint.per-file-ignores]
+"version.py" = ["UP032"]
