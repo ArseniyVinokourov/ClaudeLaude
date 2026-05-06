@@ -27,10 +27,34 @@ jobs:
 
       - name: Compute version
         id: ver
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
-          v=$(python version.py)
-          if [ -z "$v" ]; then
-            echo "::error::version.py returned empty"
+          # Read MAJOR from VERSION file
+          raw=$(cat VERSION 2>/dev/null | tr -d '[:space:]')
+          if [[ "$raw" == *.* ]]; then
+            # Distribution build with full version baked in — use as-is
+            v="$raw"
+          else
+            major="${raw:-0}"
+            minor=$(git rev-list --count main)
+
+            # Extract PR number from the squash commit subject ("... (#NN)")
+            subj=$(git log -1 --format='%s')
+            pr_num=$(printf '%s' "$subj" | grep -oE '\(#[0-9]+\)' | tail -1 | tr -d '(#)')
+
+            if [ -n "$pr_num" ]; then
+              patch=$(gh api "/repos/$REPO/pulls/$pr_num" --jq '.commits' 2>/dev/null || echo 0)
+            else
+              patch=0
+            fi
+
+            v="$major.$minor.$patch"
+          fi
+
+          if [ -z "$v" ] || [ "$v" = ".." ]; then
+            echo "::error::Failed to compute version (raw=$raw)"
             exit 1
           fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
