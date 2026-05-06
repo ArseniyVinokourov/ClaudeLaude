@@ -31,3 +31,4 @@ Telegram bot (ClaudeLaude) that provides a Forum Topics UI for Claude Code. Each
 ## Git
 - Commit messages in English, present tense.
 - One logical change per commit.
+- Branch names use a category prefix: `feat/`, `fix/`, `ui/`, `chore/`, `ops/`, `security/`, `docs/`, `refactor/`. Example: `fix/permissions-lifecycle`, `feat/resume-picker`. Same prefix shows up as `[prefix]` tag on each item in the project TODO list.
