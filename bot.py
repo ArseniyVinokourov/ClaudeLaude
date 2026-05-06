@@ -173,6 +173,10 @@ def _format_status(turn: TurnState) -> str:
     return f"⚙️ <code>{tg.esc(last)}</code> — {ts}"
 
 
+def _interrupt_button(session):
+    return [[{"text": "⏹ Interrupt", "callback_data": f"int:{session.sid}"}]]
+
+
 def _update_status(session, turn: TurnState):
     fid = forum()
     if not fid or not session.topic_id:
@@ -180,10 +184,11 @@ def _update_status(session, turn: TurnState):
     text = _format_status(turn)
     if text == turn._last_status_text:
         return
+    btn = _interrupt_button(session)
     if turn.status_msg_id:
-        tg.edit(turn.status_msg_id, text, fid)
+        tg.edit(turn.status_msg_id, text, fid, buttons=btn)
     else:
-        mid = tg.send(text, fid, thread_id=session.topic_id)
+        mid = tg.send(text, fid, thread_id=session.topic_id, buttons=btn)
         if mid:
             turn.status_msg_id = mid
     turn._last_status_text = text
@@ -219,7 +224,7 @@ def _turn_timer(session, turn: TurnState):
         if mid and fid:
             text = _format_status(turn)
             if text != turn._last_status_text:
-                tg.edit(mid, text, fid)
+                tg.edit(mid, text, fid, buttons=_interrupt_button(session))
                 turn._last_status_text = text
         if fid and session.topic_id:
             tg.send_chat_action(fid, thread_id=session.topic_id)
@@ -286,7 +291,8 @@ def on_assistant(session, text):
         ids = tg.send_long(text, fid, thread_id=session.topic_id, markdown=True)
         turn.msg_ids.extend(ids)
         turn.msg_texts.append(text)
-        mid = tg.send(_format_status(turn), fid, thread_id=session.topic_id)
+        mid = tg.send(_format_status(turn), fid, thread_id=session.topic_id,
+                      buttons=_interrupt_button(session))
         turn.status_msg_id = mid
 
 
@@ -445,7 +451,8 @@ def on_thinking(session):
         return
     turn = _get_turn(session)
     if turn._timer_thread is None:
-        mid = tg.send("⏳ 0:00", fid, thread_id=session.topic_id)
+        mid = tg.send("⏳ 0:00", fid, thread_id=session.topic_id,
+                      buttons=_interrupt_button(session))
         turn.status_msg_id = mid
         tg.send_chat_action(fid, thread_id=session.topic_id)
         t = threading.Thread(
@@ -522,7 +529,7 @@ def _resolve_hook_session(claude_session_id, data):
     label = (f"\U0001f517 {dirname} #{n} — {ts}" if n > 1
              else f"\U0001f517 {dirname} — {ts}")
     try:
-        topic_id = tg.create_forum_topic(fid, label, icon_color=0x8EEE98)
+        topic_id = tg.create_forum_topic(fid, label, icon_color=0x6FB9F0)
         _log(f"created topic {topic_id}")
     except Exception as e:
         _log(f"create_forum_topic FAILED: {e}")
@@ -1137,6 +1144,30 @@ def cmd_stop(session, chat_id, thread_id):
     tg.send("⏹ Session stopped.", chat_id, thread_id=thread_id)
 
 
+def cmd_interrupt(session, chat_id, thread_id):
+    if not session:
+        if not thread_id:
+            _ephemeral(chat_id, "Send this in a session topic.", seconds=5)
+        else:
+            tg.send("Send this in a session topic.", chat_id, thread_id=thread_id)
+        return
+    if not session.is_bot_spawned:
+        tg.send("ℹ️ Terminal session — interrupt from terminal (Ctrl-C).",
+                chat_id, thread_id=thread_id)
+        return
+    _do_interrupt(session, chat_id, thread_id)
+
+
+def _do_interrupt(session, chat_id, thread_id):
+    if not mgr.interrupt(session.sid):
+        _ephemeral(chat_id, "Nothing to interrupt.",
+                   thread_id=thread_id, seconds=5)
+        return
+    _cancel_session_perms(session.sid, "interrupted")
+    _ephemeral(chat_id, "⏹ Turn interrupted.",
+               thread_id=thread_id, seconds=5)
+
+
 def cmd_restart(chat_id, thread_id):
     if not thread_id:
         fid = forum()
@@ -1332,6 +1363,7 @@ _HELP_TEXT = (
     "/resume &lt;id&gt; — continue by session id\n"
     "/stop — stop current session\n"
     "/restart — restart stopped session\n"
+    "/interrupt — abort current turn (session stays alive)\n"
     "\n"
     "<b>In topic</b>\n"
     "/history [N] — last N events (default 30)\n"
@@ -1351,12 +1383,12 @@ _HELP_TEXT = (
 
 _KNOWN_COMMANDS = {
     "/setup", "/new", "/sessions", "/resume", "/history", "/stop",
-    "/restart", "/usage", "/display", "/test_perm",
+    "/interrupt", "/restart", "/usage", "/display", "/test_perm",
     "/stop_bot", "/help", "/start", "/menu",
 }
 
 _HELP_DOCUMENTED_COMMANDS = {
-    "/new", "/sessions", "/resume", "/stop", "/restart",
+    "/new", "/sessions", "/resume", "/stop", "/interrupt", "/restart",
     "/history", "/usage", "/display",
     "/menu", "/help", "/stop_bot",
 }
@@ -1650,6 +1682,8 @@ def _handle_command(cmd, args, chat_id, thread_id, session):
         cmd_history(session, chat_id, thread_id, args)
     elif cmd == "/stop":
         cmd_stop(session, chat_id, thread_id)
+    elif cmd == "/interrupt":
+        cmd_interrupt(session, chat_id, thread_id)
     elif cmd == "/restart":
         cmd_restart(chat_id, thread_id)
     elif cmd == "/usage":
@@ -1684,6 +1718,13 @@ def _handle_callback(cb, data):
     cb_chat = cb.get("message", {}).get("chat", {}).get("id")
     cb_msg = cb.get("message", {}).get("message_id")
     cb_thread = cb.get("message", {}).get("message_thread_id")
+
+    if data.startswith("int:"):
+        sid = data[4:]
+        session = mgr._sessions.get(sid)
+        if session:
+            _do_interrupt(session, cb_chat, cb_thread)
+        return
 
     if data.startswith("p:"):
         parts = data.split(":")
