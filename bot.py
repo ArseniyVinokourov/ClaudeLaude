@@ -48,7 +48,8 @@ class TurnState:
 class BotState:
     def __init__(self):
         self.lock = threading.Lock()
-        self.pending_permissions: dict[str, int] = {}
+        # short_id -> (msg_id, chat_id, sid_or_None)
+        self.pending_permissions: dict[str, tuple[int, int, str | None]] = {}
         self.perm_key_map: dict[str, str] = {}
         self.pending_project_picks: dict[str, list[str]] = {}
         self.pending_resume_picks: dict[str, list[tuple]] = {}
@@ -558,6 +559,71 @@ def _invalidate_session(session):
     mgr._persist()
 
 
+def _cancel_session_perms(sid: str, reason: str):
+    """Cancel pending permission requests tied to a session.
+
+    Edits the Allow/Deny message to "✗ Cancelled — {reason}", schedules
+    deletion, and unblocks the hook handler with deny so it can return.
+    """
+    with state.lock:
+        victims = [
+            (short_id, msg_id, chat_id)
+            for short_id, (msg_id, chat_id, p_sid)
+            in list(state.pending_permissions.items())
+            if p_sid == sid
+        ]
+        for short_id, _, _ in victims:
+            state.pending_permissions.pop(short_id, None)
+    for short_id, msg_id, chat_id in victims:
+        full_id = None
+        with state.lock:
+            full_id = state.perm_key_map.pop(short_id, None)
+        try:
+            tg.edit(msg_id, f"✗ Cancelled — {tg.esc(reason)}", chat_id)
+        except Exception as e:
+            print(f"[cancel_perm] edit failed: {e}",
+                  file=sys.stderr, flush=True)
+        def _delete_later(mid=msg_id, cid=chat_id):
+            time.sleep(5)
+            tg.delete(mid, cid)
+        threading.Thread(target=_delete_later, daemon=True).start()
+        if full_id:
+            bridge.abandon_permission(full_id)
+
+
+def _invalidate_and_stop(session, reason: str):
+    """Topic gone → clean up turn, stop session, drop maps.
+
+    Order matters: mgr.stop() fires the on_session_stop callback (which
+    cancels pending perms) only while the session is still in the
+    manager's tables.  _invalidate_session() removes the entry, so it has
+    to come last.
+    """
+    sid = session.sid
+    print(f"[lifecycle] invalidate_and_stop sid={sid} reason={reason}",
+          file=sys.stderr, flush=True)
+    with state.lock:
+        turn = state.turns.pop(sid, None)
+    if turn:
+        _end_turn(turn)
+    mgr.stop(sid, reason=reason)
+    _invalidate_session(session)
+
+
+def _valid_topic_id(session) -> int | None:
+    """Return session's topic_id only if it looks like a real session topic.
+
+    Filters out None, 0, and General (id 1) so a permission request can
+    never land in the General topic.
+    """
+    if not session:
+        return None
+    tid = session.topic_id
+    if not tid or tid == 1:
+        return None
+    return tid
+
+
 def on_hook_permission(req_id, data):
     try:
         claude_session_id = (data.get("session_id")
@@ -581,51 +647,62 @@ def on_hook_permission(req_id, data):
             detail = tg.esc(raw)
 
         short_id = req_id[-12:]
+        body = f"<b>{tg.esc(tool)}</b>\n<code>{detail}</code>"
+        buttons = [[
+            {"text": "✅ Allow", "callback_data": f"p:{short_id}:a"},
+            {"text": "❌ Deny", "callback_data": f"p:{short_id}:d"},
+        ]]
 
-        topic_id = session.topic_id if session else None
-        chat_id = forum() if topic_id else OWNER_ID
-
-        msg_id = tg.send(
-            f"<b>{tg.esc(tool)}</b>\n<code>{detail}</code>",
-            chat_id, thread_id=topic_id,
-            buttons=[[
-                {"text": "✅ Allow", "callback_data": f"p:{short_id}:a"},
-                {"text": "❌ Deny", "callback_data": f"p:{short_id}:d"},
-            ]],
-        )
+        topic_id = _valid_topic_id(session)
+        msg_id = None
+        chat_id = None
+        if topic_id:
+            chat_id = forum()
+            msg_id = tg.send(body, chat_id, thread_id=topic_id,
+                             buttons=buttons)
 
         if msg_id is None and session and topic_id:
             print(f"[resolve] stale topic {topic_id}, recreating",
                   file=sys.stderr, flush=True)
-            _invalidate_session(session)
+            _invalidate_and_stop(session, "topic gone")
             session = _resolve_hook_session(claude_session_id, data)
-            topic_id = session.topic_id if session else None
-            chat_id = forum() if topic_id else OWNER_ID
-            msg_id = tg.send(
-                f"<b>{tg.esc(tool)}</b>\n<code>{detail}</code>",
-                chat_id, thread_id=topic_id,
-                buttons=[[
-                    {"text": "✅ Allow", "callback_data": f"p:{short_id}:a"},
-                    {"text": "❌ Deny", "callback_data": f"p:{short_id}:d"},
-                ]],
-            )
+            topic_id = _valid_topic_id(session)
+            if topic_id:
+                chat_id = forum()
+                msg_id = tg.send(body, chat_id, thread_id=topic_id,
+                                 buttons=buttons)
 
+        if msg_id is None:
+            # No valid topic anywhere — fall back to OWNER DM so the user
+            # can still decide.  Never leak into General.
+            cwd = data.get("cwd", "?")
+            print(f"[perm] no topic, falling back to DM — tool={tool} "
+                  f"cwd={cwd} sid={claude_session_id}",
+                  file=sys.stderr, flush=True)
+            chat_id = OWNER_ID
+            topic_id = None
+            msg_id = tg.send(
+                f"⚠️ <i>no topic</i>\n"
+                f"<b>{tg.esc(tool)}</b>\n<code>{detail}</code>\n"
+                f"cwd: <code>{tg.esc(cwd)}</code>",
+                OWNER_ID, buttons=buttons,
+            )
+            if msg_id is None:
+                # DM also failed — last resort: abandon, claude decides.
+                print("[perm] DM fallback failed; abandoning",
+                      file=sys.stderr, flush=True)
+                bridge.abandon_permission(req_id)
+                return
+
+        sid = session.sid if session else None
         with state.lock:
             state.perm_key_map[short_id] = req_id
-            if msg_id:
-                state.pending_permissions[short_id] = msg_id
+            state.pending_permissions[short_id] = (msg_id, chat_id, sid)
 
         bridge.set_perm_context(req_id, chat_id=chat_id, topic_id=topic_id)
 
     except Exception as e:
         print(f"hook permission error: {e}", file=sys.stderr, flush=True)
-
-
-def on_perm_warning(req_id, ctx):
-    chat_id = ctx.get("chat_id")
-    topic_id = ctx.get("topic_id")
-    if chat_id:
-        tg.send("⏰ Auto-deny in 30s", chat_id, thread_id=topic_id)
 
 
 # ── command handlers ─────────────────────────────────────────────────
@@ -1414,16 +1491,20 @@ def cmd_menu(chat_id, thread_id=None, session=None):
 
 # ── main loop ────────────────────────────────────────────────────────
 
+def _on_session_stop(session, reason: str):
+    _cancel_session_perms(session.sid, reason)
+
+
 mgr = SessionManager(
     on_assistant_message=on_assistant,
     on_result=on_result,
     on_tool_use=on_tool_use,
     on_thinking=on_thinking,
+    on_session_stop=_on_session_stop,
 )
 bridge = HookBridge(
     on_notification=on_hook_notification,
     on_permission=on_hook_permission,
-    on_perm_warning=on_perm_warning,
 )
 
 
@@ -1437,17 +1518,8 @@ def _topic_healthcheck():
         for session in mgr.list_sessions():
             if not session.topic_id:
                 continue
-            ok = tg.send_chat_action(fid, thread_id=session.topic_id)
-            if not ok:
-                print(f"[healthcheck] topic {session.topic_id} gone, "
-                      f"stopping {session.name}",
-                      file=sys.stderr, flush=True)
-                with state.lock:
-                    turn = state.turns.pop(session.sid, None)
-                if turn:
-                    _end_turn(turn)
-                _invalidate_session(session)
-                mgr.stop(session.sid)
+            if not tg.topic_alive(fid, session.topic_id):
+                _invalidate_and_stop(session, "topic deleted")
 
 
 def main():
@@ -1620,11 +1692,12 @@ def _handle_callback(cb, data):
             decision = "allow" if parts[2] == "a" else "deny"
             with state.lock:
                 full_id = state.perm_key_map.pop(short_id, short_id)
-                msg_id = state.pending_permissions.pop(short_id, None)
+                entry = state.pending_permissions.pop(short_id, None)
             bridge.resolve_permission(full_id, decision)
-            if msg_id and cb_chat:
+            if entry:
+                msg_id, perm_chat, _ = entry
                 mark = "✅" if decision == "allow" else "❌"
-                tg.edit(msg_id, f"{mark} done", cb_chat)
+                tg.edit(msg_id, f"{mark} done", perm_chat)
 
     elif data.startswith("na:"):
         pick_id = data.split(":")[1]

@@ -2,7 +2,9 @@
 
 Claude Code hooks POST JSON to localhost:HOOK_PORT.  For notifications the
 server responds immediately.  For permission requests it blocks until the
-Telegram user clicks Allow / Deny (or the timeout expires — default: deny).
+Telegram user clicks Allow / Deny, or until the bot itself cancels the
+request (session stopped, topic deleted) by calling resolve_permission().
+The bot never makes the decision on the user's behalf.
 """
 import json
 import sys
@@ -27,15 +29,13 @@ class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
 class HookBridge:
     def __init__(self,
                  on_notification: Callable,
-                 on_permission: Callable,
-                 on_perm_warning: Callable | None = None):
+                 on_permission: Callable):
         self.on_notification = on_notification
         self.on_permission = on_permission
-        self.on_perm_warning = on_perm_warning
         self._pending: dict[str, threading.Event] = {}
         self._decisions: dict[str, str] = {}
+        self._abandoned: set[str] = set()
         self._perm_context: dict[str, dict] = {}
-        self._timers: dict[str, threading.Timer] = {}
         self._server: HTTPServer | None = None
 
     def start(self):
@@ -51,15 +51,27 @@ class HookBridge:
     def resolve_permission(self, req_id: str, decision: str):
         _log(f"resolve req_id={req_id} decision={decision}")
         self._decisions[req_id] = decision
-        t = self._timers.pop(req_id, None)
-        if t:
-            t.cancel()
         event = self._pending.get(req_id)
         if event:
             event.set()
             _log(f"event set for {req_id}")
         else:
             _log(f"WARNING: no pending event for {req_id}")
+
+    def abandon_permission(self, req_id: str):
+        """Wake the handler thread without producing a decision.
+
+        Used when the bot can no longer offer the user a way to answer
+        (session stopped, topic deleted, bot shutting down).  The handler
+        closes the connection without writing a response — claude treats
+        the dropped connection however its own policy says, the bot does
+        not pick allow/deny on the user's behalf.
+        """
+        _log(f"abandon req_id={req_id}")
+        self._abandoned.add(req_id)
+        event = self._pending.get(req_id)
+        if event:
+            event.set()
 
     def _make_handler(self):
         bridge = self
@@ -120,36 +132,23 @@ class HookBridge:
                 except Exception as e:
                     _log(f"permission callback error: {e}")
 
-                # Warning timer: fires 30s before the 120s timeout
-                def _warn():
-                    if req_id in bridge._pending:
-                        ctx = bridge._perm_context.get(req_id, {})
-                        if bridge.on_perm_warning:
-                            try:
-                                bridge.on_perm_warning(req_id, ctx)
-                            except Exception as e:
-                                _log(f"perm warning error: {e}")
-
-                timer = threading.Timer(260, _warn)
-                bridge._timers[req_id] = timer
-                timer.start()
-
                 _log(f"waiting for decision req_id={req_id} ...")
-                got_signal = event.wait(timeout=290)
+                event.wait()
 
                 # Cleanup
-                t = bridge._timers.pop(req_id, None)
-                if t:
-                    t.cancel()
-                decision = bridge._decisions.pop(req_id, "deny")
+                abandoned = req_id in bridge._abandoned
+                bridge._abandoned.discard(req_id)
+                decision = bridge._decisions.pop(req_id, None)
                 bridge._pending.pop(req_id, None)
                 bridge._perm_context.pop(req_id, None)
 
-                if got_signal:
-                    _log(f"decision received: {decision}")
-                else:
-                    _log(f"TIMEOUT, auto-deny for req_id={req_id}")
+                if abandoned or decision is None:
+                    _log(f"abandoned req_id={req_id} — closing without "
+                         f"response, claude decides on its own")
+                    self.close_connection = True
+                    return
 
+                _log(f"decision received: {decision}")
                 payload = json.dumps({
                     "hookSpecificOutput": {
                         "hookEventName": "PermissionRequest",
