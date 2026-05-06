@@ -54,7 +54,10 @@ class Session:
     _proc: subprocess.Popen | None = field(default=None, repr=False)
 
 
-_PERSIST_PATH = os.path.join(os.path.dirname(__file__), ".sessions.json")
+_PERSIST_PATH = os.environ.get(
+    "BOT_SESSIONS_FILE",
+    os.path.join(os.path.dirname(__file__), ".sessions.json"),
+)
 _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
 
 
