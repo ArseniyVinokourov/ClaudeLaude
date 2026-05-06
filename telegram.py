@@ -259,6 +259,35 @@ def send_chat_action(chat_id: int, action: str = "typing",
         return False
 
 
+def topic_alive(chat_id: int, thread_id: int) -> bool:
+    """Probe whether a forum topic still exists.
+
+    sendChatAction returns OK even for deleted topics, so we use a
+    send-and-delete pair: a single zero-width character with notification
+    disabled, immediately removed.  Returns False if sendMessage rejects
+    the thread_id (the canonical "message thread not found" 400).
+    """
+    try:
+        r = _req("sendMessage", {
+            "chat_id": chat_id,
+            "message_thread_id": thread_id,
+            "text": "⁣",
+            "disable_notification": True,
+        })
+    except Exception:
+        return False
+    msg_id = r.get("result", {}).get("message_id")
+    if msg_id:
+        try:
+            _req("deleteMessage", {
+                "chat_id": chat_id,
+                "message_id": msg_id,
+            })
+        except Exception:
+            pass
+    return True
+
+
 # ── forum topics ────────────────────────────────────────────────────
 
 def poll(offset: int | None = None, timeout: int = 30) -> list[dict]:

@@ -63,11 +63,13 @@ class SessionManager:
                  on_assistant_message: Callable,
                  on_result: Callable,
                  on_tool_use: Callable,
-                 on_thinking: Callable):
+                 on_thinking: Callable,
+                 on_session_stop: Callable | None = None):
         self._on_assistant = on_assistant_message
         self._on_result = on_result
         self._on_tool_use = on_tool_use
         self._on_thinking = on_thinking
+        self._on_session_stop = on_session_stop
         self._sessions: dict[str, Session] = {}
         self._topic_map: dict[int, str] = {}
         self._cwd_map: dict[str, str] = {}
@@ -87,16 +89,23 @@ class SessionManager:
         self._persist()
         return session
 
-    def stop(self, sid: str):
+    def stop(self, sid: str, reason: str = "stopped"):
         session = self._sessions.get(sid)
         if not session:
             return
+        was_alive = session.alive
         session.alive = False
         session.stopped_at = time.time()
         session._queue.put(None)
         if session._proc and session._proc.poll() is None:
             session._proc.terminate()
         self._persist()
+        if was_alive and self._on_session_stop:
+            try:
+                self._on_session_stop(session, reason)
+            except Exception as e:
+                print(f"[session {sid}] on_stop error: {e}",
+                      file=sys.stderr, flush=True)
 
     def restart(self, sid: str) -> bool:
         session = self._sessions.get(sid)
