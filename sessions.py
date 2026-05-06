@@ -16,7 +16,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Callable
+from collections.abc import Callable
 
 _CLAUDE_BIN = (shutil.which("claude")
                or os.path.expanduser("~/.local/bin/claude"))
@@ -388,18 +388,16 @@ class SessionManager:
             proc.wait()
             session._proc = None
 
-            if session._worker_generation != gen:
+            if session._worker_generation == gen:
+                full_text = "".join(
+                    c for c in assistant_chunks if isinstance(c, str)
+                )
+                if full_text.strip():
+                    session.history.append(
+                        HistoryEntry(time.time(), "assistant", full_text))
+                self._on_result(session, full_text, "")
+            else:
                 self._on_result(session, "", "")
-                return
-
-            full_text = "".join(
-                c for c in assistant_chunks if isinstance(c, str)
-            )
-            if full_text.strip():
-                session.history.append(
-                    HistoryEntry(time.time(), "assistant", full_text))
-
-            self._on_result(session, full_text, "")
 
     def _dispatch(self, session: Session, event: dict,
                   assistant_chunks: list[str], gen: int):

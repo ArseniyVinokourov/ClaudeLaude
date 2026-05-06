@@ -10,7 +10,7 @@ import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
-from typing import Callable
+from collections.abc import Callable
 
 from config import HOOK_PORT
 
