@@ -96,7 +96,7 @@ def _md_table_to_list(text: str) -> str:
                 title = f"**{header[0]} {val}**"
             else:
                 title = f"**{val}**"
-            details = [f"  {h}: {v}" for h, v in zip(header[1:], row[1:])]
+            details = [f"  {h}: {v}" for h, v in zip(header[1:], row[1:], strict=False)]
             result.append(title + "\n" + "\n".join(details))
         return "\n\n".join(result)
     return _MD_TABLE_RE.sub(_replace, text)
@@ -929,7 +929,7 @@ def _do_resume(claude_session_id: str, chat_id, thread_id=None):
     if not topic_id:
         _ephemeral(fid, "❌ Failed to create topic.", seconds=7)
         return
-    session = mgr.resume(claude_session_id, topic_id, name, cwd)
+    mgr.resume(claude_session_id, topic_id, name, cwd)
     send_to_topic(topic_id,
                   f"▶️ Resumed session\n"
                   f"cwd: <code>{tg.esc(cwd)}</code>\n"
@@ -960,7 +960,7 @@ def cmd_resume(args: str, chat_id, thread_id=None):
     blocks = []
     buttons = []
     now = time.time()
-    for i, (sid, cwd, first_msg, mtime) in enumerate(sessions):
+    for i, (_sid, cwd, first_msg, mtime) in enumerate(sessions):
         age = now - mtime
         if age < 60:
             age_str = "just now"

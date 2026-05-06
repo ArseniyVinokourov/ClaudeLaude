@@ -1,0 +1,105 @@
+name: pr-checks
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  validate:
+    name: validate
+    runs-on: ubuntu-latest
+    env:
+      OWNER_LOGIN: ArseniyVinokourov
+      MARKER: "<!-- pr-checks-feedback -->"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install ruff
+        run: pip install ruff==0.6.9
+
+      - name: Run validation
+        id: validate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ github.head_ref }}
+          TITLE: ${{ github.event.pull_request.title }}
+          BODY: ${{ github.event.pull_request.body }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR: ${{ github.event.pull_request.number }}
+          ERRORS_FILE: ${{ runner.temp }}/pr_errors.md
+        run: |
+          chmod +x .github/scripts/pr-validate.sh
+          .github/scripts/pr-validate.sh
+          echo "errors_file=$ERRORS_FILE" >> "$GITHUB_OUTPUT"
+          if [ -s "$ERRORS_FILE" ]; then
+            echo "has_errors=true" >> "$GITHUB_OUTPUT"
+            echo "::group::Validation errors"
+            cat "$ERRORS_FILE"
+            echo "::endgroup::"
+          else
+            echo "has_errors=false" >> "$GITHUB_OUTPUT"
+            echo "All checks passed."
+          fi
+
+      - name: Post or update PR feedback comment
+        if: always() && steps.validate.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          HAS_ERRORS: ${{ steps.validate.outputs.has_errors }}
+          ERRORS_FILE: ${{ steps.validate.outputs.errors_file }}
+        run: |
+          BODY_FILE="${RUNNER_TEMP}/comment_body.md"
+
+          if [ "$HAS_ERRORS" = "true" ]; then
+            {
+              printf '%s\n' "$MARKER"
+              printf '👋 Some checks did not pass on this PR. Here is what to fix:\n'
+              cat "$ERRORS_FILE"
+              printf '\n---\n\n'
+              printf '📖 Full contributor guide: [CONTRIBUTING.md](https://github.com/%s/blob/main/CONTRIBUTING.md)\n\n' "$REPO"
+              printf '_This comment auto-updates when you push new commits._\n'
+            } > "$BODY_FILE"
+          else
+            {
+              printf '%s\n' "$MARKER"
+              printf '✅ All automated checks passed. Awaiting maintainer review.\n'
+            } > "$BODY_FILE"
+          fi
+
+          existing=$(gh api "/repos/$REPO/issues/$PR/comments" --paginate \
+            --jq ".[] | select(.body | startswith(\"$MARKER\")) | .id" | head -1)
+
+          if [ -n "$existing" ]; then
+            if gh api -X PATCH "/repos/$REPO/issues/comments/$existing" \
+                -F "body=@$BODY_FILE" >/dev/null 2>&1; then
+              echo "Updated existing feedback comment ($existing)."
+            else
+              echo "::warning::Could not update PR comment (token may be read-only for fork PRs)."
+            fi
+          else
+            if gh api -X POST "/repos/$REPO/issues/$PR/comments" \
+                -F "body=@$BODY_FILE" >/dev/null 2>&1; then
+              echo "Posted new feedback comment."
+            else
+              echo "::warning::Could not post PR comment (token may be read-only for fork PRs). Errors are visible in the workflow logs."
+            fi
+          fi
+
+      - name: Fail if errors found
+        if: steps.validate.outputs.has_errors == 'true'
+        run: |
+          echo "::error::PR validation found issues. See the bot's comment on the PR for the friendly summary, or expand 'Run validation' above for details."
+          exit 1

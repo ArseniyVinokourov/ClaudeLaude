@@ -1,5 +1,4 @@
 """Thin Telegram Bot API wrapper — module-level functions."""
-import json
 import os
 import re
 import sys
