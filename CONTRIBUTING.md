@@ -60,6 +60,7 @@ CI blocks non-maintainer PRs that touch:
 - `VERSION` — version is managed by the maintainer
 - `version.py` — version resolution logic
 - `.github/workflows/*` — CI definitions (supply-chain protection)
+- `.github/scripts/*` — CI scripts (supply-chain protection)
 - `CODEOWNERS` — review routing
 
 If you have a real reason to change one of these, open an issue first.
@@ -79,6 +80,23 @@ for f in *.sh; do bash -n "$f"; done
 pip install ruff==0.6.9
 ruff check .
 ```
+
+## Why your PR might fail CI
+
+When CI fails, a bot posts a single comment on your PR listing every issue with the exact fix. Don't panic — almost all failures are mechanical and quick to fix. The most common ones:
+
+| Failure | What to do |
+|---|---|
+| Branch name doesn't match `<prefix>/<slug>` | Rename in your fork: `git branch -m feat/your-thing && git push -u origin feat/your-thing`, then re-open the PR from the renamed branch. |
+| PR title isn't `<type>: <description>` | Edit the PR title (pencil icon next to title). |
+| Branch prefix and PR title prefix differ | Pick one and align both. |
+| `## Summary` section missing or empty | Edit the PR body — the template already has the heading; just fill it in. |
+| Owner-only files modified | Revert changes to `VERSION`, `version.py`, `.github/workflows/`, `.github/scripts/`, or `CODEOWNERS`. Open an issue if you genuinely need to change one. |
+| Python `py_compile` fails | Real syntax error somewhere — fix it locally and push again. |
+| Bash `bash -n` fails | Same as above for shell scripts. |
+| Ruff lint fails | Run `ruff check --fix .` locally; commit the auto-fixes. The remaining issues are listed in the bot comment. |
+
+The bot comment auto-updates with each push, so just keep pushing fixes and the list shrinks.
 
 ## Versioning (reference)
 

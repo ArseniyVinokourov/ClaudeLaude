@@ -6,100 +6,100 @@ on:
 
 permissions:
   contents: read
-  pull-requests: read
+  pull-requests: write
+  issues: write
 
 jobs:
   validate:
     name: validate
     runs-on: ubuntu-latest
+    env:
+      OWNER_LOGIN: ArseniyVinokourov
+      MARKER: "<!-- pr-checks-feedback -->"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Branch name follows prefix convention
-        env:
-          BRANCH: ${{ github.head_ref }}
-        run: |
-          if [[ ! "$BRANCH" =~ ^(feat|fix|ui|chore|ops|security|docs|refactor)/[a-z0-9._-]+$ ]]; then
-            echo "::error::Branch name '$BRANCH' must match <prefix>/<slug>"
-            echo "Allowed prefixes: feat/ fix/ ui/ chore/ ops/ security/ docs/ refactor/"
-            exit 1
-          fi
-
-      - name: PR title follows Conventional Commits
-        env:
-          TITLE: ${{ github.event.pull_request.title }}
-        run: |
-          if [[ ! "$TITLE" =~ ^(feat|fix|ui|chore|ops|security|docs|refactor):\ .+ ]]; then
-            echo "::error::PR title must be '<type>: <description>'"
-            echo "Got: $TITLE"
-            echo "Allowed types: feat fix ui chore ops security docs refactor"
-            exit 1
-          fi
-
-      - name: Branch prefix matches PR title prefix
-        env:
-          BRANCH: ${{ github.head_ref }}
-          TITLE: ${{ github.event.pull_request.title }}
-        run: |
-          branch_prefix="${BRANCH%%/*}"
-          title_prefix="${TITLE%%:*}"
-          if [ "$branch_prefix" != "$title_prefix" ]; then
-            echo "::error::Branch prefix '$branch_prefix' does not match PR title prefix '$title_prefix'"
-            exit 1
-          fi
-
-      - name: PR body has Summary section
-        env:
-          BODY: ${{ github.event.pull_request.body }}
-        run: |
-          if [ -z "$BODY" ]; then
-            echo "::error::PR description is empty. Use the template."
-            exit 1
-          fi
-          # Extract Summary section content (everything between "## Summary" and the next heading or EOF)
-          summary=$(printf '%s\n' "$BODY" | awk '
-            /^## Summary[[:space:]]*$/ { in_section = 1; next }
-            /^## / && in_section { exit }
-            in_section { print }
-          ')
-          # Strip whitespace and HTML comments
-          stripped=$(printf '%s' "$summary" | sed 's/<!--[^>]*-->//g' | tr -d '[:space:]')
-          if [ -z "$stripped" ]; then
-            echo "::error::PR body must contain a non-empty '## Summary' section"
-            exit 1
-          fi
-
-      - name: Owner-only files unchanged (for non-owner PRs)
-        if: github.event.pull_request.user.login != 'ArseniyVinokourov'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR: ${{ github.event.pull_request.number }}
-        run: |
-          changed=$(gh pr diff "$PR" --name-only)
-          forbidden_re='^(VERSION|version\.py|\.github/workflows/|\.github/CODEOWNERS|CODEOWNERS)'
-          if echo "$changed" | grep -qE "$forbidden_re"; then
-            echo "::error::Non-owner PR cannot modify these files:"
-            echo "$changed" | grep -E "$forbidden_re"
-            exit 1
-          fi
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
-      - name: Python syntax (py_compile)
-        run: python -m py_compile *.py
-
-      - name: Bash syntax
-        run: |
-          for f in *.sh; do
-            bash -n "$f"
-          done
-
       - name: Install ruff
         run: pip install ruff==0.6.9
 
-      - name: Ruff lint
-        run: ruff check .
+      - name: Run validation
+        id: validate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ github.head_ref }}
+          TITLE: ${{ github.event.pull_request.title }}
+          BODY: ${{ github.event.pull_request.body }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR: ${{ github.event.pull_request.number }}
+          ERRORS_FILE: ${{ runner.temp }}/pr_errors.md
+        run: |
+          chmod +x .github/scripts/pr-validate.sh
+          .github/scripts/pr-validate.sh
+          echo "errors_file=$ERRORS_FILE" >> "$GITHUB_OUTPUT"
+          if [ -s "$ERRORS_FILE" ]; then
+            echo "has_errors=true" >> "$GITHUB_OUTPUT"
+            echo "::group::Validation errors"
+            cat "$ERRORS_FILE"
+            echo "::endgroup::"
+          else
+            echo "has_errors=false" >> "$GITHUB_OUTPUT"
+            echo "All checks passed."
+          fi
+
+      - name: Post or update PR feedback comment
+        if: always() && steps.validate.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          HAS_ERRORS: ${{ steps.validate.outputs.has_errors }}
+          ERRORS_FILE: ${{ steps.validate.outputs.errors_file }}
+        run: |
+          BODY_FILE="${RUNNER_TEMP}/comment_body.md"
+
+          if [ "$HAS_ERRORS" = "true" ]; then
+            {
+              printf '%s\n' "$MARKER"
+              printf '👋 Some checks did not pass on this PR. Here is what to fix:\n'
+              cat "$ERRORS_FILE"
+              printf '\n---\n\n'
+              printf '📖 Full contributor guide: [CONTRIBUTING.md](https://github.com/%s/blob/main/CONTRIBUTING.md)\n\n' "$REPO"
+              printf '_This comment auto-updates when you push new commits._\n'
+            } > "$BODY_FILE"
+          else
+            {
+              printf '%s\n' "$MARKER"
+              printf '✅ All automated checks passed. Awaiting maintainer review.\n'
+            } > "$BODY_FILE"
+          fi
+
+          existing=$(gh api "/repos/$REPO/issues/$PR/comments" --paginate \
+            --jq ".[] | select(.body | startswith(\"$MARKER\")) | .id" | head -1)
+
+          if [ -n "$existing" ]; then
+            if gh api -X PATCH "/repos/$REPO/issues/comments/$existing" \
+                -F "body=@$BODY_FILE" >/dev/null 2>&1; then
+              echo "Updated existing feedback comment ($existing)."
+            else
+              echo "::warning::Could not update PR comment (token may be read-only for fork PRs)."
+            fi
+          else
+            if gh api -X POST "/repos/$REPO/issues/$PR/comments" \
+                -F "body=@$BODY_FILE" >/dev/null 2>&1; then
+              echo "Posted new feedback comment."
+            else
+              echo "::warning::Could not post PR comment (token may be read-only for fork PRs). Errors are visible in the workflow logs."
+            fi
+          fi
+
+      - name: Fail if errors found
+        if: steps.validate.outputs.has_errors == 'true'
+        run: |
+          echo "::error::PR validation found issues. See the bot's comment on the PR for the friendly summary, or expand 'Run validation' above for details."
+          exit 1
