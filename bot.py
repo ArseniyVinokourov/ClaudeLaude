@@ -849,10 +849,40 @@ def _topic_url(topic_id):
     return f"https://t.me/c/{short_id}/{topic_id}"
 
 
+def _session_jsonl_path(claude_sid: str) -> str | None:
+    try:
+        for d in os.listdir(CLAUDE_PROJECTS_DIR):
+            p = os.path.join(CLAUDE_PROJECTS_DIR, d, f"{claude_sid}.jsonl")
+            if os.path.isfile(p):
+                return p
+    except Exception:
+        return None
+    return None
+
+
+def _session_last_active(s) -> float:
+    if s.history:
+        return s.history[-1].ts
+    if s.claude_session_id:
+        p = _session_jsonl_path(s.claude_session_id)
+        if p:
+            try:
+                return os.path.getmtime(p)
+            except OSError:
+                pass
+    return s.started
+
+
+def _short_cwd(cwd: str, limit: int = 48) -> str:
+    if not cwd or len(cwd) <= limit:
+        return cwd or "?"
+    return "…" + cwd[-(limit - 1):]
+
+
 def cmd_sessions(chat_id, thread_id=None):
     all_sessions = [s for s in mgr._sessions.values()
                     if s.claude_session_id and s.topic_id]
-    all_sessions.sort(key=lambda s: (not s.alive, -s.started))
+    all_sessions.sort(key=lambda s: (not s.alive, -_session_last_active(s)))
     if not all_sessions:
         if not thread_id:
             _ephemeral(chat_id, "No sessions.", seconds=5)
@@ -863,7 +893,7 @@ def cmd_sessions(chat_id, thread_id=None):
     buttons = []
     now = time.time()
     for i, s in enumerate(all_sessions):
-        age = int(now - s.started)
+        age = int(now - _session_last_active(s))
         if age < 60:
             age_str = "just now"
         elif age < 3600:
@@ -876,7 +906,8 @@ def cmd_sessions(chat_id, thread_id=None):
         num = i + 1
         name = s.name if len(s.name) <= 25 else s.name[:22] + "…"
         blocks.append(
-            f"<b>{num}.</b> {icon} {tg.esc(name)} · <i>{age_str}</i>"
+            f"<b>{num}.</b> {icon} {tg.esc(name)} · <i>{age_str}</i>\n"
+            f"    <code>{tg.esc(_short_cwd(s.cwd))}</code>"
         )
         btn_label = f"{num}. {name}"
         if len(btn_label) > 25:
@@ -914,9 +945,31 @@ def _strip_md(s: str) -> str:
     return " ".join(s.split())
 
 
+_RESUME_RECENT_SECONDS = 5 * 60
+
+
+def _live_claude_session_ids() -> set[str]:
+    """Sids of currently running `claude --resume <uuid>` processes."""
+    sids: set[str] = set()
+    try:
+        out = subprocess.run(
+            ["pgrep", "-af", "claude"],
+            capture_output=True, text=True, timeout=2,
+        ).stdout
+    except Exception:
+        return sids
+    for line in out.splitlines():
+        m = re.search(r"--resume\s+([0-9a-f-]{36})", line)
+        if m:
+            sids.add(m.group(1))
+    return sids
+
+
 def _discover_resumable_sessions(limit=10):
-    active_ids = {s.claude_session_id for s in mgr._sessions.values()
-                  if s.alive and s.claude_session_id}
+    bot_sids = {s.claude_session_id for s in mgr._sessions.values()
+                if s.claude_session_id}
+    live_terminal_sids = _live_claude_session_ids() - bot_sids
+    recent_cutoff = time.time() - _RESUME_RECENT_SECONDS
     raw = []
     try:
         for d in os.listdir(CLAUDE_PROJECTS_DIR):
@@ -927,19 +980,27 @@ def _discover_resumable_sessions(limit=10):
                 if not f.endswith(".jsonl") or len(f) != 42:
                     continue
                 sid = f[:-6]
-                if sid in active_ids:
+                if sid in bot_sids:
                     continue
                 path = os.path.join(proj_dir, f)
                 mtime = os.path.getmtime(path)
+                if sid not in live_terminal_sids and mtime < recent_cutoff:
+                    continue
                 cwd = None
                 first_msg = None
+                title = None
                 try:
                     with open(path) as fh:
-                        for line in fh:
+                        for i, line in enumerate(fh):
+                            if i > 50:
+                                break
                             obj = json.loads(line)
                             if not cwd:
                                 cwd = obj.get("cwd")
-                            if obj.get("type") == "user":
+                            t = obj.get("type")
+                            if t == "ai-title" and not title:
+                                title = (obj.get("aiTitle") or "").strip()
+                            elif t == "user" and not first_msg:
                                 msg = obj.get("message", {})
                                 if isinstance(msg, dict):
                                     c = msg.get("content", "")
@@ -951,19 +1012,21 @@ def _discover_resumable_sessions(limit=10):
                                         )
                                     if isinstance(c, str) and c.strip():
                                         first_msg = _strip_md(c)[:80]
+                            if title and first_msg and cwd:
                                 break
                 except Exception:
                     continue
+                desc = title or first_msg
                 if cwd and os.path.isdir(cwd):
-                    raw.append((sid, cwd, first_msg, mtime))
+                    raw.append((sid, cwd, desc, mtime))
     except Exception:
         pass
-    # Dedup by (cwd, first_msg) — keep newest mtime per group
+    # Dedup by (cwd, desc) — keep newest mtime per group
     seen: dict[tuple, tuple] = {}
-    for sid, cwd, first_msg, mtime in raw:
-        key = (cwd, first_msg or "")
+    for sid, cwd, desc, mtime in raw:
+        key = (cwd, desc or "")
         if key not in seen or mtime > seen[key][3]:
-            seen[key] = (sid, cwd, first_msg, mtime)
+            seen[key] = (sid, cwd, desc, mtime)
     found = list(seen.values())
     found.sort(key=lambda x: x[3], reverse=True)
     return found[:limit]
@@ -984,7 +1047,7 @@ def _do_resume(claude_session_id: str, chat_id, thread_id=None):
             _reply(chat_id, thread_id,
                    f"ℹ️ Already active: <b>{tg.esc(existing.name)}</b>")
         return
-    if existing and not existing.is_bot_spawned:
+    if existing:
         mgr.detach_terminal(existing.sid)
     cwd = _resolve_session_cwd(claude_session_id)
     if not cwd or not os.path.isdir(cwd):
@@ -1018,6 +1081,47 @@ def _do_resume(claude_session_id: str, chat_id, thread_id=None):
                    seconds=5)
 
 
+_RESUME_RECENT_LIMIT = 4
+
+
+def _format_age(seconds: float) -> str:
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        return f"{int(seconds/60)}m ago"
+    if seconds < 86400:
+        return f"{int(seconds/3600)}h ago"
+    return f"{int(seconds/86400)}d ago"
+
+
+def _build_resume_picker(sessions, pick_id, max_items=None):
+    show = sessions if max_items is None else sessions[:max_items]
+    blocks = []
+    rows = []
+    now = time.time()
+    for i, (_sid, cwd, desc, mtime) in enumerate(show):
+        proj = os.path.basename(cwd.rstrip("/"))
+        age_str = _format_age(now - mtime)
+        hint = ""
+        if desc:
+            hint = desc[:50].rstrip()
+            if len(desc) > 50:
+                hint += "…"
+        num = i + 1
+        head = f"<b>{num}.</b> {tg.esc(proj)} · <i>{age_str}</i>"
+        blocks.append(f"{head}\n    <i>{tg.esc(hint)}</i>" if hint else head)
+        btn_label = f"{num}. {proj}"
+        if len(btn_label) > 25:
+            btn_label = btn_label[:22] + "…"
+        rows.append([{"text": btn_label,
+                      "callback_data": f"r:{pick_id}:{i}"}])
+    if max_items is not None and len(sessions) > max_items:
+        rows.append([{"text": f"\U0001f4cb Show all ({len(sessions)})",
+                      "callback_data": f"ra:{pick_id}"}])
+    text = "▶️ <b>Resume</b>\n\n" + "\n\n".join(blocks)
+    return text, rows
+
+
 def cmd_resume(args: str, chat_id, thread_id=None):
     fid = forum()
     if not fid:
@@ -1034,38 +1138,8 @@ def cmd_resume(args: str, chat_id, thread_id=None):
     pick_id = str(time.time_ns())[-10:]
     with state.lock:
         state.pending_resume_picks[pick_id] = sessions
-    blocks = []
-    buttons = []
-    now = time.time()
-    for i, (_sid, cwd, first_msg, mtime) in enumerate(sessions):
-        age = now - mtime
-        if age < 60:
-            age_str = "just now"
-        elif age < 3600:
-            age_str = f"{int(age/60)}m ago"
-        elif age < 86400:
-            age_str = f"{int(age/3600)}h ago"
-        else:
-            age_str = f"{int(age/86400)}d ago"
-        proj = os.path.basename(cwd.rstrip("/"))
-        hint = ""
-        if first_msg:
-            hint = first_msg[:50].rstrip()
-            if len(first_msg) > 50:
-                hint += "…"
-        num = i + 1
-        head = f"<b>{num}.</b> {tg.esc(proj)} · <i>{age_str}</i>"
-        if hint:
-            blocks.append(f"{head}\n    <i>{tg.esc(hint)}</i>")
-        else:
-            blocks.append(head)
-        btn_label = f"{num}. {proj}"
-        if len(btn_label) > 25:
-            btn_label = btn_label[:22] + "…"
-        buttons.append({"text": btn_label,
-                        "callback_data": f"r:{pick_id}:{i}"})
-    rows = [buttons[j:j+3] for j in range(0, len(buttons), 3)]
-    text = "▶️ <b>Resume</b>\n\n" + "\n\n".join(blocks)
+    text, rows = _build_resume_picker(sessions, pick_id,
+                                      max_items=_RESUME_RECENT_LIMIT)
     mid = _reply(chat_id, thread_id, text, buttons=rows)
     if not thread_id and mid and chat_id:
         def _cleanup():
@@ -1725,6 +1799,15 @@ def _handle_callback(cb, data):
                     if cb_chat and cb_msg:
                         tg.delete(cb_msg, cb_chat)
                     _spawn_session(projects[idx])
+
+    elif data.startswith("ra:"):
+        pick_id = data.split(":")[1]
+        with state.lock:
+            sessions_list = state.pending_resume_picks.get(pick_id)
+        if sessions_list and cb_chat and cb_msg:
+            text, rows = _build_resume_picker(sessions_list, pick_id,
+                                              max_items=None)
+            tg.edit(cb_msg, text, cb_chat, buttons=rows)
 
     elif data.startswith("r:"):
         parts = data.split(":")
