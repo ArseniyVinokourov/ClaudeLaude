@@ -1,0 +1,105 @@
+name: pr-checks
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  validate:
+    name: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Branch name follows prefix convention
+        env:
+          BRANCH: ${{ github.head_ref }}
+        run: |
+          if [[ ! "$BRANCH" =~ ^(feat|fix|ui|chore|ops|security|docs|refactor)/[a-z0-9._-]+$ ]]; then
+            echo "::error::Branch name '$BRANCH' must match <prefix>/<slug>"
+            echo "Allowed prefixes: feat/ fix/ ui/ chore/ ops/ security/ docs/ refactor/"
+            exit 1
+          fi
+
+      - name: PR title follows Conventional Commits
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          if [[ ! "$TITLE" =~ ^(feat|fix|ui|chore|ops|security|docs|refactor):\ .+ ]]; then
+            echo "::error::PR title must be '<type>: <description>'"
+            echo "Got: $TITLE"
+            echo "Allowed types: feat fix ui chore ops security docs refactor"
+            exit 1
+          fi
+
+      - name: Branch prefix matches PR title prefix
+        env:
+          BRANCH: ${{ github.head_ref }}
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          branch_prefix="${BRANCH%%/*}"
+          title_prefix="${TITLE%%:*}"
+          if [ "$branch_prefix" != "$title_prefix" ]; then
+            echo "::error::Branch prefix '$branch_prefix' does not match PR title prefix '$title_prefix'"
+            exit 1
+          fi
+
+      - name: PR body has Summary section
+        env:
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if [ -z "$BODY" ]; then
+            echo "::error::PR description is empty. Use the template."
+            exit 1
+          fi
+          # Extract Summary section content (everything between "## Summary" and the next heading or EOF)
+          summary=$(printf '%s\n' "$BODY" | awk '
+            /^## Summary[[:space:]]*$/ { in_section = 1; next }
+            /^## / && in_section { exit }
+            in_section { print }
+          ')
+          # Strip whitespace and HTML comments
+          stripped=$(printf '%s' "$summary" | sed 's/<!--[^>]*-->//g' | tr -d '[:space:]')
+          if [ -z "$stripped" ]; then
+            echo "::error::PR body must contain a non-empty '## Summary' section"
+            exit 1
+          fi
+
+      - name: Owner-only files unchanged (for non-owner PRs)
+        if: github.event.pull_request.user.login != 'ArseniyVinokourov'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          changed=$(gh pr diff "$PR" --name-only)
+          forbidden_re='^(VERSION|version\.py|\.github/workflows/|\.github/CODEOWNERS|CODEOWNERS)'
+          if echo "$changed" | grep -qE "$forbidden_re"; then
+            echo "::error::Non-owner PR cannot modify these files:"
+            echo "$changed" | grep -E "$forbidden_re"
+            exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Python syntax (py_compile)
+        run: python -m py_compile *.py
+
+      - name: Bash syntax
+        run: |
+          for f in *.sh; do
+            bash -n "$f"
+          done
+
+      - name: Install ruff
+        run: pip install ruff==0.6.9
+
+      - name: Ruff lint
+        run: ruff check .
