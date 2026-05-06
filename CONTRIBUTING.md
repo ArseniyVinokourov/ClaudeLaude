@@ -5,10 +5,10 @@ Thanks for the interest. This is a single-maintainer project; every change ships
 ## How changes flow
 
 1. Fork the repo (or create a branch if you have write access).
-2. Branch off `pre-v1` (active dev) — not `main`.
-3. Open a PR into `pre-v1`. CI runs automatically.
+2. Branch off `main`.
+3. Open a PR into `main`. CI runs automatically.
 4. Maintainer reviews, requests changes, eventually approves and squash-merges.
-5. Releases happen by merging `pre-v1` → `main`. Each merge into `main` auto-creates a `vX.Y.Z` tag and a GitHub Release.
+5. The merge into `main` auto-creates a `vX.Y.Z` tag and a GitHub Release. Each PR = one new version.
 
 ## Branch names
 
@@ -102,8 +102,8 @@ The bot comment auto-updates with each push, so just keep pushing fixes and the 
 
 Format: `vMAJOR.MINOR.PATCH`.
 
-- `MAJOR` is read from the `VERSION` file (`0` during pre-v1 development).
-- `MINOR` = number of commits on `main`.
+- `MAJOR` is read from the `VERSION` file (`0` during pre-1.0 development).
+- `MINOR` = number of commits on `main` (so each squash-merged PR bumps it by 1).
 - `PATCH` = commits on the current branch ahead of `main` (always `0` for tagged main commits).
 
 The `version.py` module computes this; the release workflow tags every push to `main` automatically.
