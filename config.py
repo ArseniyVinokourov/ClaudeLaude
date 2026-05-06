@@ -10,7 +10,10 @@ OWNER_ID = int(os.environ["OWNER_ID"])
 PROJECTS_DIR = os.environ.get("PROJECTS_DIR", os.path.expanduser("~/Projects"))
 HOOK_PORT = int(os.environ.get("HOOK_PORT", "9853"))
 
-_STATE_FILE = os.path.join(os.path.dirname(__file__), ".state.json")
+_STATE_FILE = os.environ.get(
+    "BOT_STATE_FILE",
+    os.path.join(os.path.dirname(__file__), ".state.json"),
+)
 
 
 def _load_state() -> dict:
