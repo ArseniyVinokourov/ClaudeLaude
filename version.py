@@ -1,12 +1,20 @@
-"""Version resolution: MAJOR from VERSION file, MINOR/PATCH from git.
+"""Version resolution.
 
-Dev:  VERSION = "0"          -> "0.<commits-on-main>.<commits-ahead-of-main>"
+Dev:  VERSION = "0"          -> derived from the latest git tag
+                                ("0.M.P" exactly on a tag, "0.M.P+N" with N
+                                commits past the tag)
 Dist: VERSION = "0.42.3"     -> returned as-is (baked at packaging time)
+
+The release workflow tags every merge to main as v<MAJOR>.<MINOR>.<PATCH>:
+- MINOR = total commits on main (so each squash-merged PR bumps it by 1)
+- PATCH = commits in the merged PR (size of the change)
 """
 import os
+import re
 import subprocess
 
 _BOT_DIR = os.path.dirname(os.path.abspath(__file__))
+_TAG_RE = re.compile(r"^v(\d+\.\d+\.\d+)$")
 
 
 def _git(*args: str) -> str:
@@ -30,9 +38,16 @@ def get_version() -> str:
     major = raw or "0"
     if not _git("rev-parse", "--git-dir"):
         return f"{major}.0.0"
-    minor = _git("rev-list", "--count", "main") or "0"
-    patch = _git("rev-list", "--count", "HEAD", "^main") or "0"
-    return f"{major}.{minor}.{patch}"
+
+    tag = _git("describe", "--tags", "--abbrev=0", "--match=v*")
+    m = _TAG_RE.match(tag) if tag else None
+    if not m:
+        return f"{major}.0.0"
+    base = m.group(1)
+    ahead = _git("rev-list", "--count", f"{tag}..HEAD") or "0"
+    if ahead == "0":
+        return base
+    return f"{base}+{ahead}"
 
 
 if __name__ == "__main__":

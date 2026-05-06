@@ -102,11 +102,13 @@ The bot comment auto-updates with each push, so just keep pushing fixes and the 
 
 Format: `vMAJOR.MINOR.PATCH`.
 
-- `MAJOR` is read from the `VERSION` file (`0` during pre-1.0 development).
-- `MINOR` = number of commits on `main` (so each squash-merged PR bumps it by 1).
-- `PATCH` = commits on the current branch ahead of `main` (always `0` for tagged main commits).
+- `MAJOR` — from the `VERSION` file (`0` during pre-1.0 development; bumped by hand for breaking changes).
+- `MINOR` — total commits on `main`. Each squash-merged PR adds one commit, so MINOR bumps by 1 per release.
+- `PATCH` — number of commits in the merged PR (i.e. the size of the change). A 1-commit fix → `.1`, a 7-commit feature → `.7`.
 
-The `version.py` module computes this; the release workflow tags every push to `main` automatically.
+The release workflow tags every merge to `main` as `vMAJOR.MINOR.PATCH` automatically and creates a GitHub Release with the squash commit message as the notes body.
+
+At runtime, `version.py` returns the latest tag. On a feature branch with N commits past the tag, it returns `MAJOR.MINOR.PATCH+N` (build identifier — informative, never used as an actual tag).
 
 ## Project conventions worth knowing
 
