@@ -110,6 +110,24 @@ class SessionManager:
                 print(f"[session {sid}] on_stop error: {e}",
                       file=sys.stderr, flush=True)
 
+    def interrupt(self, sid: str) -> bool:
+        """Terminate the in-flight turn's claude subprocess.
+
+        Session and worker stay alive — the worker proceeds to the next
+        queued message. Returns True if a turn was actually running.
+        """
+        session = self._sessions.get(sid)
+        if not session or not session.alive:
+            return False
+        proc = session._proc
+        if not proc or proc.poll() is not None:
+            return False
+        try:
+            proc.terminate()
+        except Exception:
+            return False
+        return True
+
     def restart(self, sid: str) -> bool:
         session = self._sessions.get(sid)
         if not session or session.alive:
