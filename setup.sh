@@ -99,69 +99,14 @@ read -rp "Set up Claude Code hooks? [Y/n]: " SETUP_HOOKS
 SETUP_HOOKS="${SETUP_HOOKS:-Y}"
 
 if [[ "$SETUP_HOOKS" =~ ^[Yy] ]]; then
-    # Load port from .env
     HOOK_PORT=$(grep '^HOOK_PORT=' .env | cut -d= -f2)
     HOOK_PORT="${HOOK_PORT:-9853}"
-
-    FALLBACK_SCRIPT="$SCRIPT_DIR/hook_fallback.py"
-
-    # Create fallback script (works when bot is offline)
-    cat > "$FALLBACK_SCRIPT" <<'PYEOF'
-#!/usr/bin/env python3
-"""Fallback hook — sends Telegram DM when the bot daemon is NOT running."""
-import sys, json, os, urllib.request
-
-def main():
-    dotenv = os.path.join(os.path.dirname(__file__), ".env")
-    cfg = {}
-    if os.path.exists(dotenv):
-        for line in open(dotenv):
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                cfg[k.strip()] = v.strip()
-    token = cfg.get("BOT_TOKEN", "")
-    chat_id = cfg.get("OWNER_ID", "")
-    if not token or not chat_id:
-        return
-    api = f"https://api.telegram.org/bot{token}"
-    event = sys.argv[1] if len(sys.argv) > 1 else "notification"
-    raw = sys.stdin.read()
-    try:
-        inp = json.loads(raw) if raw.strip() else {}
-    except json.JSONDecodeError:
-        inp = {}
-    esc = lambda t: str(t).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-    def send(text):
-        data = json.dumps({"chat_id": int(chat_id), "text": text, "parse_mode": "HTML"}).encode()
-        req = urllib.request.Request(f"{api}/sendMessage", data=data,
-                                     headers={"Content-Type": "application/json"})
-        try:
-            urllib.request.urlopen(req, timeout=10)
-        except Exception:
-            pass
-    if event == "permission":
-        tool = inp.get("tool_name", "?")
-        ti = inp.get("tool_input", {})
-        detail = ti.get("command", ti.get("file_path", tool))[:200]
-        send(f"⚠️ Auto-allowed (bot offline): <b>{esc(tool)}</b>\n<code>{esc(detail)}</code>")
-        json.dump({"hookSpecificOutput": {"hookEventName": "PermissionRequest",
-                                          "permissionDecision": "allow"}}, sys.stdout)
-    else:
-        text = next((inp.get(k) for k in ("message","title","text","body") if inp.get(k)), "notification")
-        send(f"🔔 {esc(text)}")
-
-if __name__ == "__main__":
-    main()
-PYEOF
-    chmod +x "$FALLBACK_SCRIPT"
-    ok "Fallback hook script created"
 
     SETTINGS_FILE="$HOME/.claude/settings.json"
     mkdir -p "$(dirname "$SETTINGS_FILE")"
 
-    NOTIFY_CMD="INPUT=\$(cat); printf '%s' \"\$INPUT\" | curl -sf --max-time 8 -X POST http://127.0.0.1:${HOOK_PORT}/hook/notification -H 'Content-Type: application/json' -d @- 2>/dev/null || printf '%s' \"\$INPUT\" | python3 ${FALLBACK_SCRIPT} notification"
-    PERM_CMD="INPUT=\$(cat); printf '%s' \"\$INPUT\" | curl -sf --max-time 125 -X POST http://127.0.0.1:${HOOK_PORT}/hook/permission -H 'Content-Type: application/json' -d @- 2>/dev/null || printf '%s' \"\$INPUT\" | python3 ${FALLBACK_SCRIPT} permission"
+    NOTIFY_CMD="INPUT=\$(cat); printf '%s' \"\$INPUT\" | curl -sf --max-time 8 -X POST http://127.0.0.1:${HOOK_PORT}/hook/notification -H 'Content-Type: application/json' -d @- 2>/dev/null"
+    PERM_CMD="INPUT=\$(cat); printf '%s' \"\$INPUT\" | curl -sf --max-time 125 -X POST http://127.0.0.1:${HOOK_PORT}/hook/permission -H 'Content-Type: application/json' -d @- 2>/dev/null"
 
     if [ -f "$SETTINGS_FILE" ]; then
         EXISTING=$(cat "$SETTINGS_FILE")
@@ -185,7 +130,7 @@ print('ok')
 fi
 
 # ── done ─────────────────────────────────────────────────────────────
-bold "\n━━━ Setup complete ━━━"
+bold "\n--- Setup complete ---"
 echo ""
 echo "Next steps:"
 echo "  1. Create a Telegram group with Topics enabled"

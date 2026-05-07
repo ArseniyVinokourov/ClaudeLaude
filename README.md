@@ -86,8 +86,12 @@ You need:
 
 Then:
 
-	git clone <repo-url>
-	cd claude-bot
+	bash <(curl -s https://raw.githubusercontent.com/ArseniyVinokourov/ClaudeLaude/main/install.sh)
+
+Or manually:
+
+	git clone https://github.com/ArseniyVinokourov/ClaudeLaude.git ~/claude-bot
+	cd ~/claude-bot
 	bash setup.sh
 
 setup.sh asks for:
@@ -121,6 +125,7 @@ Commands
 	/display [mobile|desktop]     formatting mode for this topic
 	/menu                         inline menu with quick actions
 	/help                         full reference
+	/update                       check for and apply bot updates
 	/stop                         stop the session in this topic
 	/restart                      restart the bot
 	/stop_bot                     shut the bot down
@@ -136,8 +141,8 @@ just the ones it spawned itself:
  - Notification         → message in General
  - PermissionRequest    → inline Allow / Deny
 
-When the bot is not running, a fallback script DMs you and
-auto-allows, so the terminal session is not blocked forever.
+When the bot is not running, hooks fail silently and Claude Code
+falls back to its normal terminal prompts.
 
 
 Architecture
@@ -165,12 +170,11 @@ Files
 	telegram.py        Bot API wrapper
 	sessions.py        Claude Code session manager
 	hooks.py           HTTP server for hooks
-	hook_fallback.py   fallback when the bot is down (created by setup.sh)
-	setup.sh           interactive install
-	install.sh         unpack from the distribution archive
-	update.sh          update an existing install
-	docs/              install/update prompts for end users
+	setup.sh           interactive first-run config
+	install.sh         clone + setup (one-liner)
+	update.sh          git-based update with backup
+	docs/              install/update instructions
 	.env.example       config template
-	.env               your config (do not commit)
+	.env               your config (not tracked)
 	.state.json        forum group binding (created at runtime)
 	requirements.txt   Python dependencies
