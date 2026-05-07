@@ -9,6 +9,9 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_ID = int(os.environ["OWNER_ID"])
 PROJECTS_DIR = os.environ.get("PROJECTS_DIR", os.path.expanduser("~/Projects"))
 HOOK_PORT = int(os.environ.get("HOOK_PORT", "9853"))
+AUTO_UPDATE = os.environ.get("AUTO_UPDATE", "false").lower() in ("true", "1", "yes")
+AUTO_UPDATE_POLICY = os.environ.get("AUTO_UPDATE_POLICY", "replace")
+BOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 _STATE_FILE = os.environ.get(
     "BOT_STATE_FILE",

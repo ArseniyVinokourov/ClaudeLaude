@@ -1,56 +1,24 @@
-# Обновление Telegram-бота ClaudeLaude
+# Updating ClaudeLaude
 
-У меня уже стоит бот ClaudeLaude (Telegram-бот для Claude Code). Мне прислали новую версию — архив `claude-bot.tar.gz`. Помоги обновить.
+Help me update ClaudeLaude — my Telegram bot for Claude Code.
 
-Я не очень технический специалист, объясняй просто.
-
-## Что нужно сделать
-
-### 1. Останови бота
-
-Если бот сейчас работает — его нужно сначала остановить:
-- Либо отправь `/stop_bot` в личку боту в Telegram
-- Либо нажми Ctrl+C в терминале где он запущен
-- Либо, если он работает как сервис: `sudo systemctl stop claude-bot`
-
-### 2. Найди и запусти update.sh
-
-Архив `claude-bot.tar.gz` лежит где-то у меня — найди его. Рядом с ним или внутри есть `update.sh`.
-
-Можно запустить двумя способами:
-
-**Способ А** — из папки бота (если update.sh уже там):
-```bash
-cd ~/claude-bot
-bash update.sh
-```
-
-**Способ Б** — распаковать архив и запустить оттуда:
-```bash
-tar xzf claude-bot.tar.gz
-cd claude-bot
-bash update.sh
-```
-
-Скрипт сам:
-- Найдёт где установлен бот
-- Сохранит мои настройки (.env, данные сессий)
-- Обновит код
-- Обновит зависимости
-- Предложит обновить хуки (скажи ответить Y)
-
-### 3. Запусти бота
+## Quick update
 
 ```bash
-cd ~/claude-bot && .venv/bin/python bot.py
+cd ~/claude-bot && bash update.sh
 ```
 
-Или если сервис: `sudo systemctl start claude-bot`
+The script will:
+- Fetch the latest version from GitHub
+- Detect any local code changes I've made
+- Back up modified files before overwriting
+- Update dependencies
+- Offer to update Claude Code hooks
 
-### 4. Проверь
+## From the bot
 
-Напиши что-нибудь в существующую сессию или создай новую через /new. Должно работать как раньше.
+I can also send `/update` in Telegram — the bot checks for updates and can apply them with one button.
 
----
+## If something breaks
 
-**Если что-то сломалось** — в папке бота есть `.backup_*` с предыдущими настройками. Помоги мне откатиться если нужно.
+Modified files are backed up in `.backup_*/modified/` inside the bot directory. I can compare with `diff` and restore if needed.

@@ -1,52 +1,55 @@
-# Установка Telegram-бота ClaudeLaude
+# Installing ClaudeLaude
 
-Мне нужна помощь с установкой Telegram-бота для Claude Code. В архиве `claude-bot.tar.gz` — бот, который позволяет общаться с Claude Code прямо из Telegram. Каждый разговор — отдельная тема в группе.
+Help me install ClaudeLaude — a Telegram bot for Claude Code.
 
-Помоги мне пошагово. Я не очень технический специалист, объясняй простым языком.
+## Prerequisites
 
-## Что нужно сделать
+Check that I have:
+- Python 3.10+ (`python3 --version`)
+- git (`git --version`)
+- Claude Code CLI installed and logged in (`claude --version`)
 
-### 1. Проверь что нужно для работы
+If anything is missing, help me install it step by step.
 
-- Python 3.10 или новее (проверь командой `python3 --version`)
-- Claude Code CLI установлен и залогинен (проверь командой `claude --version`)
-- Если чего-то нет — помоги установить, пошагово
+## Install
 
-### 2. Найди и запусти установщик
-
-Архив `claude-bot.tar.gz` лежит где-то у меня — найди его (текущая папка, ~/Downloads, рабочий стол). Рядом с ним или внутри есть `install.sh`. Запусти:
+Run this one-liner:
 
 ```bash
-bash install.sh
+bash <(curl -s https://raw.githubusercontent.com/ArseniyVinokourov/ClaudeLaude/main/install.sh)
 ```
 
-Скрипт спросит:
-1. **Куда установить** — можно просто Enter (по умолчанию ~/claude-bot)
-2. **BOT_TOKEN** — токен Telegram-бота. Если у меня его нет, объясни как создать бота через @BotFather в Telegram (это 2 минуты)
-3. **OWNER_ID** — мой Telegram ID. Объясни как узнать через @userinfobot
-4. **PROJECTS_DIR** — папка с моими проектами
-5. **HOOK_PORT** — можно просто Enter
-6. **Хуки** — когда спросит про хуки, скажи ответить Y (да)
+Or manually:
 
-### 3. Настройка Telegram
+```bash
+git clone https://github.com/ArseniyVinokourov/ClaudeLaude.git ~/claude-bot
+cd ~/claude-bot
+bash setup.sh
+```
 
-После установки скрипт покажет инструкцию по настройке Telegram-группы. Помоги мне пройти эти шаги — объясни что нажимать в приложении Telegram:
-- Создание группы
-- Включение тем (Topics)
-- Добавление бота как админа
-- Команда /setup
+The setup script will ask for:
+1. **BOT_TOKEN** — Telegram bot token. If I don't have one, explain how to create a bot via @BotFather (2 minutes).
+2. **OWNER_ID** — my Telegram user ID. Explain how to get it via @userinfobot.
+3. **PROJECTS_DIR** — directory with my projects.
+4. **HOOK_PORT** — just press Enter for default.
+5. **Hooks** — answer Y when asked.
 
-### 4. Первый запуск
+## Telegram setup
 
-Помоги запустить бота и проверить что всё работает:
-- Запуск bot.py
-- Команда /new для первой сессии
-- Убедиться что ответы приходят
+After install, walk me through:
+1. Create a Telegram group (any name)
+2. Enable Topics: Group Settings > Topics > On
+3. Add bot as admin with permissions: Manage Topics, Delete Messages
+4. Send /setup in the group
 
-### 5. Автозапуск (опционально)
+## First run
 
-Если я хочу чтобы бот запускался автоматически — помоги настроить systemd сервис или другой способ для моей ОС.
+```bash
+cd ~/claude-bot && .venv/bin/python bot.py
+```
 
----
+Then send /new to create the first session. Make sure replies come through.
 
-**Если что-то не работает** — разберись почему, не пропускай ошибки. Проверь логи, предложи решение.
+## Autostart (optional)
+
+If I want the bot to start automatically, help me set up a systemd service or bashrc autostart for my OS.
