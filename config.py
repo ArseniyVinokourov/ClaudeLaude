@@ -46,3 +46,13 @@ def set_pinned_help_id(msg_id: int | None):
     state = _load_state()
     state["pinned_help_id"] = msg_id
     _save_state(state)
+
+
+def get_dashboard_id() -> int | None:
+    return _load_state().get("dashboard_id")
+
+
+def set_dashboard_id(msg_id: int | None):
+    state = _load_state()
+    state["dashboard_id"] = msg_id
+    _save_state(state)

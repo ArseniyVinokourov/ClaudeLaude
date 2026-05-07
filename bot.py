@@ -19,7 +19,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from config import (OWNER_ID, PROJECTS_DIR, HOOK_PORT,
                     get_forum_chat_id, set_forum_chat_id,
-                    get_pinned_help_id, set_pinned_help_id)
+                    get_pinned_help_id,
+                    get_dashboard_id, set_dashboard_id)
 import telegram as tg
 from sessions import Session, SessionManager
 from hooks import HookBridge
@@ -104,6 +105,11 @@ def _md_table_to_list(text: str) -> str:
 
 
 # ── helpers ──────────────────────────────────────────────────────────
+
+_CLOSE_ROW = [{"text": "✕ Close", "callback_data": "close"}]
+
+_PICKER_TTL = 300
+
 
 def send_to_topic(topic_id, text, buttons=None):
     fid = forum()
@@ -217,7 +223,7 @@ def _end_turn(turn: TurnState):
 
 
 def _turn_timer(session, turn: TurnState):
-    """Background thread: update status timer + typing indicator."""
+    """Background thread: update status timer."""
     fid = forum()
     while not turn.stop_event.wait(3):
         mid = turn.status_msg_id
@@ -226,8 +232,6 @@ def _turn_timer(session, turn: TurnState):
             if text != turn._last_status_text:
                 tg.edit(mid, text, fid, buttons=_interrupt_button(session))
                 turn._last_status_text = text
-        if fid and session.topic_id:
-            tg.send_chat_action(fid, thread_id=session.topic_id)
 
 
 # ── compact / expand ────────────────────────────────────────────────
@@ -306,17 +310,6 @@ def on_result(session, result_text, summary):
     if not fid:
         return
 
-    parts = ["✅"]
-    if turn.tool_ops:
-        parts.append(f"⚙️ {len(turn.tool_ops)}")
-    if turn.msg_texts:
-        parts.append(f"\U0001f4ac {len(turn.msg_texts)}")
-    if session.turn_input_tokens or session.turn_output_tokens:
-        total = session.turn_input_tokens + session.turn_output_tokens
-        parts.append(f"\U0001f524 {total // 1000}k" if total >= 1000
-                     else f"\U0001f524 {total}")
-    finish_text = "  ".join(parts)
-
     # Send pending images
     for img_path in list(session.pending_images):
         if os.path.isfile(img_path):
@@ -331,10 +324,9 @@ def on_result(session, result_text, summary):
             compact_id = str(time.time_ns())[-10:]
             state.saved_turns[compact_id] = (
                 turn.msg_ids[:], turn.msg_texts[:], turn.tool_ops[:])
+        anchor = f"⚙️ {len(turn.tool_ops)}" if turn.tool_ops else "·"
         btn = [[{"text": "\U0001f5dc Compact", "callback_data": f"c:{compact_id}"}]]
-        send_to_topic(session.topic_id, finish_text, buttons=btn)
-    else:
-        send_to_topic(session.topic_id, finish_text)
+        send_to_topic(session.topic_id, anchor, buttons=btn)
 
     if not session.alive:
         tg.edit_forum_topic(fid, session.topic_id, f"⏹ {session.name}")
@@ -792,10 +784,10 @@ def _spawn_session(cwd, name=None):
         return
     mgr.create(cwd=cwd, name=name, topic_id=topic_id)
     send_to_topic(topic_id,
-                  f"▶️ Session started\ncwd: <code>{tg.esc(cwd)}</code>")
+                  f"▶️ <code>{tg.esc(cwd)}</code>")
     url = _topic_url(topic_id)
     if url:
-        _ephemeral(fid, "▶️ Session created",
+        _ephemeral(fid, "▶️",
                    buttons=[[{"text": f"Open {name}", "url": url}]],
                    seconds=5)
 
@@ -837,14 +829,14 @@ def cmd_new(args: str, chat_id=None, thread_id=None):
     if len(projects) > RECENT_LIMIT:
         rows.append([{"text": f"\U0001f4cb Show all ({len(projects)})",
                        "callback_data": f"na:{pick_id}"}])
+    rows.append(_CLOSE_ROW)
     mid = _reply(chat_id, thread_id, "\U0001f4c2 Choose project:", buttons=rows)
     if not thread_id and mid and chat_id:
         def _cleanup_picker():
-            time.sleep(15)
+            time.sleep(_PICKER_TTL)
             with state.lock:
-                if pick_id in state.pending_project_picks:
-                    state.pending_project_picks.pop(pick_id, None)
-                    tg.delete(mid, chat_id)
+                state.pending_project_picks.pop(pick_id, None)
+            tg.delete(mid, chat_id)
         threading.Thread(target=_cleanup_picker, daemon=True).start()
 
 
@@ -930,12 +922,13 @@ def cmd_sessions(chat_id, thread_id=None):
                 buttons.append({"text": btn_label,
                                 "callback_data": "noop"})
     rows = [buttons[j:j+3] for j in range(0, len(buttons), 3)]
+    rows.append(_CLOSE_ROW)
     text = "\U0001f4cb <b>Sessions</b>\n\n" + "\n\n".join(blocks)
     if not thread_id:
         mid = tg.send(text, chat_id, buttons=rows)
         if mid:
             def _cleanup():
-                time.sleep(15)
+                time.sleep(_PICKER_TTL)
                 tg.delete(mid, chat_id)
             threading.Thread(target=_cleanup, daemon=True).start()
     else:
@@ -1078,12 +1071,10 @@ def _do_resume(claude_session_id: str, chat_id, thread_id=None):
         return
     mgr.resume(claude_session_id, topic_id, name, cwd)
     send_to_topic(topic_id,
-                  f"▶️ Resumed session\n"
-                  f"cwd: <code>{tg.esc(cwd)}</code>\n"
-                  f"session: <code>{tg.esc(claude_session_id[:12])}…</code>")
+                  f"▶️ <code>{tg.esc(cwd)}</code>")
     url = _topic_url(topic_id)
     if url:
-        _ephemeral(fid, "▶️ Session resumed",
+        _ephemeral(fid, "▶️",
                    buttons=[[{"text": f"Open {name}", "url": url}]],
                    seconds=5)
 
@@ -1125,6 +1116,7 @@ def _build_resume_picker(sessions, pick_id, max_items=None):
     if max_items is not None and len(sessions) > max_items:
         rows.append([{"text": f"\U0001f4cb Show all ({len(sessions)})",
                       "callback_data": f"ra:{pick_id}"}])
+    rows.append(_CLOSE_ROW)
     text = "▶️ <b>Resume</b>\n\n" + "\n\n".join(blocks)
     return text, rows
 
@@ -1150,7 +1142,7 @@ def cmd_resume(args: str, chat_id, thread_id=None):
     mid = _reply(chat_id, thread_id, text, buttons=rows)
     if not thread_id and mid and chat_id:
         def _cleanup():
-            time.sleep(15)
+            time.sleep(_PICKER_TTL)
             with state.lock:
                 state.pending_resume_picks.pop(pick_id, None)
             tg.delete(mid, chat_id)
@@ -1160,16 +1152,16 @@ def cmd_resume(args: str, chat_id, thread_id=None):
 def cmd_history(session, chat_id, thread_id, args):
     if not session:
         if not thread_id:
-            _ephemeral(chat_id, "Send this in a session topic.", seconds=5)
+            _ephemeral(chat_id, "Use in a session topic", seconds=5)
         else:
-            tg.send("Send this in a session topic.", chat_id, thread_id=thread_id)
+            tg.send("Use in a session topic", chat_id, thread_id=thread_id)
         return
     n = 30
     if args.strip().isdigit():
         n = int(args.strip())
     entries = session.history[-n:]
     if not entries:
-        tg.send("Empty history.", chat_id, thread_id=thread_id)
+        tg.send("Empty history", chat_id, thread_id=thread_id)
         return
     lines = []
     for e in entries:
@@ -1186,7 +1178,7 @@ def cmd_display(chat_id, thread_id, args):
     if not thread_id:
         fid = forum()
         if fid:
-            _ephemeral(fid, "Send this in a session topic.", seconds=5)
+            _ephemeral(fid, "Use in a session topic", seconds=5)
         return
     mode = args.strip().lower()
     if mode not in ("mobile", "desktop"):
@@ -1202,9 +1194,9 @@ def cmd_display(chat_id, thread_id, args):
 def cmd_stop(session, chat_id, thread_id):
     if not session:
         if not thread_id:
-            _ephemeral(chat_id, "Send this in a session topic.", seconds=5)
+            _ephemeral(chat_id, "Use in a session topic", seconds=5)
         else:
-            tg.send("Send this in a session topic.", chat_id, thread_id=thread_id)
+            tg.send("Use in a session topic", chat_id, thread_id=thread_id)
         return
     with state.lock:
         turn = state.turns.pop(session.sid, None)
@@ -1215,18 +1207,18 @@ def cmd_stop(session, chat_id, thread_id):
     if fid and session.topic_id:
         tg.edit_forum_topic(fid, session.topic_id, f"⏹ {session.name}")
         tg.close_forum_topic(fid, session.topic_id)
-    tg.send("⏹ Session stopped.", chat_id, thread_id=thread_id)
+    tg.send("⏹ Stopped", chat_id, thread_id=thread_id)
 
 
 def cmd_interrupt(session, chat_id, thread_id):
     if not session:
         if not thread_id:
-            _ephemeral(chat_id, "Send this in a session topic.", seconds=5)
+            _ephemeral(chat_id, "Use in a session topic", seconds=5)
         else:
-            tg.send("Send this in a session topic.", chat_id, thread_id=thread_id)
+            tg.send("Use in a session topic", chat_id, thread_id=thread_id)
         return
     if not session.is_bot_spawned:
-        tg.send("ℹ️ Terminal session — interrupt from terminal (Ctrl-C).",
+        tg.send("ℹ️ Terminal — Ctrl-C in terminal",
                 chat_id, thread_id=thread_id)
         return
     _do_interrupt(session, chat_id, thread_id)
@@ -1246,14 +1238,14 @@ def cmd_restart(chat_id, thread_id):
     if not thread_id:
         fid = forum()
         if fid:
-            _ephemeral(fid, "Send this in a session topic.", seconds=5)
+            _ephemeral(fid, "Use in a session topic", seconds=5)
         return
     session = mgr.by_topic(thread_id)
     if not session:
-        tg.send("No session in this topic.", chat_id, thread_id=thread_id)
+        tg.send("No session here", chat_id, thread_id=thread_id)
         return
     if session.alive:
-        tg.send("Session is already running.", chat_id, thread_id=thread_id)
+        tg.send("Already running", chat_id, thread_id=thread_id)
         return
     if mgr.restart(session.sid):
         fid = forum()
@@ -1261,10 +1253,10 @@ def cmd_restart(chat_id, thread_id):
             tg.reopen_forum_topic(fid, session.topic_id)
             tg.edit_forum_topic(fid, session.topic_id,
                                 f"\U0001f7e2 {session.name}")
-        tg.send("▶️ Session restarted.", chat_id,
+        tg.send("▶️ Restarted", chat_id,
                 thread_id=thread_id)
     else:
-        tg.send("❌ Failed to restart.", chat_id, thread_id=thread_id)
+        tg.send("❌ Failed to restart", chat_id, thread_id=thread_id)
 
 
 def _fetch_account_usage() -> str | None:
@@ -1416,43 +1408,50 @@ def cmd_test_perm(chat_id, thread_id=None):
             "when buttons appear.", chat_id, thread_id=thread_id)
 
 
-_PINNED_TEXT = (
-    "<b>ClaudeLaude Bot</b>\n"
-    "Claude Code → Telegram\n"
-    "\n"
-    "/new — new session\n"
-    "/sessions — list + fork\n"
-    "/resume — continue session\n"
-    "/usage — tokens + limits"
-)
+_usage_cache: str | None = None
+_usage_cache_ts: float = 0
+_USAGE_CACHE_TTL = 300
+
+
+def _build_dashboard() -> str:
+    from version import get_version
+    ver = get_version()
+    active = sum(1 for s in mgr._sessions.values() if s.alive)
+    stopped = sum(1 for s in mgr._sessions.values() if not s.alive)
+    parts = [f"<b>ClaudeLaude</b> v{tg.esc(ver)}"]
+    if active or stopped:
+        segs = []
+        if active:
+            segs.append(f"▶ {active} active")
+        if stopped:
+            segs.append(f"⏹ {stopped} stopped")
+        parts.append(" · ".join(segs))
+    else:
+        parts.append("No sessions")
+    if _usage_cache:
+        parts.append(_usage_cache)
+    return "\n".join(parts)
 
 _HELP_TEXT = (
-    "<b>ClaudeLaude Bot — Help</b>\n"
+    "<b>ClaudeLaude — Help</b>\n"
     "\n"
     "<b>Sessions</b>\n"
     "/new — project picker\n"
-    "/new &lt;path&gt; [name] — session in dir\n"
-    "/sessions — list sessions + fork\n"
-    "/resume — pick session to continue\n"
-    "/resume &lt;id&gt; — continue by session id\n"
-    "/stop — stop current session\n"
-    "/restart — restart stopped session\n"
-    "/interrupt — abort current turn (session stays alive)\n"
+    "/new &lt;path&gt; — session in dir\n"
+    "/sessions — list + fork\n"
+    "/resume — continue session\n"
+    "/stop · /restart · /interrupt\n"
     "\n"
     "<b>In topic</b>\n"
-    "/history [N] — last N events (default 30)\n"
-    "/usage — session tokens + account limits\n"
-    "/display [mobile|desktop] — toggle view\n"
+    "/history [N] — last N events\n"
+    "/usage — tokens + limits\n"
+    "/display — toggle mobile/desktop\n"
     "\n"
     "<b>Other</b>\n"
-    "/menu — quick actions\n"
-    "/help — this message\n"
-    "/stop_bot — shutdown bot\n"
+    "/menu · /help · /stop_bot\n"
     "\n"
-    "Unknown /commands in bot sessions are\n"
-    "forwarded to Claude as user messages.\n"
-    "Photos/files in bot topics are sent\n"
-    "to the session as attachments."
+    "Unknown /commands → Claude.\n"
+    "Photos/files → attachments."
 )
 
 _KNOWN_COMMANDS = {
@@ -1477,7 +1476,7 @@ _MENU_ROWS = [
 
 def cmd_help(chat_id, thread_id=None):
     if not thread_id:
-        _ephemeral(chat_id, _HELP_TEXT, seconds=7)
+        _ephemeral(chat_id, _HELP_TEXT, seconds=_PICKER_TTL)
     else:
         tg.send(_HELP_TEXT, chat_id, thread_id=thread_id)
 
@@ -1516,22 +1515,28 @@ def _cleanup_general():
               file=sys.stderr, flush=True)
 
 
-def _sync_pinned_help():
-    """Send or update the pinned help+menu message in General."""
+def _sync_dashboard():
+    """Send or update the pinned dashboard message in General."""
     _validate_help()
     fid = forum()
     if not fid:
         return
-    old_id = get_pinned_help_id()
+    text = _build_dashboard()
+    old_id = get_dashboard_id()
+    if not old_id:
+        old_id = get_pinned_help_id()
     if old_id:
         try:
             tg._req("editMessageText", {
                 "chat_id": fid,
                 "message_id": old_id,
-                "text": _PINNED_TEXT,
+                "text": text,
                 "parse_mode": "HTML",
                 "reply_markup": {"inline_keyboard": _MENU_ROWS},
             })
+            if not get_dashboard_id():
+                set_dashboard_id(old_id)
+            return
         except Exception as e:
             body = ""
             if hasattr(e, "response") and e.response is not None:
@@ -1541,21 +1546,17 @@ def _sync_pinned_help():
                     pass
             if "not modified" in body.lower():
                 return
-            print(f"[pinned] edit failed: {e} {body}",
+            print(f"[dashboard] edit failed: {e} {body}",
                   file=sys.stderr, flush=True)
-            set_pinned_help_id(None)
-        else:
-            return
-    # Convention: General has exactly one pinned message (this help).
-    # Clear everything before pinning the fresh one.
+            set_dashboard_id(None)
     try:
         tg._req("unpinAllChatMessages", {"chat_id": fid})
     except Exception:
         pass
-    msg_id = tg.send(_PINNED_TEXT, fid, buttons=_MENU_ROWS)
+    msg_id = tg.send(text, fid, buttons=_MENU_ROWS)
     if msg_id:
         tg.pin(msg_id, fid)
-        set_pinned_help_id(msg_id)
+        set_dashboard_id(msg_id)
 
 
 def cmd_menu(chat_id, thread_id=None, session=None):
@@ -1586,11 +1587,12 @@ def cmd_menu(chat_id, thread_id=None, session=None):
     rows.append([
         {"text": "❓ Help", "callback_data": "m:help"},
     ])
+    rows.append(_CLOSE_ROW)
     mid = tg.send("\U0001f3ae <b>Quick actions</b>", chat_id,
                    thread_id=thread_id, buttons=rows)
     if not thread_id and mid:
         def _cleanup():
-            time.sleep(15)
+            time.sleep(_PICKER_TTL)
             tg.delete(mid, chat_id)
         threading.Thread(target=_cleanup, daemon=True).start()
 
@@ -1614,15 +1616,57 @@ bridge = HookBridge(
 )
 
 
-def _topic_healthcheck():
-    """Periodically check that session topics still exist; stop orphans."""
+def _refresh_usage_cache():
+    global _usage_cache, _usage_cache_ts
+    try:
+        raw = _fetch_account_usage()
+        if raw:
+            lines = raw.strip().splitlines()
+            short = []
+            for line in lines:
+                m = re.search(r'(\d+)%', line)
+                label = "Week" if "week" in line.lower() else "Session"
+                if m:
+                    short.append(f"{label}: {m.group(1)}%")
+            _usage_cache = " · ".join(short) if short else None
+        else:
+            _usage_cache = None
+        _usage_cache_ts = time.time()
+    except Exception as e:
+        print(f"[dashboard] usage fetch error: {e}",
+              file=sys.stderr, flush=True)
+
+
+def _dashboard_loop():
+    """Background: update dashboard pin every 60s, refresh usage every 5m."""
+    time.sleep(5)
     while bot_running:
-        time.sleep(30)
+        if time.time() - _usage_cache_ts > _USAGE_CACHE_TTL:
+            _refresh_usage_cache()
+        try:
+            _sync_dashboard()
+        except Exception as e:
+            print(f"[dashboard] update error: {e}",
+                  file=sys.stderr, flush=True)
+        time.sleep(60)
+
+
+def _topic_healthcheck():
+    """Periodically check that session topics still exist; stop orphans.
+
+    Probes only idle sessions (no activity for >120s) to avoid noise from
+    the send-and-delete probe in active topics.
+    """
+    while bot_running:
+        time.sleep(120)
         fid = forum()
         if not fid:
             continue
+        now = time.time()
         for session in mgr.list_sessions():
             if not session.topic_id:
+                continue
+            if now - _session_last_active(session) < 120:
                 continue
             if not tg.topic_alive(fid, session.topic_id):
                 _invalidate_and_stop(session, "topic deleted")
@@ -1633,6 +1677,7 @@ def main():
 
     bridge.start()
     threading.Thread(target=_topic_healthcheck, daemon=True).start()
+    threading.Thread(target=_dashboard_loop, daemon=True).start()
     tg.set_my_commands([
         {"command": "new", "description": "New Claude session"},
         {"command": "sessions", "description": "Active sessions"},
@@ -1644,7 +1689,7 @@ def main():
         {"command": "display", "description": "Toggle mobile/desktop"},
         {"command": "help", "description": "Show help"},
     ])
-    _sync_pinned_help()
+    _sync_dashboard()
     _cleanup_general()
 
     offset = None
@@ -1697,7 +1742,7 @@ def _handle_update(u):
     document = msg.get("document")
     if photos or document:
         if not (session and session.is_bot_spawned and session.alive):
-            tg.send("Send files in an active bot session topic.",
+            tg.send("Send files in an active session",
                     chat_id, thread_id=thread_id)
             return
         file_id = photos[-1]["file_id"] if photos else document["file_id"]
@@ -1709,10 +1754,10 @@ def _handle_update(u):
             user_text = (f"{caption}\n[Attached file: {dest}]" if caption
                          else f"[Attached file: {dest}]")
             if not mgr.send_user_message(session.sid, user_text):
-                tg.send("⚠️ Session died.", chat_id,
+                tg.send("⚠️ Session died", chat_id,
                         thread_id=thread_id)
         else:
-            tg.send("❌ Failed to download file.", chat_id,
+            tg.send("❌ Download failed", chat_id,
                     thread_id=thread_id)
         return
 
@@ -1727,19 +1772,18 @@ def _handle_update(u):
         if session and session.is_bot_spawned:
             ok = mgr.send_user_message(session.sid, text)
             if not ok:
-                tg.send("⚠️ Session died.", chat_id,
+                tg.send("⚠️ Session died", chat_id,
                         thread_id=thread_id)
         elif session:
-            tg.send("ℹ️ Terminal session — "
-                    "send messages from terminal.",
+            tg.send("ℹ️ Terminal session — use terminal",
                     chat_id, thread_id=thread_id)
         elif chat_id == OWNER_ID:
-            tg.send("Send in a session topic, or /new to create one.",
+            tg.send("Use in a session topic, or /new",
                     chat_id)
         else:
             fid = forum()
             if fid and chat_id == fid:
-                _ephemeral(chat_id, "Send in a session topic, or /new to create one.", seconds=5)
+                _ephemeral(chat_id, "Use in a session topic, or /new", seconds=5)
 
 
 def _handle_command(cmd, args, chat_id, thread_id, session):
@@ -1780,11 +1824,10 @@ def _handle_command(cmd, args, chat_id, thread_id, session):
             ok = mgr.send_user_message(session.sid,
                                        f"{cmd} {args}".strip())
             if not ok:
-                tg.send("⚠️ Session died.", chat_id,
+                tg.send("⚠️ Session died", chat_id,
                         thread_id=thread_id)
         elif session:
-            tg.send("ℹ️ Terminal session — "
-                    "send messages from terminal.",
+            tg.send("ℹ️ Terminal session — use terminal",
                     chat_id, thread_id=thread_id)
 
 
@@ -1812,7 +1855,11 @@ def _handle_callback(cb, data):
             if entry:
                 msg_id, perm_chat, _ = entry
                 mark = "✅" if decision == "allow" else "❌"
-                tg.edit(msg_id, f"{mark} done", perm_chat)
+                tg.edit(msg_id, mark, perm_chat)
+                def _del_perm(mid=msg_id, cid=perm_chat):
+                    time.sleep(1)
+                    tg.delete(mid, cid)
+                threading.Thread(target=_del_perm, daemon=True).start()
 
     elif data.startswith("na:"):
         pick_id = data.split(":")[1]
@@ -1824,6 +1871,7 @@ def _handle_callback(cb, data):
                 label = os.path.basename(p.rstrip("/"))
                 rows.append([{"text": label,
                               "callback_data": f"n:{pick_id}:{i}"}])
+            rows.append(_CLOSE_ROW)
             if cb_chat and cb_msg:
                 tg.edit(cb_msg, "\U0001f4c2 Choose project:",
                         cb_chat, buttons=rows)
@@ -1917,18 +1965,25 @@ def _handle_callback(cb, data):
                     session = mgr.fork(parent, topic_id, parent.name)
                     if session:
                         send_to_topic(topic_id,
-                                      f"\U0001f500 Forked from <b>{tg.esc(parent.name)}</b>\n"
-                                      f"cwd: <code>{tg.esc(parent.cwd)}</code>")
+                                      f"\U0001f500 Fork of <b>{tg.esc(parent.name)}</b>")
                         _send_fork_summary(parent, topic_id)
                         url = _topic_url(topic_id)
                         if url:
-                            _ephemeral(fid, "\U0001f500 Fork created",
-                                       buttons=[[{"text": f"Open {parent.name} fork", "url": url}]],
+                            _ephemeral(fid, "\U0001f500",
+                                       buttons=[[{"text": "Open fork", "url": url}]],
                                        seconds=5)
+
+    elif data == "close":
+        if cb_chat and cb_msg:
+            tg.delete(cb_msg, cb_chat)
+        return
 
     elif data.startswith("m:"):
         action = data[2:]
         session = mgr.by_topic(cb_thread) if cb_thread else None
+        # Self-delete the menu on action (except inline-friendly ones)
+        if action not in ("help",) and cb_chat and cb_msg:
+            tg.delete(cb_msg, cb_chat)
         if action == "new":
             cmd_new("", chat_id=cb_chat, thread_id=cb_thread)
         elif action == "sessions":
