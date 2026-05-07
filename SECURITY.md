@@ -25,7 +25,7 @@ Only the latest release on `main` receives security fixes. There are no backport
 
 **Do not open a public issue for security vulnerabilities.**
 
-Email [arseny@tentixo.com](mailto:arseny@tentixo.com) with:
+Email [a.vinokourov418@gmail.com](mailto:a.vinokourov418@gmail.com) with:
 
 1. Description of the vulnerability
 2. Steps to reproduce
