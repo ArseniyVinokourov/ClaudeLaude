@@ -174,3 +174,23 @@ Files
 	.env               your config (do not commit)
 	.state.json        forum group binding (created at runtime)
 	requirements.txt   Python dependencies
+
+
+Contributing
+------------
+
+Fork, branch off main, open a PR. Full guide in CONTRIBUTING.md.
+
+
+Security
+--------
+
+This bot gives shell access to your machine through Telegram.
+Threat model and hardening advice in SECURITY.md.
+Report vulnerabilities to arseny@tentixo.com — not in public issues.
+
+
+License
+-------
+
+Apache-2.0. See LICENSE.
