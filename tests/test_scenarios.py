@@ -543,20 +543,23 @@ def test_compact_button_no_checkmark(bot, tmp_path):
     _drain_updates(bot)
     bot.tg.wait_for_call("sendMessage", message_thread_id=100, timeout=3)
 
-    # Find the finish message (has Compact button).
-    finish_msgs = [
-        m for m in bot.tg.calls_of("sendMessage")
-        if m.get("message_thread_id") == 100
-        and "reply_markup" in m
+    # Compact button is now added via editMessageReplyMarkup on last msg.
+    edits = bot.tg.calls_of("editMessageReplyMarkup")
+    compact_edits = [
+        e for e in edits
+        if "reply_markup" in e
         and any("Compact" in b["text"]
-                for row in m["reply_markup"]["inline_keyboard"]
+                for row in e["reply_markup"]["inline_keyboard"]
                 for b in row)
     ]
-    assert finish_msgs, "no Compact button message found"
-    # Should NOT contain ✅ or token stats.
-    for m in finish_msgs:
-        assert "✅" not in m["text"], f"✅ still in finish: {m['text']}"
-        assert "🔤" not in m["text"], f"token stats in finish: {m['text']}"
+    assert compact_edits, "no Compact button via editMessageReplyMarkup"
+    # No separate "·" or "✅" anchor message.
+    anchor_msgs = [
+        m for m in bot.tg.calls_of("sendMessage")
+        if m.get("message_thread_id") == 100
+        and m.get("text") in ("·", "✅")
+    ]
+    assert not anchor_msgs, f"unexpected anchor message: {anchor_msgs}"
 
 
 # ── 15. close button deletes message ──────────────────────────────

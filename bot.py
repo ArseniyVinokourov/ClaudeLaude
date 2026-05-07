@@ -32,6 +32,10 @@ _CLAUDE_BIN = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude"
 DEFAULT_DISPLAY = "mobile"
 _UPLOAD_DIR = "/tmp/bot_uploads"
 
+_ICON_ACTIVE = "5417915203100613993"   # 💬
+_ICON_TERMINAL = "5350554349074391003" # 💻
+_ICON_STOPPED = ""                     # removes custom emoji → color dot
+
 
 @dataclass
 class TurnState:
@@ -248,7 +252,8 @@ def _build_summary(texts: list[str], ops: list[str]) -> str:
     try:
         r = subprocess.run(
             [_CLAUDE_BIN, '-p',
-             f'Summarize in 1-2 sentences, be very brief:\n{combined[:2000]}',
+             'Summarize in 1-2 sentences. Reply in the same language '
+             f'as the original text. Be very brief:\n{combined[:2000]}',
              '--no-session-persistence', '--tools', ''],
             capture_output=True, text=True, timeout=15,
             cwd='/tmp',
@@ -325,13 +330,21 @@ def on_result(session, result_text, summary):
             compact_id = str(time.time_ns())[-10:]
             state.saved_turns[compact_id] = (
                 turn.msg_ids[:], turn.msg_texts[:], turn.tool_ops[:])
-        anchor = f"⚙️ {len(turn.tool_ops)}" if turn.tool_ops else "·"
         btn = [[{"text": "\U0001f5dc Compact", "callback_data": f"c:{compact_id}"}]]
-        send_to_topic(session.topic_id, anchor, buttons=btn)
+        last_mid = turn.msg_ids[-1]
+        try:
+            tg._req("editMessageReplyMarkup", {
+                "chat_id": fid,
+                "message_id": last_mid,
+                "reply_markup": {"inline_keyboard": btn},
+            })
+        except Exception:
+            pass
 
     if not session.alive:
-        stop_label = f"⏹ {session.name}"
-        tg.edit_forum_topic(fid, session.topic_id, stop_label)
+        stop_label = session.name
+        tg.edit_forum_topic(fid, session.topic_id, stop_label,
+                            icon_custom_emoji_id=_ICON_STOPPED)
         with state.lock:
             state.topic_labels[session.topic_id] = stop_label
         session.topic_label = stop_label
@@ -391,7 +404,7 @@ def _auto_rename_topic(session, result_text, fid):
             if len(title) > 20:
                 title = title[:17] + "…"
         if title:
-            label = f"\U0001f7e2 {title}"
+            label = title
             tg.edit_forum_topic(fid, session.topic_id, label[:128])
             with state.lock:
                 state.topic_labels[session.topic_id] = label[:128]
@@ -526,8 +539,8 @@ def _resolve_hook_session(claude_session_id, data):
         state.topic_counter[dirname] = state.topic_counter.get(dirname, 0) + 1
         n = state.topic_counter[dirname]
     ts = time.strftime("%H:%M")
-    label = (f"\U0001f517 {dirname} #{n} — {ts}" if n > 1
-             else f"\U0001f517 {dirname} — {ts}")
+    label = (f"{dirname} #{n} — {ts}" if n > 1
+             else f"{dirname} — {ts}")
     try:
         topic_id = tg.create_forum_topic(fid, label, icon_color=0x6FB9F0)
         _log(f"created topic {topic_id}")
@@ -785,8 +798,8 @@ def _spawn_session(cwd, name=None):
         state.topic_counter[name] = state.topic_counter.get(name, 0) + 1
         n = state.topic_counter[name]
     ts = time.strftime("%H:%M")
-    label = (f"\U0001f7e2 {name} #{n} — {ts}" if n > 1
-             else f"\U0001f7e2 {name} — {ts}")
+    label = (f"{name} #{n} — {ts}" if n > 1
+             else f"{name} — {ts}")
     try:
         topic_id = tg.create_forum_topic(fid, label, icon_color=0x6FB9F0)
     except Exception as e:
@@ -917,7 +930,7 @@ def cmd_sessions(chat_id, thread_id=None):
             age_str = f"{age // 3600}h ago"
         else:
             age_str = f"{age // 86400}d ago"
-        icon = "\U0001f7e2" if s.alive else "⏹"
+        icon = "▶" if s.alive else "·"
         num = i + 1
         name = s.name if len(s.name) <= 25 else s.name[:22] + "…"
         blocks.append(
@@ -1075,8 +1088,8 @@ def _do_resume(claude_session_id: str, chat_id, thread_id=None):
         state.topic_counter[name] = state.topic_counter.get(name, 0) + 1
         n = state.topic_counter[name]
     ts = time.strftime("%H:%M")
-    label = (f"▶️ {name} #{n} — {ts}" if n > 1
-             else f"▶️ {name} — {ts}")
+    label = (f"{name} #{n} — {ts}" if n > 1
+             else f"{name} — {ts}")
     try:
         topic_id = tg.create_forum_topic(fid, label, icon_color=0x6FB9F0)
     except Exception as e:
@@ -1224,8 +1237,9 @@ def cmd_stop(session, chat_id, thread_id):
     mgr.stop(session.sid)
     fid = forum()
     if fid and session.topic_id:
-        stop_label = f"⏹ {session.name}"
-        tg.edit_forum_topic(fid, session.topic_id, stop_label)
+        stop_label = session.name
+        tg.edit_forum_topic(fid, session.topic_id, stop_label,
+                            icon_custom_emoji_id=_ICON_STOPPED)
         with state.lock:
             state.topic_labels[session.topic_id] = stop_label
         session.topic_label = stop_label
@@ -1273,12 +1287,12 @@ def cmd_restart(chat_id, thread_id):
     if mgr.restart(session.sid):
         fid = forum()
         if fid:
-            restart_label = f"\U0001f7e2 {session.name}"
             tg.reopen_forum_topic(fid, session.topic_id)
-            tg.edit_forum_topic(fid, session.topic_id, restart_label)
+            tg.edit_forum_topic(fid, session.topic_id, session.name,
+                                icon_custom_emoji_id=_ICON_ACTIVE)
             with state.lock:
-                state.topic_labels[session.topic_id] = restart_label
-            session.topic_label = restart_label
+                state.topic_labels[session.topic_id] = session.name
+            session.topic_label = session.name
         tg.send("▶️ Restarted", chat_id,
                 thread_id=thread_id)
     else:
@@ -1584,6 +1598,8 @@ def _sync_dashboard():
                   file=sys.stderr, flush=True)
             set_dashboard_id(None)
             set_pinned_help_id(None)
+    if old_id:
+        tg.delete(old_id, fid)
     try:
         tg._req("unpinAllChatMessages", {"chat_id": fid})
     except Exception:
@@ -1703,6 +1719,8 @@ def _topic_healthcheck():
                 continue
             with state.lock:
                 label = state.topic_labels.get(session.topic_id)
+            if not label:
+                label = session.topic_label or session.name
             if not tg.topic_alive(fid, session.topic_id, name=label):
                 _invalidate_and_stop(session, "topic deleted")
 
@@ -1728,8 +1746,8 @@ def main():
         {"command": "display", "description": "Toggle mobile/desktop"},
         {"command": "help", "description": "Show help"},
     ])
+    _refresh_usage_cache()
     _sync_dashboard()
-    _cleanup_general()
 
     offset = None
     while bot_running:
@@ -1970,7 +1988,8 @@ def _handle_callback(cb, data):
         if saved and cb_chat:
             msg_ids, texts, ops = saved
             for mid in msg_ids:
-                tg.delete(mid, cb_chat)
+                if mid != cb_msg:
+                    tg.delete(mid, cb_chat)
             if cb_msg:
                 tg.edit(cb_msg, "⏳ Summarizing…", cb_chat)
 
@@ -1989,15 +2008,24 @@ def _handle_callback(cb, data):
             saved = state.saved_turns.get(compact_id)
         if saved and cb_chat:
             _, texts, ops = saved
-            btn = [[{"text": "\U0001f5dc Compact",
-                      "callback_data": f"c:{compact_id}"}]]
             if cb_msg:
-                tg.edit(cb_msg, "✅ done", cb_chat, buttons=btn)
+                tg.delete(cb_msg, cb_chat)
             new_ids = []
             for t in texts:
                 new_ids.extend(
                     tg.send_long(t, cb_chat, thread_id=cb_thread,
                                  markdown=True))
+            btn = [[{"text": "\U0001f5dc Compact",
+                      "callback_data": f"c:{compact_id}"}]]
+            if new_ids:
+                try:
+                    tg._req("editMessageReplyMarkup", {
+                        "chat_id": cb_chat,
+                        "message_id": new_ids[-1],
+                        "reply_markup": {"inline_keyboard": btn},
+                    })
+                except Exception:
+                    pass
             with state.lock:
                 state.saved_turns[compact_id] = (new_ids, texts, ops)
 
@@ -2010,7 +2038,7 @@ def _handle_callback(cb, data):
             fid = forum()
             if fid:
                 ts = time.strftime("%H:%M")
-                label = f"\U0001f500 {parent.name} fork — {ts}"
+                label = f"{parent.name} fork — {ts}"
                 topic_id = tg.create_forum_topic(fid, label, icon_color=0x6FB9F0)
                 if topic_id:
                     with state.lock:
