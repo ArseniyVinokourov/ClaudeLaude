@@ -174,3 +174,31 @@ Files
 	.env               your config (do not commit)
 	.state.json        forum group binding (created at runtime)
 	requirements.txt   Python dependencies
+
+
+Contributing
+------------
+
+See CONTRIBUTING.md for the full guide. The short version:
+
+ 1. Fork, branch off main, open a PR.
+ 2. Branch: <prefix>/<slug>. PR title: <prefix>: <description>.
+ 3. CI runs lint, syntax, and tests automatically.
+ 4. Maintainer reviews and squash-merges.
+
+Bug reports and feature requests go through GitHub Issues (templates
+provided).
+
+
+Security
+--------
+
+This bot gives shell access to your machine through Telegram.
+Read SECURITY.md for the threat model and hardening advice.
+Report vulnerabilities to arseny@tentixo.com, not in public issues.
+
+
+License
+-------
+
+Apache-2.0. See LICENSE.
