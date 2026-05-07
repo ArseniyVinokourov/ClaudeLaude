@@ -176,6 +176,21 @@ Files
 	requirements.txt   Python dependencies
 
 
-Contributing      see CONTRIBUTING.md
-Security          see SECURITY.md
-License           Apache-2.0 — see LICENSE
+Contributing
+------------
+
+Fork, branch off main, open a PR. Full guide in CONTRIBUTING.md.
+
+
+Security
+--------
+
+This bot gives shell access to your machine through Telegram.
+Threat model and hardening advice in SECURITY.md.
+Report vulnerabilities to arseny@tentixo.com — not in public issues.
+
+
+License
+-------
+
+Apache-2.0. See LICENSE.
