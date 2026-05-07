@@ -24,6 +24,8 @@ temp/
 # Distribution artifacts
 *.tar.gz
 *.zip
+.dist_checksums
+.backup_*
 
 # Local Claude Code settings (per-developer)
 .claude/settings.local.json

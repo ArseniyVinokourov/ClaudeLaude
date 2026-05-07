@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 sys.path.insert(0, os.path.dirname(__file__))
 
 from config import (OWNER_ID, PROJECTS_DIR, HOOK_PORT,
+                    AUTO_UPDATE, AUTO_UPDATE_POLICY, BOT_DIR,
                     get_forum_chat_id, set_forum_chat_id,
                     get_pinned_help_id, set_pinned_help_id,
                     get_dashboard_id, set_dashboard_id)
@@ -1473,6 +1474,163 @@ def _build_dashboard() -> str:
         parts.append(_usage_cache)
     return "\n".join(parts)
 
+
+def _git(*args: str) -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "-C", BOT_DIR, *args],
+            stderr=subprocess.DEVNULL, text=True,
+        ).strip()
+    except Exception:
+        return ""
+
+
+def _check_update() -> tuple[str, str] | None:
+    """Return (current_ver, latest_ver) if an update is available, else None."""
+    _git("fetch", "--tags", "origin")
+    from version import get_version
+    current = get_version()
+    tags = _git("tag", "-l", "v*")
+    if not tags:
+        return None
+    latest_tag = sorted(tags.splitlines(), key=lambda t: [
+        int(x) for x in t.lstrip("v").split(".") if x.isdigit()
+    ])[-1]
+    latest = latest_tag.lstrip("v")
+    local_head = _git("rev-parse", "HEAD")
+    remote_head = _git("rev-parse", "origin/main")
+    if local_head == remote_head and local_head:
+        return None
+    if current.split("+")[0] == latest:
+        return None
+    return current, latest
+
+
+def _has_local_changes() -> list[str]:
+    """Return list of files modified compared to .dist_checksums."""
+    checksums_path = os.path.join(BOT_DIR, ".dist_checksums")
+    if not os.path.isfile(checksums_path):
+        return []
+    import hashlib
+    modified = []
+    with open(checksums_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("  ", 1)
+            if len(parts) != 2:
+                continue
+            expected_hash, filepath = parts
+            full = os.path.join(BOT_DIR, filepath)
+            if not os.path.isfile(full):
+                continue
+            with open(full, "rb") as fh:
+                actual = hashlib.sha256(fh.read()).hexdigest()
+            if actual != expected_hash:
+                modified.append(filepath)
+    return modified
+
+
+def _run_update(non_interactive=False, policy=None) -> tuple[bool, str]:
+    """Run update.sh; return (success, output)."""
+    cmd = ["bash", os.path.join(BOT_DIR, "update.sh")]
+    if non_interactive:
+        cmd.append("--non-interactive")
+    if policy:
+        cmd.append(f"--policy={policy}")
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=120, cwd=BOT_DIR)
+        return r.returncode == 0, r.stdout + r.stderr
+    except Exception as e:
+        return False, str(e)
+
+
+def _restart_bot():
+    """Re-exec the bot process."""
+    print("[update] restarting bot...", file=sys.stderr, flush=True)
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+def cmd_update(chat_id, thread_id=None):
+    mid = _reply(chat_id, thread_id, "⏳ Checking for updates...")
+
+    def _do_check():
+        result = _check_update()
+        if mid:
+            tg.delete(mid, chat_id)
+        if not result:
+            if not thread_id:
+                _ephemeral(chat_id, "✅ Already up to date.", seconds=5)
+            else:
+                tg.send("✅ Already up to date.", chat_id,
+                        thread_id=thread_id)
+            return
+
+        current, latest = result
+        modified = _has_local_changes()
+
+        text = f"<b>Update available</b>\n{tg.esc(current)} → <b>{tg.esc(latest)}</b>"
+        if modified:
+            text += f"\n\n⚠️ {len(modified)} locally modified file(s):"
+            for f in modified[:5]:
+                text += f"\n  <code>{tg.esc(f)}</code>"
+            if len(modified) > 5:
+                text += f"\n  … and {len(modified) - 5} more"
+
+        buttons = [[
+            {"text": "⬆️ Update now", "callback_data": "upd:go"},
+            {"text": "❌ Cancel", "callback_data": "upd:no"},
+        ]]
+        _reply(chat_id, thread_id, text, buttons=buttons)
+
+    threading.Thread(target=_do_check, daemon=True).start()
+
+
+def _auto_update_loop():
+    """Background thread: check for updates at startup + every hour."""
+    if not AUTO_UPDATE:
+        return
+    time.sleep(10)
+    while bot_running:
+        try:
+            result = _check_update()
+            if result:
+                current, latest = result
+                modified = _has_local_changes()
+                if not modified:
+                    print(f"[auto-update] {current} → {latest}, no local changes, updating",
+                          file=sys.stderr, flush=True)
+                    ok, output = _run_update(non_interactive=True)
+                    if ok:
+                        _restart_bot()
+                    else:
+                        print(f"[auto-update] failed: {output[:200]}",
+                              file=sys.stderr, flush=True)
+                elif AUTO_UPDATE_POLICY == "replace":
+                    print(f"[auto-update] {current} → {latest}, {len(modified)} modified, policy=replace",
+                          file=sys.stderr, flush=True)
+                    ok, output = _run_update(non_interactive=True, policy="replace")
+                    if ok:
+                        _restart_bot()
+                    else:
+                        print(f"[auto-update] failed: {output[:200]}",
+                              file=sys.stderr, flush=True)
+                else:
+                    fid = forum()
+                    if fid:
+                        _ephemeral(fid,
+                                   f"⬆️ Update available: {tg.esc(current)} → <b>{tg.esc(latest)}</b>\n"
+                                   f"{len(modified)} locally modified file(s). Use /update to review.",
+                                   seconds=30)
+        except Exception as e:
+            print(f"[auto-update] error: {e}", file=sys.stderr, flush=True)
+        for _ in range(3600):
+            if not bot_running:
+                return
+            time.sleep(1)
+
 _HELP_TEXT = (
     "<b>ClaudeLaude — Help</b>\n"
     "\n"
@@ -1492,6 +1650,7 @@ _HELP_TEXT = (
     "/display [mobile|desktop] — toggle view\n"
     "\n"
     "<b>Other</b>\n"
+    "/update — check for bot updates\n"
     "/menu — quick actions\n"
     "/help — this message\n"
     "/stop_bot — shutdown bot\n"
@@ -1505,12 +1664,12 @@ _HELP_TEXT = (
 _KNOWN_COMMANDS = {
     "/setup", "/new", "/sessions", "/resume", "/history", "/stop",
     "/interrupt", "/restart", "/usage", "/display", "/test_perm",
-    "/stop_bot", "/help", "/start", "/menu",
+    "/update", "/stop_bot", "/help", "/start", "/menu",
 }
 
 _HELP_DOCUMENTED_COMMANDS = {
     "/new", "/sessions", "/resume", "/stop", "/interrupt", "/restart",
-    "/history", "/usage", "/display",
+    "/history", "/usage", "/display", "/update",
     "/menu", "/help", "/stop_bot",
 }
 
@@ -1744,8 +1903,10 @@ def main():
         {"command": "history", "description": "Last N events"},
         {"command": "usage", "description": "Token usage"},
         {"command": "display", "description": "Toggle mobile/desktop"},
+        {"command": "update", "description": "Check for bot updates"},
         {"command": "help", "description": "Show help"},
     ])
+    threading.Thread(target=_auto_update_loop, daemon=True).start()
     _refresh_usage_cache()
     _sync_dashboard()
 
@@ -1877,6 +2038,8 @@ def _handle_command(cmd, args, chat_id, thread_id, session):
         cmd_usage(session, chat_id, thread_id)
     elif cmd == "/display":
         cmd_display(chat_id, thread_id, args)
+    elif cmd == "/update":
+        cmd_update(chat_id, thread_id)
     elif cmd == "/test_perm":
         cmd_test_perm(chat_id, thread_id)
     elif cmd == "/stop_bot":
@@ -2059,6 +2222,32 @@ def _handle_callback(cb, data):
         if cb_chat and cb_msg:
             tg.delete(cb_msg, cb_chat)
         return
+
+    elif data.startswith("upd:"):
+        action = data[4:]
+        if action == "go":
+            if cb_msg and cb_chat:
+                tg.edit(cb_msg, "⬆️ Updating...", cb_chat)
+
+            def _do_update():
+                modified = _has_local_changes()
+                policy = AUTO_UPDATE_POLICY if modified else None
+                ok, output = _run_update(non_interactive=True, policy=policy)
+                if ok:
+                    if cb_chat:
+                        tg.send("✅ Updated. Restarting...", cb_chat,
+                                thread_id=cb_thread)
+                    time.sleep(1)
+                    _restart_bot()
+                else:
+                    msg = f"❌ Update failed:\n<code>{tg.esc(output[:500])}</code>"
+                    if cb_chat:
+                        tg.send(msg, cb_chat, thread_id=cb_thread)
+
+            threading.Thread(target=_do_update, daemon=True).start()
+        elif action == "no":
+            if cb_msg and cb_chat:
+                tg.delete(cb_msg, cb_chat)
 
     elif data.startswith("m:"):
         action = data[2:]
