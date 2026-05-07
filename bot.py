@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from config import (OWNER_ID, PROJECTS_DIR, HOOK_PORT,
                     get_forum_chat_id, set_forum_chat_id,
-                    get_pinned_help_id,
+                    get_pinned_help_id, set_pinned_help_id,
                     get_dashboard_id, set_dashboard_id)
 import telegram as tg
 from sessions import Session, SessionManager
@@ -334,6 +334,7 @@ def on_result(session, result_text, summary):
         tg.edit_forum_topic(fid, session.topic_id, stop_label)
         with state.lock:
             state.topic_labels[session.topic_id] = stop_label
+        session.topic_label = stop_label
     elif session.topic_id not in state.renamed_topics and result_text.strip():
         with state.lock:
             state.renamed_topics.add(session.topic_id)
@@ -394,6 +395,7 @@ def _auto_rename_topic(session, result_text, fid):
             tg.edit_forum_topic(fid, session.topic_id, label[:128])
             with state.lock:
                 state.topic_labels[session.topic_id] = label[:128]
+            session.topic_label = label[:128]
             session.name = title
             mgr._persist()
 
@@ -538,12 +540,15 @@ def _resolve_hook_session(claude_session_id, data):
     with state.lock:
         state.topic_labels[topic_id] = label
     if claude_session_id:
-        return mgr.register_terminal(claude_session_id, topic_id, cwd=cwd)
+        s = mgr.register_terminal(claude_session_id, topic_id, cwd=cwd)
+        s.topic_label = label
+        return s
     _log(f"registered topic {topic_id} (no claude session_id)")
     sid = uuid.uuid4().hex[:8]
     session = Session(
         sid=sid, topic_id=topic_id, cwd=cwd,
         name=dirname, is_bot_spawned=False,
+        topic_label=label,
     )
     mgr._sessions[sid] = session
     mgr._topic_map[topic_id] = sid
@@ -792,13 +797,14 @@ def _spawn_session(cwd, name=None):
         return
     with state.lock:
         state.topic_labels[topic_id] = label
-    mgr.create(cwd=cwd, name=name, topic_id=topic_id)
+    s = mgr.create(cwd=cwd, name=name, topic_id=topic_id)
+    s.topic_label = label
     send_to_topic(topic_id,
                   f"▶️ <code>{tg.esc(cwd)}</code>")
     url = _topic_url(topic_id)
     if url:
-        _ephemeral(fid, "▶️",
-                   buttons=[[{"text": f"Open {name}", "url": url}]],
+        _ephemeral(fid, f"▶ {name}",
+                   buttons=[[{"text": "Open", "url": url}]],
                    seconds=5)
 
 
@@ -1081,13 +1087,14 @@ def _do_resume(claude_session_id: str, chat_id, thread_id=None):
         return
     with state.lock:
         state.topic_labels[topic_id] = label
-    mgr.resume(claude_session_id, topic_id, name, cwd)
+    s = mgr.resume(claude_session_id, topic_id, name, cwd)
+    s.topic_label = label
     send_to_topic(topic_id,
                   f"▶️ <code>{tg.esc(cwd)}</code>")
     url = _topic_url(topic_id)
     if url:
-        _ephemeral(fid, "▶️",
-                   buttons=[[{"text": f"Open {name}", "url": url}]],
+        _ephemeral(fid, f"▶ {name}",
+                   buttons=[[{"text": "Open", "url": url}]],
                    seconds=5)
 
 
@@ -1221,6 +1228,7 @@ def cmd_stop(session, chat_id, thread_id):
         tg.edit_forum_topic(fid, session.topic_id, stop_label)
         with state.lock:
             state.topic_labels[session.topic_id] = stop_label
+        session.topic_label = stop_label
         tg.close_forum_topic(fid, session.topic_id)
     tg.send("⏹ Stopped", chat_id, thread_id=thread_id)
 
@@ -1270,6 +1278,7 @@ def cmd_restart(chat_id, thread_id):
             tg.edit_forum_topic(fid, session.topic_id, restart_label)
             with state.lock:
                 state.topic_labels[session.topic_id] = restart_label
+            session.topic_label = restart_label
         tg.send("▶️ Restarted", chat_id,
                 thread_id=thread_id)
     else:
@@ -1412,17 +1421,26 @@ def cmd_test_perm(chat_id, thread_id=None):
                 body = json.loads(resp.read().decode())
                 dec = body.get("hookSpecificOutput", {}).get(
                     "permissionDecision", "?")
-                tg.send(
-                    f"✅ Test OK! Decision: <b>{tg.esc(dec)}</b>",
-                    chat_id, thread_id=thread_id)
+                if thread_id:
+                    tg.send(f"Test OK! Decision: {tg.esc(dec)}",
+                            chat_id, thread_id=thread_id)
+                else:
+                    _ephemeral(chat_id, f"Test OK! Decision: {tg.esc(dec)}",
+                               seconds=7)
         except Exception as e:
-            tg.send(
-                f"❌ Test failed: <code>{tg.esc(str(e))}</code>",
-                chat_id, thread_id=thread_id)
+            msg = f"Test failed: {tg.esc(str(e))}"
+            if thread_id:
+                tg.send(msg, chat_id, thread_id=thread_id)
+            else:
+                _ephemeral(chat_id, msg, seconds=7)
 
     threading.Thread(target=_do_test, daemon=True).start()
-    tg.send("\U0001f9ea Test permission sent — click Allow/Deny "
-            "when buttons appear.", chat_id, thread_id=thread_id)
+    if thread_id:
+        tg.send("Test permission sent — click Allow/Deny.",
+                chat_id, thread_id=thread_id)
+    else:
+        _ephemeral(chat_id, "Test permission sent — click Allow/Deny.",
+                   seconds=10)
 
 
 _usage_cache: str | None = None
@@ -1432,7 +1450,7 @@ _USAGE_CACHE_TTL = 300
 
 def _build_dashboard() -> str:
     from version import get_version
-    ver = get_version()
+    ver = get_version().split("+")[0]
     active = sum(1 for s in mgr._sessions.values() if s.alive)
     parts = [f"<b>ClaudeLaude</b> v{tg.esc(ver)}"]
     if active:
@@ -1565,6 +1583,7 @@ def _sync_dashboard():
             print(f"[dashboard] edit failed: {e} {body}",
                   file=sys.stderr, flush=True)
             set_dashboard_id(None)
+            set_pinned_help_id(None)
     try:
         tg._req("unpinAllChatMessages", {"chat_id": fid})
     except Exception:
@@ -1691,6 +1710,10 @@ def _topic_healthcheck():
 def main():
     global bot_running
 
+    for s in mgr.list_sessions():
+        if s.topic_id and s.topic_label:
+            with state.lock:
+                state.topic_labels[s.topic_id] = s.topic_label
     bridge.start()
     threading.Thread(target=_topic_healthcheck, daemon=True).start()
     threading.Thread(target=_dashboard_loop, daemon=True).start()
@@ -1742,6 +1765,15 @@ def _handle_update(u):
           f"text={text[:60] or caption[:60]}",
           file=sys.stderr, flush=True)
 
+    # Auto-delete pin service messages from bot in General
+    if msg.get("pinned_message"):
+        fid = forum()
+        if fid and chat_id == fid:
+            mid = msg.get("message_id")
+            if mid:
+                tg.delete(mid, chat_id)
+        return
+
     if from_user != OWNER_ID:
         return
 
@@ -1791,7 +1823,10 @@ def _handle_update(u):
                 tg.send("⚠️ Session died", chat_id,
                         thread_id=thread_id)
         elif session:
-            tg.send("ℹ️ Terminal session — use terminal",
+            tg.send("Terminal session — use terminal",
+                    chat_id, thread_id=thread_id)
+        elif thread_id:
+            tg.send("No active session. Use /restart or /new",
                     chat_id, thread_id=thread_id)
         elif chat_id == OWNER_ID:
             tg.send("Use in a session topic, or /new",
@@ -1870,7 +1905,7 @@ def _handle_callback(cb, data):
             bridge.resolve_permission(full_id, decision)
             if entry:
                 msg_id, perm_chat, _ = entry
-                mark = "✅" if decision == "allow" else "❌"
+                mark = "✓ Allowed" if decision == "allow" else "✗ Denied"
                 tg.edit(msg_id, mark, perm_chat)
                 def _del_perm(mid=msg_id, cid=perm_chat):
                     time.sleep(1)
@@ -1982,6 +2017,7 @@ def _handle_callback(cb, data):
                         state.topic_labels[topic_id] = label
                     session = mgr.fork(parent, topic_id, parent.name)
                     if session:
+                        session.topic_label = label
                         send_to_topic(topic_id,
                                       f"\U0001f500 Fork of <b>{tg.esc(parent.name)}</b>")
                         _send_fork_summary(parent, topic_id)
@@ -1999,9 +2035,7 @@ def _handle_callback(cb, data):
     elif data.startswith("m:"):
         action = data[2:]
         session = mgr.by_topic(cb_thread) if cb_thread else None
-        # Self-delete the menu on action (except inline-friendly ones)
-        if action not in ("help",) and cb_chat and cb_msg:
-            tg.delete(cb_msg, cb_chat)
+        # Don't delete the source message — it may be the dashboard pin
         if action == "new":
             cmd_new("", chat_id=cb_chat, thread_id=cb_thread)
         elif action == "sessions":

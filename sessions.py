@@ -47,6 +47,7 @@ class Session:
     total_cache_read: int = 0
     total_cache_create: int = 0
     total_cost_usd: float = 0.0
+    topic_label: str = ""
     turn_input_tokens: int = 0
     turn_output_tokens: int = 0
     pending_images: list[str] = field(default_factory=list)
@@ -266,6 +267,7 @@ class SessionManager:
                     "topic_id": s.topic_id,
                     "cwd": s.cwd,
                     "name": s.name,
+                    "topic_label": s.topic_label,
                     "claude_session_id": s.claude_session_id,
                     "is_bot_spawned": s.is_bot_spawned,
                     "alive": s.alive,
@@ -325,6 +327,7 @@ class SessionManager:
                 total_cache_read=r.get("total_cache_read", 0),
                 total_cache_create=r.get("total_cache_create", 0),
                 total_cost_usd=r.get("total_cost_usd", 0.0),
+                topic_label=r.get("topic_label", ""),
                 history=history,
             )
             self._sessions[sid] = session

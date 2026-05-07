@@ -508,10 +508,9 @@ def test_permission_done_ephemeral(bot, tmp_path):
     ))
     _drain_updates(bot)
 
-    # The edit should show just "✅" (no "done" suffix).
     edits = bot.tg.calls_of("editMessageText")
-    assert any(e["text"] == "✅" for e in edits), \
-        f"expected edit to '✅', got: {[e['text'] for e in edits]}"
+    assert any(e["text"] == "✓ Allowed" for e in edits), \
+        f"expected edit to '✓ Allowed', got: {[e['text'] for e in edits]}"
 
 
 # ── 14. compact button replaces ✅ finish line ─────────────────────

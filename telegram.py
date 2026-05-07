@@ -276,7 +276,15 @@ def topic_alive(chat_id: int, thread_id: int, name: str | None = None) -> bool:
                 "name": name[:128],
             })
             return True
-        except Exception:
+        except Exception as e:
+            body = ""
+            if hasattr(e, "response") and e.response is not None:
+                try:
+                    body = e.response.text
+                except Exception:
+                    pass
+            if "not_modified" in body.lower() or "not modified" in body.lower():
+                return True
             return False
     try:
         r = _req("sendMessage", {
