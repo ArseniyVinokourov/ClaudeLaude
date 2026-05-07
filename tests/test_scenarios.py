@@ -43,7 +43,6 @@ def test_new_creates_topic_and_greets(bot, tmp_path):
         p for p in bot.tg.calls_of("sendMessage")
         if p.get("message_thread_id") == 100
     )
-    assert "Session started" in greeting["text"]
     assert str(cwd) in greeting["text"]
 
 
@@ -469,3 +468,125 @@ def test_send_long_splits_at_newline(bot):
     # First chunk should end at the newline (no B leaked into chunk 1).
     assert "B" not in bodies[0]
     assert "A" not in bodies[1]
+
+
+# ── 13. permission done → ephemeral 1s (edit + schedule delete) ────
+
+def test_permission_done_ephemeral(bot, tmp_path):
+    """After Allow/Deny, the perm message is edited to ✅/❌ and
+    scheduled for deletion (1s ephemeral instead of permanent)."""
+    cwd = tmp_path / "demo"
+    cwd.mkdir(exist_ok=True)
+    bot.tg.inject_update(text_update(
+        f"/new {cwd}",
+        owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
+    ))
+    _drain_updates(bot)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    bot.mod.mgr.link_claude_id("claude-perm-eph", sess)
+    bot.tg.reset()
+
+    import threading
+    req_id = "req-eph"
+    bot.mod.bridge._pending[req_id] = threading.Event()
+    bot.mod.on_hook_permission(req_id, {
+        "tool_name": "Bash",
+        "tool_input": {"command": "echo hi"},
+        "session_id": "claude-perm-eph",
+    })
+    perm_msg = next(
+        m for m in bot.tg.calls_of("sendMessage")
+        if "reply_markup" in m
+    )
+    flat = [b for row in perm_msg["reply_markup"]["inline_keyboard"]
+            for b in row]
+    allow_btn = next(b for b in flat if "Allow" in b["text"])
+
+    bot.tg.inject_update(callback_update(
+        allow_btn["callback_data"],
+        owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
+    ))
+    _drain_updates(bot)
+
+    edits = bot.tg.calls_of("editMessageText")
+    assert any(e["text"] == "✓ Allowed" for e in edits), \
+        f"expected edit to '✓ Allowed', got: {[e['text'] for e in edits]}"
+
+
+# ── 14. compact button replaces ✅ finish line ─────────────────────
+
+def test_compact_button_no_checkmark(bot, tmp_path):
+    """Turn completion shows Compact button, NOT the old ✅ stats line."""
+    cwd = tmp_path / "demo"
+    cwd.mkdir(exist_ok=True)
+    bot.tg.inject_update(text_update(
+        f"/new {cwd}",
+        owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
+    ))
+    _drain_updates(bot)
+    bot.tg.reset()
+
+    bot.claude.script([
+        {"type": "system", "session_id": "claude-compact"},
+        {"type": "tool_use", "name": "Bash",
+         "input": {"command": "ls"}},
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "listed files"},
+        ]}},
+        {"type": "result", "session_id": "claude-compact",
+         "usage": {"input_tokens": 10, "output_tokens": 5}},
+    ])
+    bot.tg.inject_update(text_update(
+        "list", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, thread_id=100,
+    ))
+    _drain_updates(bot)
+    bot.tg.wait_for_call("sendMessage", message_thread_id=100, timeout=3)
+
+    # Compact button is now added via editMessageReplyMarkup on last msg.
+    edits = bot.tg.calls_of("editMessageReplyMarkup")
+    compact_edits = [
+        e for e in edits
+        if "reply_markup" in e
+        and any("Compact" in b["text"]
+                for row in e["reply_markup"]["inline_keyboard"]
+                for b in row)
+    ]
+    assert compact_edits, "no Compact button via editMessageReplyMarkup"
+    # No separate "·" or "✅" anchor message.
+    anchor_msgs = [
+        m for m in bot.tg.calls_of("sendMessage")
+        if m.get("message_thread_id") == 100
+        and m.get("text") in ("·", "✅")
+    ]
+    assert not anchor_msgs, f"unexpected anchor message: {anchor_msgs}"
+
+
+# ── 15. close button deletes message ──────────────────────────────
+
+def test_close_button_deletes_message(bot, tmp_path):
+    bot.tg.inject_update(callback_update(
+        "close",
+        owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id,
+        message_id=999,
+    ))
+    _drain_updates(bot)
+    assert 999 in bot.tg.deleted_messages
+
+
+# ── 16. dashboard build ───────────────────────────────────────────
+
+def test_dashboard_build(bot, tmp_path):
+    """Dashboard text includes version and session count."""
+    cwd = tmp_path / "demo"
+    cwd.mkdir(exist_ok=True)
+    bot.tg.inject_update(text_update(
+        f"/new {cwd}",
+        owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
+    ))
+    _drain_updates(bot)
+
+    text = bot.mod._build_dashboard()
+    assert "ClaudeLaude" in text
+    assert "1 active" in text

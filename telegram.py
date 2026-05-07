@@ -49,11 +49,25 @@ def _req(method: str, params: dict | None = None) -> dict:
 
 _FENCE_RE = re.compile(r'```\w*\n?(.*?)```', re.DOTALL)
 _INLINE_CODE_RE = re.compile(r'`([^`\n]+)`')
-_BOLD_RE = re.compile(r'\*\*(.+?)\*\*', re.DOTALL)
-_ITALIC_RE = re.compile(r'\*(\S.*?\S|\S)\*')
+_BOLD_ITALIC_RE = re.compile(r'\*{3}(.+?)\*{3}')
+_BOLD_RE = re.compile(r'\*\*(.+?)\*\*')
+_ITALIC_RE = re.compile(r'(?<!\*)\*(?!\*)(\S(?:[^*<]*\S)?)\*(?!\*)')
 _STRIKE_RE = re.compile(r'~~(.+?)~~')
 _LINK_RE = re.compile(r'\[([^\]]+)\]\(([^)]+)\)')
 _HEADING_RE = re.compile(r'^#{1,6}\s+(.+)$', re.MULTILINE)
+_TAG_RE = re.compile(r'<(/?)([bisa]|pre|code)(?:\s[^>]*)?\s*>')
+
+
+def _tags_balanced(text: str) -> bool:
+    stack: list[str] = []
+    for m in _TAG_RE.finditer(text):
+        if m.group(1):
+            if not stack or stack[-1] != m.group(2):
+                return False
+            stack.pop()
+        else:
+            stack.append(m.group(2))
+    return not stack
 
 
 def md_to_html(text: str) -> str:
@@ -74,8 +88,14 @@ def md_to_html(text: str) -> str:
 
     text = esc(text)
 
-    text = _HEADING_RE.sub(r'<b>\1</b>', text)
+    text = _BOLD_ITALIC_RE.sub(r'<b><i>\1</i></b>', text)
     text = _BOLD_RE.sub(r'<b>\1</b>', text)
+
+    def _heading_sub(m):
+        inner = re.sub(r'</?[bi]>', '', m.group(1))
+        return f'<b>{inner}</b>'
+    text = _HEADING_RE.sub(_heading_sub, text)
+
     text = _ITALIC_RE.sub(r'<i>\1</i>', text)
     text = _STRIKE_RE.sub(r'<s>\1</s>', text)
     text = _LINK_RE.sub(r'<a href="\2">\1</a>', text)
@@ -84,6 +104,10 @@ def md_to_html(text: str) -> str:
         text = text.replace(f"\x00B{i}\x00", f"<pre>{esc(block)}</pre>")
     for i, code in enumerate(codes):
         text = text.replace(f"\x00C{i}\x00", f"<code>{esc(code)}</code>")
+
+    if not _tags_balanced(text):
+        text = re.sub(r'<[^>]+>', '', text)
+
     return text
 
 
@@ -259,14 +283,33 @@ def send_chat_action(chat_id: int, action: str = "typing",
         return False
 
 
-def topic_alive(chat_id: int, thread_id: int) -> bool:
+def topic_alive(chat_id: int, thread_id: int, name: str | None = None) -> bool:
     """Probe whether a forum topic still exists.
 
-    sendChatAction returns OK even for deleted topics, so we use a
-    send-and-delete pair: a single zero-width character with notification
-    disabled, immediately removed.  Returns False if sendMessage rejects
-    the thread_id (the canonical "message thread not found" 400).
+    When `name` is provided, uses editForumTopic (truly silent — no
+    message, no notification).  Returns TOPIC_ID_INVALID for deleted
+    topics, ok:true for alive ones.
+
+    Without `name`, falls back to send-and-delete (visible but brief).
     """
+    if name:
+        try:
+            _req("editForumTopic", {
+                "chat_id": chat_id,
+                "message_thread_id": thread_id,
+                "name": name[:128],
+            })
+            return True
+        except Exception as e:
+            body = ""
+            if hasattr(e, "response") and e.response is not None:
+                try:
+                    body = e.response.text
+                except Exception:
+                    pass
+            if "not_modified" in body.lower() or "not modified" in body.lower():
+                return True
+            return False
     try:
         r = _req("sendMessage", {
             "chat_id": chat_id,
@@ -309,23 +352,32 @@ def answer_callback(callback_id: str):
         _log(f"answer_callback error: {e}")
 
 
+_TOPIC_ICON_EMOJI_ID = "5417915203100613993"  # 💬
+
+
 def create_forum_topic(chat_id: int, label: str,
                        icon_color: int = 0x6FB9F0) -> int | None:
-    r = _req("createForumTopic", {
+    params: dict = {
         "chat_id": chat_id,
         "name": label[:128],
         "icon_color": icon_color,
-    })
+        "icon_custom_emoji_id": _TOPIC_ICON_EMOJI_ID,
+    }
+    r = _req("createForumTopic", params)
     return r.get("result", {}).get("message_thread_id")
 
 
-def edit_forum_topic(chat_id: int, topic_id: int, label: str):
+def edit_forum_topic(chat_id: int, topic_id: int, label: str,
+                     icon_custom_emoji_id: str | None = None):
+    params: dict = {
+        "chat_id": chat_id,
+        "message_thread_id": topic_id,
+        "name": label[:128],
+    }
+    if icon_custom_emoji_id is not None:
+        params["icon_custom_emoji_id"] = icon_custom_emoji_id
     try:
-        _req("editForumTopic", {
-            "chat_id": chat_id,
-            "message_thread_id": topic_id,
-            "name": label[:128],
-        })
+        _req("editForumTopic", params)
     except Exception as e:
         _log(f"edit_forum_topic error: {e}")
 
