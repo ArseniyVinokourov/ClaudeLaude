@@ -14,4 +14,4 @@ The maintainer ([@ArseniyVinokourov](https://github.com/ArseniyVinokourov)) has 
 
 ## Reporting
 
-Email [arseny@tentixo.com](mailto:arseny@tentixo.com). Reports are confidential.
+Email [a.vinokourov418@gmail.com](mailto:a.vinokourov418@gmail.com). Reports are confidential.
