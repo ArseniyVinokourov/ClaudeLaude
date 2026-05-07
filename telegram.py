@@ -259,14 +259,25 @@ def send_chat_action(chat_id: int, action: str = "typing",
         return False
 
 
-def topic_alive(chat_id: int, thread_id: int) -> bool:
+def topic_alive(chat_id: int, thread_id: int, name: str | None = None) -> bool:
     """Probe whether a forum topic still exists.
 
-    sendChatAction returns OK even for deleted topics, so we use a
-    send-and-delete pair: a single zero-width character with notification
-    disabled, immediately removed.  Returns False if sendMessage rejects
-    the thread_id (the canonical "message thread not found" 400).
+    When `name` is provided, uses editForumTopic (truly silent — no
+    message, no notification).  Returns TOPIC_ID_INVALID for deleted
+    topics, ok:true for alive ones.
+
+    Without `name`, falls back to send-and-delete (visible but brief).
     """
+    if name:
+        try:
+            _req("editForumTopic", {
+                "chat_id": chat_id,
+                "message_thread_id": thread_id,
+                "name": name[:128],
+            })
+            return True
+        except Exception:
+            return False
     try:
         r = _req("sendMessage", {
             "chat_id": chat_id,

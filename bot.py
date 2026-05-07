@@ -59,6 +59,7 @@ class BotState:
         self.topic_counter: dict[str, int] = {}
         self.renamed_topics: set[int] = set()
         self.saved_turns: dict[str, tuple[list[int], list[str], list[str]]] = {}
+        self.topic_labels: dict[int, str] = {}
 
 
 state = BotState()
@@ -329,7 +330,10 @@ def on_result(session, result_text, summary):
         send_to_topic(session.topic_id, anchor, buttons=btn)
 
     if not session.alive:
-        tg.edit_forum_topic(fid, session.topic_id, f"⏹ {session.name}")
+        stop_label = f"⏹ {session.name}"
+        tg.edit_forum_topic(fid, session.topic_id, stop_label)
+        with state.lock:
+            state.topic_labels[session.topic_id] = stop_label
     elif session.topic_id not in state.renamed_topics and result_text.strip():
         with state.lock:
             state.renamed_topics.add(session.topic_id)
@@ -388,6 +392,8 @@ def _auto_rename_topic(session, result_text, fid):
         if title:
             label = f"\U0001f7e2 {title}"
             tg.edit_forum_topic(fid, session.topic_id, label[:128])
+            with state.lock:
+                state.topic_labels[session.topic_id] = label[:128]
             session.name = title
             mgr._persist()
 
@@ -529,6 +535,8 @@ def _resolve_hook_session(claude_session_id, data):
     if not topic_id:
         _log("create_forum_topic returned None")
         return None
+    with state.lock:
+        state.topic_labels[topic_id] = label
     if claude_session_id:
         return mgr.register_terminal(claude_session_id, topic_id, cwd=cwd)
     _log(f"registered topic {topic_id} (no claude session_id)")
@@ -782,6 +790,8 @@ def _spawn_session(cwd, name=None):
     if not topic_id:
         _ephemeral(fid, "❌ Failed to create topic. Check bot admin rights.", seconds=7)
         return
+    with state.lock:
+        state.topic_labels[topic_id] = label
     mgr.create(cwd=cwd, name=name, topic_id=topic_id)
     send_to_topic(topic_id,
                   f"▶️ <code>{tg.esc(cwd)}</code>")
@@ -1069,6 +1079,8 @@ def _do_resume(claude_session_id: str, chat_id, thread_id=None):
     if not topic_id:
         _ephemeral(fid, "❌ Failed to create topic.", seconds=7)
         return
+    with state.lock:
+        state.topic_labels[topic_id] = label
     mgr.resume(claude_session_id, topic_id, name, cwd)
     send_to_topic(topic_id,
                   f"▶️ <code>{tg.esc(cwd)}</code>")
@@ -1205,7 +1217,10 @@ def cmd_stop(session, chat_id, thread_id):
     mgr.stop(session.sid)
     fid = forum()
     if fid and session.topic_id:
-        tg.edit_forum_topic(fid, session.topic_id, f"⏹ {session.name}")
+        stop_label = f"⏹ {session.name}"
+        tg.edit_forum_topic(fid, session.topic_id, stop_label)
+        with state.lock:
+            state.topic_labels[session.topic_id] = stop_label
         tg.close_forum_topic(fid, session.topic_id)
     tg.send("⏹ Stopped", chat_id, thread_id=thread_id)
 
@@ -1250,9 +1265,11 @@ def cmd_restart(chat_id, thread_id):
     if mgr.restart(session.sid):
         fid = forum()
         if fid:
+            restart_label = f"\U0001f7e2 {session.name}"
             tg.reopen_forum_topic(fid, session.topic_id)
-            tg.edit_forum_topic(fid, session.topic_id,
-                                f"\U0001f7e2 {session.name}")
+            tg.edit_forum_topic(fid, session.topic_id, restart_label)
+            with state.lock:
+                state.topic_labels[session.topic_id] = restart_label
         tg.send("▶️ Restarted", chat_id,
                 thread_id=thread_id)
     else:
@@ -1417,17 +1434,9 @@ def _build_dashboard() -> str:
     from version import get_version
     ver = get_version()
     active = sum(1 for s in mgr._sessions.values() if s.alive)
-    stopped = sum(1 for s in mgr._sessions.values() if not s.alive)
     parts = [f"<b>ClaudeLaude</b> v{tg.esc(ver)}"]
-    if active or stopped:
-        segs = []
-        if active:
-            segs.append(f"▶ {active} active")
-        if stopped:
-            segs.append(f"⏹ {stopped} stopped")
-        parts.append(" · ".join(segs))
-    else:
-        parts.append("No sessions")
+    if active:
+        parts.append(f"▶ {active} active")
     if _usage_cache:
         parts.append(_usage_cache)
     return "\n".join(parts)
@@ -1437,21 +1446,28 @@ _HELP_TEXT = (
     "\n"
     "<b>Sessions</b>\n"
     "/new — project picker\n"
-    "/new &lt;path&gt; — session in dir\n"
-    "/sessions — list + fork\n"
-    "/resume — continue session\n"
-    "/stop · /restart · /interrupt\n"
+    "/new &lt;path&gt; [name] — session in dir\n"
+    "/sessions — list sessions + fork\n"
+    "/resume — pick session to continue\n"
+    "/resume &lt;id&gt; — continue by session id\n"
+    "/stop — stop current session\n"
+    "/restart — restart stopped session\n"
+    "/interrupt — abort current turn\n"
     "\n"
     "<b>In topic</b>\n"
-    "/history [N] — last N events\n"
-    "/usage — tokens + limits\n"
-    "/display — toggle mobile/desktop\n"
+    "/history [N] — last N events (default 30)\n"
+    "/usage — session tokens + account limits\n"
+    "/display [mobile|desktop] — toggle view\n"
     "\n"
     "<b>Other</b>\n"
-    "/menu · /help · /stop_bot\n"
+    "/menu — quick actions\n"
+    "/help — this message\n"
+    "/stop_bot — shutdown bot\n"
     "\n"
-    "Unknown /commands → Claude.\n"
-    "Photos/files → attachments."
+    "Unknown /commands in bot sessions are\n"
+    "forwarded to Claude as user messages.\n"
+    "Photos/files in bot topics are sent\n"
+    "to the session as attachments."
 )
 
 _KNOWN_COMMANDS = {
@@ -1654,21 +1670,21 @@ def _dashboard_loop():
 def _topic_healthcheck():
     """Periodically check that session topics still exist; stop orphans.
 
-    Probes only idle sessions (no activity for >120s) to avoid noise from
-    the send-and-delete probe in active topics.
+    Uses editForumTopic with the stored label as a silent probe — no
+    messages sent, no notifications.  Falls back to send-and-delete when
+    no label is tracked.
     """
     while bot_running:
-        time.sleep(120)
+        time.sleep(30)
         fid = forum()
         if not fid:
             continue
-        now = time.time()
         for session in mgr.list_sessions():
             if not session.topic_id:
                 continue
-            if now - _session_last_active(session) < 120:
-                continue
-            if not tg.topic_alive(fid, session.topic_id):
+            with state.lock:
+                label = state.topic_labels.get(session.topic_id)
+            if not tg.topic_alive(fid, session.topic_id, name=label):
                 _invalidate_and_stop(session, "topic deleted")
 
 
@@ -1962,6 +1978,8 @@ def _handle_callback(cb, data):
                 label = f"\U0001f500 {parent.name} fork — {ts}"
                 topic_id = tg.create_forum_topic(fid, label, icon_color=0x6FB9F0)
                 if topic_id:
+                    with state.lock:
+                        state.topic_labels[topic_id] = label
                     session = mgr.fork(parent, topic_id, parent.name)
                     if session:
                         send_to_topic(topic_id,
