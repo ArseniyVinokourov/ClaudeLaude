@@ -94,7 +94,8 @@ def _check_unlocked(chat_id, thread_id=None) -> bool:
     return False
 
 
-def _try_unlock(text: str, chat_id: int, msg_id: int | None) -> bool:
+def _try_unlock(text: str, chat_id: int, msg_id: int | None,
+                thread_id: int | None = None) -> bool:
     if not _unlock_active() or state.unlocked:
         return False
     if text != UNLOCK_WORD:
@@ -103,7 +104,8 @@ def _try_unlock(text: str, chat_id: int, msg_id: int | None) -> bool:
     if msg_id:
         tg.delete(msg_id, chat_id)
     audit.log("unlock", "unlocked")
-    _ephemeral(chat_id, "\U0001f513 Unlocked.", seconds=3)
+    _ephemeral(chat_id, "\U0001f513 Unlocked.", seconds=5,
+               thread_id=thread_id)
     _sync_dashboard()
     return True
 
@@ -2091,7 +2093,11 @@ def _handle_update(u):
         if text.lower().startswith("/unkill"):
             deactivate_kill()
             audit.log("kill_switch", "deactivated")
-            _ephemeral(chat_id, "\U0001f513 Bot unkilled.", seconds=5)
+            mid = msg.get("message_id")
+            if mid:
+                tg.delete(mid, chat_id)
+            _ephemeral(chat_id, "\U0001f513 Bot unkilled.", seconds=5,
+                       thread_id=msg.get("message_thread_id"))
             _sync_dashboard()
         return
 
@@ -2135,7 +2141,7 @@ def _handle_update(u):
         return
 
     # Unlock word check (before commands — the word itself is not a command)
-    if _try_unlock(text, chat_id, msg_id):
+    if _try_unlock(text, chat_id, msg_id, thread_id):
         return
 
     if text.startswith("/"):
