@@ -28,6 +28,7 @@ FORUM_CHAT_ID = 1001
 def _purge_bot_modules():
     for name in [
         "bot", "telegram", "sessions", "hooks", "config", "version",
+        "audit", "device_monitor",
     ]:
         sys.modules.pop(name, None)
 
@@ -42,6 +43,7 @@ def bot_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("OWNER_ID", str(OWNER_ID))
     monkeypatch.setenv("PROJECTS_DIR", str(tmp_path / "projects"))
     monkeypatch.setenv("HOOK_PORT", "0")
+    monkeypatch.setenv("UNLOCK_WORD", "")
     monkeypatch.setenv("BOT_STATE_FILE", str(state_file))
     monkeypatch.setenv("BOT_SESSIONS_FILE", str(sessions_file))
 

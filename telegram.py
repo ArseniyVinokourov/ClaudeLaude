@@ -83,6 +83,9 @@ def md_to_html(text: str) -> str:
         codes.append(m.group(1))
         return f"\x00C{len(codes)-1}\x00"
 
+    text = re.sub(r"<antml_thinking>.*?</antml_thinking>\s*", "", text, flags=re.DOTALL)
+    text = re.sub(r"<thinking>.*?</thinking>\s*", "", text, flags=re.DOTALL)
+
     text = _FENCE_RE.sub(_save_block, text)
     text = _INLINE_CODE_RE.sub(_save_code, text)
 

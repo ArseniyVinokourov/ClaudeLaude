@@ -1,5 +1,6 @@
 import json
 import os
+import time
 
 from dotenv import load_dotenv
 
@@ -11,7 +12,9 @@ PROJECTS_DIR = os.environ.get("PROJECTS_DIR", os.path.expanduser("~/Projects"))
 HOOK_PORT = int(os.environ.get("HOOK_PORT", "9853"))
 AUTO_UPDATE = os.environ.get("AUTO_UPDATE", "false").lower() in ("true", "1", "yes")
 AUTO_UPDATE_POLICY = os.environ.get("AUTO_UPDATE_POLICY", "replace")
+UNLOCK_WORD = os.environ.get("UNLOCK_WORD", "")
 BOT_DIR = os.path.dirname(os.path.abspath(__file__))
+_KILL_FILE = os.path.join(BOT_DIR, ".kill")
 
 _STATE_FILE = os.environ.get(
     "BOT_STATE_FILE",
@@ -58,4 +61,30 @@ def get_dashboard_id() -> int | None:
 def set_dashboard_id(msg_id: int | None):
     state = _load_state()
     state["dashboard_id"] = msg_id
+    _save_state(state)
+
+
+def is_killed() -> bool:
+    return os.path.exists(_KILL_FILE)
+
+
+def activate_kill():
+    with open(_KILL_FILE, "w") as f:
+        f.write(str(int(time.time())))
+
+
+def deactivate_kill():
+    try:
+        os.remove(_KILL_FILE)
+    except FileNotFoundError:
+        pass
+
+
+def get_unlock_enabled() -> bool:
+    return _load_state().get("unlock_enabled", bool(UNLOCK_WORD))
+
+
+def set_unlock_enabled(enabled: bool):
+    state = _load_state()
+    state["unlock_enabled"] = enabled
     _save_state(state)
