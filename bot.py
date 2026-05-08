@@ -19,9 +19,13 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from config import (OWNER_ID, PROJECTS_DIR, HOOK_PORT,
                     AUTO_UPDATE, AUTO_UPDATE_POLICY, BOT_DIR,
+                    UNLOCK_WORD,
                     get_forum_chat_id, set_forum_chat_id,
                     get_pinned_help_id, set_pinned_help_id,
-                    get_dashboard_id, set_dashboard_id)
+                    get_dashboard_id, set_dashboard_id,
+                    is_killed, activate_kill, deactivate_kill,
+                    get_unlock_enabled, set_unlock_enabled)
+import audit
 import telegram as tg
 from sessions import Session, SessionManager
 from hooks import HookBridge
@@ -65,6 +69,7 @@ class BotState:
         self.renamed_topics: set[int] = set()
         self.saved_turns: dict[str, tuple[list[int], list[str], list[str]]] = {}
         self.topic_labels: dict[int, str] = {}
+        self.unlocked: bool = not (UNLOCK_WORD and get_unlock_enabled())
 
 
 state = BotState()
@@ -73,6 +78,47 @@ bot_running = True
 
 def forum():
     return get_forum_chat_id()
+
+
+# ── security helpers ────────────────────────────────────────────────
+
+def _unlock_active() -> bool:
+    return bool(UNLOCK_WORD) and get_unlock_enabled()
+
+
+def _check_unlocked(chat_id, thread_id=None) -> bool:
+    if not _unlock_active() or state.unlocked:
+        return True
+    _ephemeral(chat_id, "\U0001f512 Locked. Send unlock word to interact.",
+               seconds=5, thread_id=thread_id)
+    return False
+
+
+def _try_unlock(text: str, chat_id: int, msg_id: int | None) -> bool:
+    if not _unlock_active() or state.unlocked:
+        return False
+    if text != UNLOCK_WORD:
+        return False
+    state.unlocked = True
+    if msg_id:
+        tg.delete(msg_id, chat_id)
+    audit.log("unlock", "unlocked")
+    _ephemeral(chat_id, "\U0001f513 Unlocked.", seconds=3)
+    _sync_dashboard()
+    return True
+
+
+def _do_kill():
+    activate_kill()
+    audit.log("kill_switch", "activated")
+    for s in mgr.list_sessions():
+        if s.alive:
+            mgr.stop(s.sid, reason="kill switch")
+    fid = forum()
+    if fid:
+        _sync_dashboard()
+        _ephemeral(fid, "\U0001f512 Bot killed. All sessions stopped.\n"
+                   "Send /unkill to resume.", seconds=15)
 
 
 # ── markdown table → list (mobile) ──────────────────────────────────
@@ -450,6 +496,9 @@ def _send_fork_summary(parent, topic_id):
 def on_tool_use(session, tool, inp):
     if not session.topic_id:
         return
+    audit.log("tool_use", f"{tool}: {json.dumps(inp, ensure_ascii=False)}"
+              if isinstance(inp, dict) else f"{tool}: {inp}",
+              sid=session.sid)
     turn = _get_turn(session)
     if not _is_noisy_tool(tool, inp):
         compact = _compact_tool_msg(tool, inp)
@@ -813,6 +862,7 @@ def _spawn_session(cwd, name=None):
         state.topic_labels[topic_id] = label
     s = mgr.create(cwd=cwd, name=name, topic_id=topic_id)
     s.topic_label = label
+    audit.log("session_start", cwd, sid=s.sid)
     send_to_topic(topic_id,
                   f"▶️ <code>{tg.esc(cwd)}</code>")
     url = _topic_url(topic_id)
@@ -1236,6 +1286,7 @@ def cmd_stop(session, chat_id, thread_id):
     if turn:
         _end_turn(turn)
     mgr.stop(session.sid)
+    audit.log("session_stop", "user stop", sid=session.sid)
     fid = forum()
     if fid and session.topic_id:
         stop_label = session.name
@@ -1416,6 +1467,27 @@ def cmd_usage(session, chat_id, thread_id):
     threading.Thread(target=_do_fetch, daemon=True).start()
 
 
+def cmd_audit(args, chat_id, thread_id=None):
+    n = 20
+    if args.strip().isdigit():
+        n = min(int(args.strip()), 100)
+    entries = audit.tail(n)
+    if not entries:
+        _ephemeral(chat_id, "No audit events.", seconds=5,
+                   thread_id=thread_id)
+        return
+    lines = []
+    for e in entries:
+        ts = e.get("ts", "?")[11:]  # HH:MM:SS
+        ev = e.get("event", "?")
+        detail = e.get("detail", "")
+        if len(detail) > 60:
+            detail = detail[:57] + "..."
+        lines.append(f"<code>{ts}</code> <b>{tg.esc(ev)}</b> {tg.esc(detail)}")
+    text = "\n".join(lines)
+    _ephemeral(chat_id, text, seconds=30, thread_id=thread_id)
+
+
 def cmd_test_perm(chat_id, thread_id=None):
     """Simulate a permission request to test the hook flow end-to-end."""
     def _do_test():
@@ -1472,6 +1544,13 @@ def _build_dashboard() -> str:
         parts.append(f"▶ {active} active")
     if _usage_cache:
         parts.append(_usage_cache)
+    if is_killed():
+        parts.append("\U0001f512 <b>KILLED</b>")
+    elif _unlock_active():
+        if state.unlocked:
+            parts.append("\U0001f513 Unlocked")
+        else:
+            parts.append("\U0001f512 Locked")
     return "\n".join(parts)
 
 
@@ -1649,6 +1728,13 @@ _HELP_TEXT = (
     "/usage — session tokens + account limits\n"
     "/display [mobile|desktop] — toggle view\n"
     "\n"
+    "<b>Security</b>\n"
+    "/kill — emergency lockdown\n"
+    "/unkill — resume after kill\n"
+    "/lock — lock sessions (unlock word)\n"
+    "/unlock toggle — enable/disable lock\n"
+    "/audit [N] — last N audit events\n"
+    "\n"
     "<b>Other</b>\n"
     "/update — check for bot updates\n"
     "/menu — quick actions\n"
@@ -1665,12 +1751,14 @@ _KNOWN_COMMANDS = {
     "/setup", "/new", "/sessions", "/resume", "/history", "/stop",
     "/interrupt", "/restart", "/usage", "/display", "/test_perm",
     "/update", "/stop_bot", "/help", "/start", "/menu",
+    "/kill", "/unkill", "/lock", "/unlock", "/audit",
 }
 
 _HELP_DOCUMENTED_COMMANDS = {
     "/new", "/sessions", "/resume", "/stop", "/interrupt", "/restart",
     "/history", "/usage", "/display", "/update",
     "/menu", "/help", "/stop_bot",
+    "/kill", "/unkill", "/lock", "/unlock", "/audit",
 }
 
 _MENU_ROWS = [
@@ -1884,6 +1972,45 @@ def _topic_healthcheck():
                 _invalidate_and_stop(session, "topic deleted")
 
 
+def _device_monitor_loop():
+    """Background: check for new TG sessions every 5 minutes."""
+    import device_monitor
+    if not device_monitor._available():
+        return
+    time.sleep(10)
+    while bot_running:
+        try:
+            new = device_monitor.check_new_devices()
+            for d in new:
+                fid = forum()
+                if not fid:
+                    break
+                ip_masked = d.get("ip", "?")
+                if "." in ip_masked:
+                    parts = ip_masked.split(".")
+                    ip_masked = f"{parts[0]}.{parts[1]}.x.x"
+                text = (
+                    f"⚠️ <b>New TG session detected</b>\n"
+                    f"{tg.esc(d.get('device_model', '?'))}, "
+                    f"{tg.esc(d.get('platform', '?'))}\n"
+                    f"{tg.esc(d.get('country', '?'))}, "
+                    f"IP {tg.esc(ip_masked)}"
+                )
+                key = d.get("key", "")
+                buttons = [
+                    [{"text": "✓ Trust", "callback_data": f"dt:{key[:40]}"},
+                     {"text": "\U0001f512 Kill bot", "callback_data": "dk:"}],
+                ]
+                audit.log("device_alert",
+                          f"{d.get('device_model', '?')} "
+                          f"{d.get('country', '?')} {ip_masked}")
+                tg.send(text, fid, buttons=buttons)
+        except Exception as e:
+            print(f"[device_monitor] error: {e}",
+                  file=sys.stderr, flush=True)
+        time.sleep(300)
+
+
 def main():
     global bot_running
 
@@ -1894,6 +2021,7 @@ def main():
     bridge.start()
     threading.Thread(target=_topic_healthcheck, daemon=True).start()
     threading.Thread(target=_dashboard_loop, daemon=True).start()
+    threading.Thread(target=_device_monitor_loop, daemon=True).start()
     tg.set_my_commands([
         {"command": "new", "description": "New Claude session"},
         {"command": "sessions", "description": "Active sessions"},
@@ -1930,6 +2058,8 @@ def _handle_update(u):
     cb = u.get("callback_query")
     if cb:
         tg.answer_callback(cb["id"])
+        if cb.get("from", {}).get("id") != OWNER_ID:
+            return
         _handle_callback(cb, cb.get("data", ""))
         return
 
@@ -1956,6 +2086,15 @@ def _handle_update(u):
     if from_user != OWNER_ID:
         return
 
+    # Kill switch — ignore everything except /unkill
+    if is_killed():
+        if text.lower().startswith("/unkill"):
+            deactivate_kill()
+            audit.log("kill_switch", "deactivated")
+            _ephemeral(chat_id, "\U0001f513 Bot unkilled.", seconds=5)
+            _sync_dashboard()
+        return
+
     thread_id = msg.get("message_thread_id")
     msg_id = msg.get("message_id")
     session = mgr.by_topic(thread_id) if thread_id else None
@@ -1968,6 +2107,8 @@ def _handle_update(u):
     photos = msg.get("photo")
     document = msg.get("document")
     if photos or document:
+        if not _check_unlocked(chat_id, thread_id):
+            return
         if not (session and session.is_bot_spawned and session.alive):
             tg.send("Send files in an active session",
                     chat_id, thread_id=thread_id)
@@ -1980,6 +2121,8 @@ def _handle_update(u):
         if tg.download_file(file_id, dest):
             user_text = (f"{caption}\n[Attached file: {dest}]" if caption
                          else f"[Attached file: {dest}]")
+            audit.log("user_message", f"[file] {filename}",
+                      sid=session.sid)
             if not mgr.send_user_message(session.sid, user_text):
                 tg.send("⚠️ Session died", chat_id,
                         thread_id=thread_id)
@@ -1991,11 +2134,21 @@ def _handle_update(u):
     if not text:
         return
 
+    # Unlock word check (before commands — the word itself is not a command)
+    if _try_unlock(text, chat_id, msg_id):
+        return
+
     if text.startswith("/"):
         cmd, _, args = text.partition(" ")
         cmd = cmd.lower().split("@")[0]
+        audit.log("command", f"{cmd} {args}".strip(),
+                  sid=session.sid if session else None)
         _handle_command(cmd, args, chat_id, thread_id, session)
     else:
+        if not _check_unlocked(chat_id, thread_id):
+            return
+        audit.log("user_message", text,
+                  sid=session.sid if session else None)
         if session and session.is_bot_spawned:
             ok = mgr.send_user_message(session.sid, text)
             if not ok:
@@ -2042,6 +2195,49 @@ def _handle_command(cmd, args, chat_id, thread_id, session):
         cmd_update(chat_id, thread_id)
     elif cmd == "/test_perm":
         cmd_test_perm(chat_id, thread_id)
+    elif cmd == "/kill":
+        _do_kill()
+    elif cmd == "/unkill":
+        deactivate_kill()
+        audit.log("kill_switch", "deactivated")
+        _ephemeral(chat_id, "\U0001f513 Bot unkilled.", seconds=5,
+                   thread_id=thread_id)
+        _sync_dashboard()
+    elif cmd == "/lock":
+        if not UNLOCK_WORD:
+            _ephemeral(chat_id, "UNLOCK_WORD not set in .env", seconds=5,
+                       thread_id=thread_id)
+        else:
+            state.unlocked = False
+            audit.log("unlock", "locked")
+            _ephemeral(chat_id, "\U0001f512 Locked.", seconds=3,
+                       thread_id=thread_id)
+            _sync_dashboard()
+    elif cmd == "/unlock":
+        if args.strip().lower() == "toggle":
+            cur = get_unlock_enabled()
+            set_unlock_enabled(not cur)
+            if not cur:
+                state.unlocked = False
+            else:
+                state.unlocked = True
+            label = "enabled" if not cur else "disabled"
+            audit.log("unlock", f"feature {label}")
+            _ephemeral(chat_id, f"Unlock word {label}.", seconds=5,
+                       thread_id=thread_id)
+            _sync_dashboard()
+        else:
+            if not UNLOCK_WORD:
+                _ephemeral(chat_id, "UNLOCK_WORD not set in .env",
+                           seconds=5, thread_id=thread_id)
+            elif state.unlocked:
+                _ephemeral(chat_id, "\U0001f513 Already unlocked.",
+                           seconds=3, thread_id=thread_id)
+            else:
+                _ephemeral(chat_id, "\U0001f512 Send your unlock word.",
+                           seconds=5, thread_id=thread_id)
+    elif cmd == "/audit":
+        cmd_audit(args, chat_id, thread_id)
     elif cmd == "/stop_bot":
         fid = forum()
         if fid:
@@ -2084,6 +2280,7 @@ def _handle_callback(cb, data):
                 full_id = state.perm_key_map.pop(short_id, short_id)
                 entry = state.pending_permissions.pop(short_id, None)
             bridge.resolve_permission(full_id, decision)
+            audit.log("permission_decision", f"{decision} {short_id}")
             if entry:
                 msg_id, perm_chat, _ = entry
                 mark = "✓ Allowed" if decision == "allow" else "✗ Denied"
@@ -2248,6 +2445,23 @@ def _handle_callback(cb, data):
         elif action == "no":
             if cb_msg and cb_chat:
                 tg.delete(cb_msg, cb_chat)
+
+    elif data.startswith("dt:"):
+        import device_monitor
+        key = data[3:]
+        device_monitor.trust_device(key)
+        audit.log("device_trust", key)
+        if cb_msg and cb_chat:
+            tg.edit(cb_msg, "✓ Device trusted", cb_chat)
+            def _del_dt(mid=cb_msg, cid=cb_chat):
+                time.sleep(5)
+                tg.delete(mid, cid)
+            threading.Thread(target=_del_dt, daemon=True).start()
+
+    elif data == "dk:":
+        _do_kill()
+        if cb_msg and cb_chat:
+            tg.edit(cb_msg, "\U0001f512 Bot killed", cb_chat)
 
     elif data.startswith("m:"):
         action = data[2:]

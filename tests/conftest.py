@@ -28,6 +28,7 @@ FORUM_CHAT_ID = 1001
 def _purge_bot_modules():
     for name in [
         "bot", "telegram", "sessions", "hooks", "config", "version",
+        "audit", "device_monitor",
     ]:
         sys.modules.pop(name, None)
 

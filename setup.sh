@@ -67,14 +67,44 @@ else
     read -rp "   HOOK_PORT [$DEFAULT_PORT]: " HOOK_PORT
     HOOK_PORT="${HOOK_PORT:-$DEFAULT_PORT}"
 
+    echo ""
+    echo "5) Unlock word — secret phrase to unlock sessions (optional)."
+    echo "   Leave empty to disable this security feature."
+    read -rp "   UNLOCK_WORD: " UNLOCK_WORD
+
     cat > .env <<EOF
 BOT_TOKEN=$BOT_TOKEN
 OWNER_ID=$OWNER_ID
 PROJECTS_DIR=$PROJECTS_DIR
 HOOK_PORT=$HOOK_PORT
+UNLOCK_WORD=$UNLOCK_WORD
 EOF
 
     ok ".env created"
+fi
+
+# ── device monitoring ────────────────────────────────────────────────
+bold "\nDevice monitoring (Telethon)"
+echo "Monitor active Telegram sessions for unauthorized devices."
+echo "Requires API credentials from https://my.telegram.org"
+echo ""
+read -rp "Set up device monitoring? [Y/n]: " SETUP_MONITOR
+SETUP_MONITOR="${SETUP_MONITOR:-Y}"
+
+if [[ "$SETUP_MONITOR" =~ ^[Yy] ]]; then
+    read -rp "   TG_API_ID: " TG_API_ID
+    read -rp "   TG_API_HASH: " TG_API_HASH
+    if [ -n "$TG_API_ID" ] && [ -n "$TG_API_HASH" ]; then
+        echo "TG_API_ID=$TG_API_ID" >> .env
+        echo "TG_API_HASH=$TG_API_HASH" >> .env
+        ok "API credentials added to .env"
+        echo ""
+        echo "  After setup, run this once to authenticate:"
+        bold "  cd $SCRIPT_DIR && .venv/bin/python -c \"import device_monitor; device_monitor.get_sessions()\""
+        echo "  (Enter phone number and code when prompted)"
+    else
+        warn "Skipping — both API_ID and API_HASH are required."
+    fi
 fi
 
 # ── python venv ──────────────────────────────────────────────────────

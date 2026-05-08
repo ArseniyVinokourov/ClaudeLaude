@@ -18,6 +18,10 @@ dist/
 # Project-specific
 hook_fallback.py
 *.log
+.audit.log*
+.kill
+.tg_monitor.session
+.known_devices.json
 test_hook_probe*.txt
 temp/
 

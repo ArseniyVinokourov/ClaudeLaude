@@ -369,6 +369,9 @@ class SessionManager:
                     HistoryEntry(time.time(), "system", f"error: {e}"))
 
     def _run_claude(self, session: Session, text: str, gen: int):
+        from config import is_killed
+        if is_killed():
+            return
         cmd = [_CLAUDE_BIN, "-p", text, "--output-format", "stream-json",
                "--verbose", "--permission-mode", "auto"]
         if session.claude_session_id:

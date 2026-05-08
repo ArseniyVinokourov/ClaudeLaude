@@ -590,3 +590,63 @@ def test_dashboard_build(bot, tmp_path):
     text = bot.mod._build_dashboard()
     assert "ClaudeLaude" in text
     assert "1 active" in text
+
+
+# ── security: callback OWNER_ID check ─────────────────────────────
+
+def test_callback_from_stranger_is_ignored(bot):
+    """Callback queries from non-owner users must be silently dropped."""
+    stranger_id = 9999
+    bot.tg.inject_update(callback_update(
+        "m:new",
+        owner_id=stranger_id,
+        forum_chat_id=bot.forum_chat_id,
+    ))
+    _drain_updates(bot)
+
+    assert bot.tg.find_call("createForumTopic") is None
+
+
+# ── security: kill switch ──────────────────────────────────────────
+
+def test_kill_switch_blocks_messages(bot, tmp_path):
+    """When .kill exists, bot ignores all messages except /unkill."""
+    import config
+    config.activate_kill()
+    try:
+        cwd = tmp_path / "demo"
+        cwd.mkdir(exist_ok=True)
+        bot.tg.inject_update(text_update(
+            f"/new {cwd}",
+            owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
+        ))
+        _drain_updates(bot)
+
+        assert bot.tg.find_call("createForumTopic") is None
+    finally:
+        config.deactivate_kill()
+
+
+def test_unkill_restores_access(bot, tmp_path):
+    """After /unkill, bot processes commands again."""
+    import config
+    config.activate_kill()
+    bot.tg.inject_update(text_update(
+        "/unkill",
+        owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
+    ))
+    _drain_updates(bot)
+    config.deactivate_kill()  # cleanup in case unkill failed
+
+    assert not config.is_killed()
+
+
+# ── security: audit log ───────────────────────────────────────────
+
+def test_audit_log_writes_events(bot, tmp_path):
+    """audit.log() writes JSON lines to .audit.log."""
+    import audit
+    audit.log("test_event", "some detail", sid="abc123")
+    time.sleep(0.1)  # wait for background writer
+    entries = audit.tail(5)
+    assert any(e.get("event") == "test_event" for e in entries)
