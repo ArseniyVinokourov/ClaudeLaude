@@ -610,7 +610,7 @@ def test_callback_from_stranger_is_ignored(bot):
 # ── security: kill switch ──────────────────────────────────────────
 
 def test_kill_switch_blocks_messages(bot, tmp_path):
-    """When .kill exists, bot ignores all messages except /unkill."""
+    """When .kill exists, bot ignores all messages."""
     import config
     config.activate_kill()
     try:
@@ -627,18 +627,57 @@ def test_kill_switch_blocks_messages(bot, tmp_path):
         config.deactivate_kill()
 
 
-def test_unkill_restores_access(bot, tmp_path):
-    """After /unkill, bot processes commands again."""
+def test_unlock_word_restores_after_kill(bot, tmp_path, monkeypatch):
+    """Unlock word in General deactivates kill switch."""
     import config
+    monkeypatch.setattr("config.UNLOCK_WORD", "s3cret")
+    monkeypatch.setattr("bot.UNLOCK_WORD", "s3cret")
     config.activate_kill()
-    bot.tg.inject_update(text_update(
-        "/unkill",
-        owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
-    ))
-    _drain_updates(bot)
-    config.deactivate_kill()  # cleanup in case unkill failed
+    try:
+        bot.tg.inject_update(text_update(
+            "s3cret",
+            owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
+        ))
+        _drain_updates(bot)
+        assert not config.is_killed()
+    finally:
+        config.deactivate_kill()
 
-    assert not config.is_killed()
+
+def test_unlock_word_rejected_in_topic(bot, tmp_path, monkeypatch):
+    """Unlock word sent in a topic (not General) must be ignored."""
+    import config
+    monkeypatch.setattr("config.UNLOCK_WORD", "s3cret")
+    monkeypatch.setattr("bot.UNLOCK_WORD", "s3cret")
+    config.activate_kill()
+    try:
+        bot.tg.inject_update(text_update(
+            "s3cret",
+            owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
+            thread_id=42,
+        ))
+        _drain_updates(bot)
+        assert config.is_killed()
+    finally:
+        config.deactivate_kill()
+
+
+def test_unlock_word_injection_resistance(bot, tmp_path, monkeypatch):
+    """Partial matches and substrings must not unlock."""
+    import config
+    monkeypatch.setattr("config.UNLOCK_WORD", "s3cret")
+    monkeypatch.setattr("bot.UNLOCK_WORD", "s3cret")
+    config.activate_kill()
+    try:
+        for attempt in ["s3cre", "s3crett", "S3CRET", " s3cret extra"]:
+            bot.tg.inject_update(text_update(
+                attempt,
+                owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
+            ))
+            _drain_updates(bot)
+            assert config.is_killed(), f"unlocked with {attempt!r}"
+    finally:
+        config.deactivate_kill()
 
 
 # ── security: audit log ───────────────────────────────────────────
