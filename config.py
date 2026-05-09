@@ -80,11 +80,3 @@ def deactivate_kill():
         pass
 
 
-def get_unlock_enabled() -> bool:
-    return _load_state().get("unlock_enabled", bool(UNLOCK_WORD))
-
-
-def set_unlock_enabled(enabled: bool):
-    state = _load_state()
-    state["unlock_enabled"] = enabled
-    _save_state(state)

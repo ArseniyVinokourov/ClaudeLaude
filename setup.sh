@@ -68,8 +68,18 @@ else
     HOOK_PORT="${HOOK_PORT:-$DEFAULT_PORT}"
 
     echo ""
-    echo "5) Unlock word — secret phrase to unlock sessions (optional)."
-    echo "   Leave empty to disable this security feature."
+    bold "5) Security: unlock word (optional but recommended)"
+    echo ""
+    echo "   If someone gets access to your Telegram account, they can"
+    echo "   control the bot and run commands on your machine."
+    echo ""
+    echo "   The /kill command instantly stops all sessions and locks"
+    echo "   the bot. To restore access from Telegram, you need an"
+    echo "   unlock word — a secret phrase only you know."
+    echo ""
+    echo "   Without an unlock word, /kill can only be reversed by"
+    echo "   deleting the .kill file directly on your machine."
+    echo ""
     read -rp "   UNLOCK_WORD: " UNLOCK_WORD
 
     cat > .env <<EOF

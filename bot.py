@@ -23,8 +23,7 @@ from config import (OWNER_ID, PROJECTS_DIR, HOOK_PORT,
                     get_forum_chat_id, set_forum_chat_id,
                     get_pinned_help_id, set_pinned_help_id,
                     get_dashboard_id, set_dashboard_id,
-                    is_killed, activate_kill, deactivate_kill,
-                    get_unlock_enabled, set_unlock_enabled)
+                    is_killed, activate_kill, deactivate_kill)
 import audit
 import telegram as tg
 from sessions import Session, SessionManager
@@ -69,7 +68,6 @@ class BotState:
         self.renamed_topics: set[int] = set()
         self.saved_turns: dict[str, tuple[list[int], list[str], list[str]]] = {}
         self.topic_labels: dict[int, str] = {}
-        self.unlocked: bool = not (UNLOCK_WORD and get_unlock_enabled())
 
 
 state = BotState()
@@ -82,30 +80,38 @@ def forum():
 
 # ── security helpers ────────────────────────────────────────────────
 
-def _unlock_active() -> bool:
-    return bool(UNLOCK_WORD) and get_unlock_enabled()
+_unkill_attempts: list[float] = []
+_UNKILL_MAX_ATTEMPTS = 3
+_UNKILL_COOLDOWN = 300  # 5 minutes
 
 
-def _check_unlocked(chat_id, thread_id=None) -> bool:
-    if not _unlock_active() or state.unlocked:
-        return True
-    _ephemeral(chat_id, "\U0001f512 Locked. Send unlock word to interact.",
-               seconds=5, thread_id=thread_id)
-    return False
-
-
-def _try_unlock(text: str, chat_id: int, msg_id: int | None,
-                thread_id: int | None = None) -> bool:
-    if not _unlock_active() or state.unlocked:
+def _try_unkill(text: str, chat_id: int, msg_id: int | None,
+                thread_id: int | None) -> bool:
+    """Accept unlock word in General only. Constant-time compare, no regex."""
+    if not UNLOCK_WORD or not is_killed():
         return False
-    if text != UNLOCK_WORD:
+    fid = forum()
+    if not fid or chat_id != fid or thread_id:
         return False
-    state.unlocked = True
+    now = time.time()
+    # Prune old attempts
+    _unkill_attempts[:] = [t for t in _unkill_attempts
+                           if now - t < _UNKILL_COOLDOWN]
+    if len(_unkill_attempts) >= _UNKILL_MAX_ATTEMPTS:
+        audit.log("kill_switch", "unlock rate-limited")
+        return False
+    import hmac
+    clean = text.strip()
+    if not hmac.compare_digest(clean.encode(), UNLOCK_WORD.encode()):
+        _unkill_attempts.append(now)
+        audit.log("kill_switch", "unlock failed attempt")
+        return False
+    _unkill_attempts.clear()
+    deactivate_kill()
+    audit.log("kill_switch", "deactivated via unlock word")
     if msg_id:
         tg.delete(msg_id, chat_id)
-    audit.log("unlock", "unlocked")
-    _ephemeral(chat_id, "\U0001f513 Unlocked.", seconds=5,
-               thread_id=thread_id)
+    _ephemeral(chat_id, "\U0001f513 Bot unlocked.", seconds=5)
     _sync_dashboard()
     return True
 
@@ -119,8 +125,14 @@ def _do_kill():
     fid = forum()
     if fid:
         _sync_dashboard()
-        _ephemeral(fid, "\U0001f512 Bot killed. All sessions stopped.\n"
-                   "Send /unkill to resume.", seconds=15)
+        if UNLOCK_WORD:
+            _ephemeral(fid, "\U0001f512 Bot killed. All sessions stopped.\n"
+                       "Send unlock word in General to restore.",
+                       seconds=15)
+        else:
+            _ephemeral(fid, "\U0001f512 Bot killed. All sessions stopped.\n"
+                       "Delete .kill file on the machine to restore.",
+                       seconds=15)
 
 
 # ── markdown table → list (mobile) ──────────────────────────────────
@@ -1548,11 +1560,6 @@ def _build_dashboard() -> str:
         parts.append(_usage_cache)
     if is_killed():
         parts.append("\U0001f512 <b>KILLED</b>")
-    elif _unlock_active():
-        if state.unlocked:
-            parts.append("\U0001f513 Unlocked")
-        else:
-            parts.append("\U0001f512 Locked")
     return "\n".join(parts)
 
 
@@ -1730,13 +1737,6 @@ _HELP_TEXT = (
     "/usage — session tokens + account limits\n"
     "/display [mobile|desktop] — toggle view\n"
     "\n"
-    "<b>Security</b>\n"
-    "/kill — emergency lockdown\n"
-    "/unkill — resume after kill\n"
-    "/lock — lock sessions (unlock word)\n"
-    "/unlock toggle — enable/disable lock\n"
-    "/audit [N] — last N audit events\n"
-    "\n"
     "<b>Other</b>\n"
     "/update — check for bot updates\n"
     "/menu — quick actions\n"
@@ -1753,14 +1753,13 @@ _KNOWN_COMMANDS = {
     "/setup", "/new", "/sessions", "/resume", "/history", "/stop",
     "/interrupt", "/restart", "/usage", "/display", "/test_perm",
     "/update", "/stop_bot", "/help", "/start", "/menu",
-    "/kill", "/unkill", "/lock", "/unlock", "/audit",
+    "/kill", "/audit",
 }
 
 _HELP_DOCUMENTED_COMMANDS = {
     "/new", "/sessions", "/resume", "/stop", "/interrupt", "/restart",
     "/history", "/usage", "/display", "/update",
     "/menu", "/help", "/stop_bot",
-    "/kill", "/unkill", "/lock", "/unlock", "/audit",
 }
 
 _MENU_ROWS = [
@@ -1778,7 +1777,7 @@ def cmd_help(chat_id, thread_id=None):
         tg.send(_HELP_TEXT, chat_id, thread_id=thread_id)
 
 
-_HIDDEN_COMMANDS = {"/setup", "/test_perm", "/start"}
+_HIDDEN_COMMANDS = {"/setup", "/test_perm", "/start", "/kill", "/audit"}
 
 
 def _validate_help():
@@ -2088,17 +2087,11 @@ def _handle_update(u):
     if from_user != OWNER_ID:
         return
 
-    # Kill switch — ignore everything except /unkill
+    # Kill switch — ignore everything except unlock word in General
     if is_killed():
-        if text.lower().startswith("/unkill"):
-            deactivate_kill()
-            audit.log("kill_switch", "deactivated")
-            mid = msg.get("message_id")
-            if mid:
-                tg.delete(mid, chat_id)
-            _ephemeral(chat_id, "\U0001f513 Bot unkilled.", seconds=5,
-                       thread_id=msg.get("message_thread_id"))
-            _sync_dashboard()
+        if text:
+            _try_unkill(text, chat_id, msg.get("message_id"),
+                        msg.get("message_thread_id"))
         return
 
     thread_id = msg.get("message_thread_id")
@@ -2113,8 +2106,6 @@ def _handle_update(u):
     photos = msg.get("photo")
     document = msg.get("document")
     if photos or document:
-        if not _check_unlocked(chat_id, thread_id):
-            return
         if not (session and session.is_bot_spawned and session.alive):
             tg.send("Send files in an active session",
                     chat_id, thread_id=thread_id)
@@ -2140,10 +2131,6 @@ def _handle_update(u):
     if not text:
         return
 
-    # Unlock word check (before commands — the word itself is not a command)
-    if _try_unlock(text, chat_id, msg_id, thread_id):
-        return
-
     if text.startswith("/"):
         cmd, _, args = text.partition(" ")
         cmd = cmd.lower().split("@")[0]
@@ -2151,8 +2138,6 @@ def _handle_update(u):
                   sid=session.sid if session else None)
         _handle_command(cmd, args, chat_id, thread_id, session)
     else:
-        if not _check_unlocked(chat_id, thread_id):
-            return
         audit.log("user_message", text,
                   sid=session.sid if session else None)
         if session and session.is_bot_spawned:
@@ -2203,45 +2188,6 @@ def _handle_command(cmd, args, chat_id, thread_id, session):
         cmd_test_perm(chat_id, thread_id)
     elif cmd == "/kill":
         _do_kill()
-    elif cmd == "/unkill":
-        deactivate_kill()
-        audit.log("kill_switch", "deactivated")
-        _ephemeral(chat_id, "\U0001f513 Bot unkilled.", seconds=5,
-                   thread_id=thread_id)
-        _sync_dashboard()
-    elif cmd == "/lock":
-        if not UNLOCK_WORD:
-            _ephemeral(chat_id, "UNLOCK_WORD not set in .env", seconds=5,
-                       thread_id=thread_id)
-        else:
-            state.unlocked = False
-            audit.log("unlock", "locked")
-            _ephemeral(chat_id, "\U0001f512 Locked.", seconds=3,
-                       thread_id=thread_id)
-            _sync_dashboard()
-    elif cmd == "/unlock":
-        if args.strip().lower() == "toggle":
-            cur = get_unlock_enabled()
-            set_unlock_enabled(not cur)
-            if not cur:
-                state.unlocked = False
-            else:
-                state.unlocked = True
-            label = "enabled" if not cur else "disabled"
-            audit.log("unlock", f"feature {label}")
-            _ephemeral(chat_id, f"Unlock word {label}.", seconds=5,
-                       thread_id=thread_id)
-            _sync_dashboard()
-        else:
-            if not UNLOCK_WORD:
-                _ephemeral(chat_id, "UNLOCK_WORD not set in .env",
-                           seconds=5, thread_id=thread_id)
-            elif state.unlocked:
-                _ephemeral(chat_id, "\U0001f513 Already unlocked.",
-                           seconds=3, thread_id=thread_id)
-            else:
-                _ephemeral(chat_id, "\U0001f512 Send your unlock word.",
-                           seconds=5, thread_id=thread_id)
     elif cmd == "/audit":
         cmd_audit(args, chat_id, thread_id)
     elif cmd == "/stop_bot":
