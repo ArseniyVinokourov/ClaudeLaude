@@ -689,3 +689,104 @@ def test_audit_log_writes_events(bot, tmp_path):
     time.sleep(0.1)  # wait for background writer
     entries = audit.tail(5)
     assert any(e.get("event") == "test_event" for e in entries)
+
+
+# ── terminal watcher: cleanup on session progress ─────────────────
+
+def test_terminal_watcher_cleans_notification(bot, tmp_path, monkeypatch):
+    """Notification in terminal topic is deleted when JSONL grows."""
+    import json as _json
+
+    projects_dir = tmp_path / "claude_projects" / "proj"
+    projects_dir.mkdir(parents=True)
+    monkeypatch.setattr(bot.mod, "CLAUDE_PROJECTS_DIR",
+                        str(projects_dir.parent))
+
+    csid = "term-session-001"
+    jsonl = projects_dir / f"{csid}.jsonl"
+    jsonl.write_text(_json.dumps({"type": "user", "cwd": "/tmp"}) + "\n")
+
+    # Simulate: terminal session registered, notification sent to topic
+    bot.mod.mgr.register_terminal(csid, 100, cwd="/tmp")
+    mid = bot.mod.send_to_topic(100, "\U0001f514 test notification")
+    assert mid is not None
+    bot.mod._track_terminal_msg(csid, mid, bot.forum_chat_id, "notification")
+
+    # JSONL grows → watcher should clean up
+    with open(jsonl, "a") as f:
+        f.write(_json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "done"}]}}) + "\n")
+
+    bot.mod._cleanup_terminal_pending(csid)
+    assert mid in bot.tg.deleted_messages
+
+
+def test_terminal_watcher_cleans_permission(bot, tmp_path, monkeypatch):
+    """Permission buttons in terminal topic are resolved when JSONL grows."""
+    import json as _json
+
+    projects_dir = tmp_path / "claude_projects" / "proj"
+    projects_dir.mkdir(parents=True)
+    monkeypatch.setattr(bot.mod, "CLAUDE_PROJECTS_DIR",
+                        str(projects_dir.parent))
+
+    csid = "term-session-002"
+    jsonl = projects_dir / f"{csid}.jsonl"
+    jsonl.write_text(_json.dumps({"type": "user", "cwd": "/tmp"}) + "\n")
+
+    session = bot.mod.mgr.register_terminal(csid, 100, cwd="/tmp")
+
+    # Simulate a permission message
+    short_id = "abcdef123456"
+    mid = bot.mod.send_to_topic(100, "Bash\nls -la")
+    assert mid is not None
+    with bot.mod.state.lock:
+        bot.mod.state.perm_key_map[short_id] = f"full-req-{short_id}"
+        bot.mod.state.pending_permissions[short_id] = (
+            mid, bot.forum_chat_id, session.sid)
+    bot.mod._track_terminal_msg(csid, mid, bot.forum_chat_id,
+                                f"perm:{short_id}")
+
+    # Grow JSONL
+    with open(jsonl, "a") as f:
+        f.write(_json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "ok"}]}}) + "\n")
+
+    bot.mod._cleanup_terminal_pending(csid)
+
+    # Permission should be resolved
+    assert bot.tg.messages[mid]["text"] == "✓ Resolved in terminal"
+    with bot.mod.state.lock:
+        assert short_id not in bot.mod.state.pending_permissions
+        assert short_id not in bot.mod.state.perm_key_map
+
+
+def test_terminal_watcher_offset_init(bot, tmp_path, monkeypatch):
+    """First track initializes offset to current file size (no false cleanup)."""
+    import json as _json
+
+    projects_dir = tmp_path / "claude_projects" / "proj"
+    projects_dir.mkdir(parents=True)
+    monkeypatch.setattr(bot.mod, "CLAUDE_PROJECTS_DIR",
+                        str(projects_dir.parent))
+
+    csid = "term-session-003"
+    jsonl = projects_dir / f"{csid}.jsonl"
+    jsonl.write_text(_json.dumps({"type": "user", "cwd": "/tmp"}) + "\n")
+
+    bot.mod.mgr.register_terminal(csid, 100, cwd="/tmp")
+    mid = bot.mod.send_to_topic(100, "\U0001f514 hello")
+    assert mid is not None
+
+    # Track records current offset
+    bot.mod._track_terminal_msg(csid, mid, bot.forum_chat_id, "notification")
+    initial_offset = bot.mod._watcher_offsets[csid]
+    assert initial_offset > 0
+
+    # Watcher poll: no growth → no cleanup
+    import os
+    size = os.path.getsize(str(jsonl))
+    assert size <= initial_offset
+    # pending_terminal_msgs still has the entry
+    with bot.mod.state.lock:
+        assert csid in bot.mod.state.pending_terminal_msgs

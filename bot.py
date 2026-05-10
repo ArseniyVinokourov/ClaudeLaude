@@ -68,6 +68,9 @@ class BotState:
         self.renamed_topics: set[int] = set()
         self.saved_turns: dict[str, tuple[list[int], list[str], list[str]]] = {}
         self.topic_labels: dict[int, str] = {}
+        # terminal watcher: claude_session_id → [(msg_id, chat_id, kind)]
+        # kind: "perm:<short_id>" | "notification"
+        self.pending_terminal_msgs: dict[str, list[tuple[int, int, str]]] = {}
 
 
 state = BotState()
@@ -99,13 +102,23 @@ def _try_unkill(text: str, chat_id: int, msg_id: int | None,
                            if now - t < _UNKILL_COOLDOWN]
     if len(_unkill_attempts) >= _UNKILL_MAX_ATTEMPTS:
         audit.log("kill_switch", "unlock rate-limited")
-        return False
+        remaining = int(_UNKILL_COOLDOWN - (now - _unkill_attempts[0]))
+        _ephemeral(chat_id, f"Rate limited. Try again in {remaining}s.",
+                   seconds=10)
+        if msg_id:
+            tg.delete(msg_id, chat_id)
+        return True
     import hmac
     clean = text.strip()
     if not hmac.compare_digest(clean.encode(), UNLOCK_WORD.encode()):
         _unkill_attempts.append(now)
         audit.log("kill_switch", "unlock failed attempt")
-        return False
+        left = _UNKILL_MAX_ATTEMPTS - len(_unkill_attempts)
+        if left > 0:
+            _ephemeral(chat_id, f"Wrong. {left} attempt(s) left.", seconds=5)
+        if msg_id:
+            tg.delete(msg_id, chat_id)
+        return True
     _unkill_attempts.clear()
     deactivate_kill()
     audit.log("kill_switch", "deactivated via unlock word")
@@ -174,7 +187,7 @@ def _md_table_to_list(text: str) -> str:
 
 _CLOSE_ROW = [{"text": "✕ Close", "callback_data": "close"}]
 
-_PICKER_TTL = 300
+_PICKER_TTL = 60
 
 
 def send_to_topic(topic_id, text, buttons=None):
@@ -557,17 +570,19 @@ def on_hook_notification(text, claude_session_id, data=None):
     try:
         session = (mgr.by_claude_session_id(claude_session_id)
                    if claude_session_id else None)
-        if session and session.topic_id:
-            send_to_topic(session.topic_id, f"\U0001f514 {tg.esc(text)}")
-        else:
+        if not (session and session.topic_id):
             _resolve_hook_session(claude_session_id, data or {})
             session = (mgr.by_claude_session_id(claude_session_id)
                        if claude_session_id else None)
-            if session and session.topic_id:
-                send_to_topic(session.topic_id,
-                              f"\U0001f514 {tg.esc(text)}")
-            else:
-                tg.send(f"\U0001f514 {tg.esc(text)}", OWNER_ID)
+
+        if session and session.topic_id:
+            mid = send_to_topic(session.topic_id,
+                                f"\U0001f514 {tg.esc(text)}")
+            if mid and claude_session_id and not session.is_bot_spawned:
+                _track_terminal_msg(claude_session_id, mid,
+                                    forum(), "notification")
+        else:
+            tg.send(f"\U0001f514 {tg.esc(text)}", OWNER_ID)
     except Exception as e:
         print(f"hook notification error: {e}", file=sys.stderr, flush=True)
 
@@ -646,6 +661,27 @@ def _invalidate_session(session):
         del mgr._claude_id_map[session.claude_session_id]
     mgr._sessions.pop(sid, None)
     mgr._persist()
+
+
+_watcher_offsets: dict[str, int] = {}
+
+
+def _track_terminal_msg(claude_session_id: str, msg_id: int,
+                        chat_id: int, kind: str):
+    if claude_session_id not in _watcher_offsets:
+        path = _session_jsonl_path(claude_session_id)
+        try:
+            _watcher_offsets[claude_session_id] = (
+                os.path.getsize(path) if path else 0)
+        except OSError:
+            _watcher_offsets[claude_session_id] = 0
+        print(f"[watcher] track csid={claude_session_id[:8]}… "
+              f"offset={_watcher_offsets[claude_session_id]} "
+              f"kind={kind} msg={msg_id}",
+              file=sys.stderr, flush=True)
+    with state.lock:
+        state.pending_terminal_msgs.setdefault(
+            claude_session_id, []).append((msg_id, chat_id, kind))
 
 
 def _cancel_session_perms(sid: str, reason: str):
@@ -787,6 +823,11 @@ def on_hook_permission(req_id, data):
         with state.lock:
             state.perm_key_map[short_id] = req_id
             state.pending_permissions[short_id] = (msg_id, chat_id, sid)
+
+        if (session and not session.is_bot_spawned
+                and claude_session_id and msg_id and chat_id):
+            _track_terminal_msg(claude_session_id, msg_id, chat_id,
+                                f"perm:{short_id}")
 
         bridge.set_perm_context(req_id, chat_id=chat_id, topic_id=topic_id)
 
@@ -1060,8 +1101,9 @@ def _live_claude_session_ids() -> set[str]:
 
 
 def _discover_resumable_sessions(limit=10):
-    bot_sids = {s.claude_session_id for s in mgr._sessions.values()
-                if s.claude_session_id}
+    bot_sids = (mgr._known_bot_sids |
+                {s.claude_session_id for s in mgr._sessions.values()
+                 if s.claude_session_id})
     live_terminal_sids = _live_claude_session_ids() - bot_sids
     recent_cutoff = time.time() - _RESUME_RECENT_SECONDS
     raw = []
@@ -1973,6 +2015,59 @@ def _topic_healthcheck():
                 _invalidate_and_stop(session, "topic deleted")
 
 
+def _cleanup_terminal_pending(csid: str):
+    """Remove stale messages from a terminal topic after session progressed."""
+    with state.lock:
+        msgs = state.pending_terminal_msgs.pop(csid, [])
+    if not msgs:
+        return
+    for msg_id, chat_id, kind in msgs:
+        if kind.startswith("perm:"):
+            short_id = kind[5:]
+            with state.lock:
+                full_id = state.perm_key_map.pop(short_id, None)
+                state.pending_permissions.pop(short_id, None)
+            try:
+                tg.edit(msg_id, "✓ Resolved in terminal", chat_id)
+            except Exception:
+                pass
+            if full_id:
+                bridge.abandon_permission(full_id)
+            def _del(mid=msg_id, cid=chat_id):
+                time.sleep(5)
+                tg.delete(mid, cid)
+            threading.Thread(target=_del, daemon=True).start()
+        else:
+            try:
+                tg.delete(msg_id, chat_id)
+            except Exception:
+                pass
+
+
+def _terminal_watcher():
+    """Poll JSONL files of terminal sessions; clean stale messages on progress."""
+    while bot_running:
+        time.sleep(5)
+        with state.lock:
+            watched = list(state.pending_terminal_msgs.keys())
+        for csid in watched:
+            path = _session_jsonl_path(csid)
+            if not path:
+                continue
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            prev = _watcher_offsets.get(csid, 0)
+            if size <= prev:
+                continue
+            print(f"[watcher] JSONL grew csid={csid[:8]}… "
+                  f"{prev}→{size}, cleaning",
+                  file=sys.stderr, flush=True)
+            _watcher_offsets[csid] = size
+            _cleanup_terminal_pending(csid)
+
+
 def _device_monitor_loop():
     """Background: check for new TG sessions every 5 minutes."""
     import device_monitor
@@ -2020,8 +2115,10 @@ def main():
             with state.lock:
                 state.topic_labels[s.topic_id] = s.topic_label
     bridge.start()
+    _cleanup_general()
     threading.Thread(target=_topic_healthcheck, daemon=True).start()
     threading.Thread(target=_dashboard_loop, daemon=True).start()
+    threading.Thread(target=_terminal_watcher, daemon=True).start()
     threading.Thread(target=_device_monitor_loop, daemon=True).start()
     tg.set_my_commands([
         {"command": "new", "description": "New Claude session"},
