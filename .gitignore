@@ -31,8 +31,9 @@ temp/
 .dist_checksums
 .backup_*
 
-# Local Claude Code settings (per-developer)
-.claude/settings.local.json
+# Local Claude Code config (per-developer) — settings, output styles, etc.
+.claude/
+CLAUDE.local.md
 
 # IDE / editors
 .idea/
