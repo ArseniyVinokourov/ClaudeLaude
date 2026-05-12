@@ -78,6 +78,7 @@ class SessionManager:
         self._topic_map: dict[int, str] = {}
         self._cwd_map: dict[str, str] = {}
         self._claude_id_map: dict[str, str] = {}
+        self._known_bot_sids: set[str] = set()
         self._persist_lock = threading.Lock()
         self._restore()
 
@@ -334,6 +335,8 @@ class SessionManager:
             self._topic_map[topic_id] = sid
             if session.claude_session_id:
                 self._claude_id_map[session.claude_session_id] = sid
+                if session.is_bot_spawned:
+                    self._known_bot_sids.add(session.claude_session_id)
             if session.cwd:
                 self._cwd_map[session.cwd] = sid
             if session.is_bot_spawned and alive:
@@ -449,6 +452,8 @@ class SessionManager:
                     del self._claude_id_map[old]
                 session.claude_session_id = sid
                 self._claude_id_map[sid] = session.sid
+                if session.is_bot_spawned:
+                    self._known_bot_sids.add(sid)
                 self._persist()
 
         elif etype == "assistant":

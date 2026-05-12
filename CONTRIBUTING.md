@@ -31,7 +31,7 @@ CI rejects branch names that don't match.
 
 ## PR titles
 
-Conventional Commits, **with the same prefix as your branch**:
+Conventional Commits:
 
 ```
 feat: add sticker reactions

@@ -46,21 +46,7 @@ if [[ ! "$TITLE" =~ ${PREFIX_RE}:\ .+ ]]; then
    To fix: edit the PR title above (the small pencil icon next to it)."
 fi
 
-# 3. Branch prefix matches PR title prefix (only meaningful if both look well-formed)
-if [[ "$BRANCH" =~ ^([a-z]+)/ ]] && [[ "$TITLE" =~ ^([a-z]+): ]]; then
-  branch_prefix="${BRANCH%%/*}"
-  title_prefix="${TITLE%%:*}"
-  if [ "$branch_prefix" != "$title_prefix" ]; then
-    append "❌ **Branch and PR title prefixes don't match.**
-
-   Branch prefix: \`$branch_prefix\`
-   PR title prefix: \`$title_prefix\`
-
-   They must be identical. Either rename the branch or edit the PR title."
-  fi
-fi
-
-# 4. PR description has a non-empty `## Summary` section
+# 3. PR description has a non-empty `## Summary` section
 summary=$(printf '%s\n' "$BODY" | awk '
   /^## Summary[[:space:]]*$/ { in_section = 1; next }
   /^## / && in_section { exit }
@@ -75,7 +61,7 @@ if [ -z "$stripped" ]; then
    Edit the PR description above to add it."
 fi
 
-# 5. Owner-only files (skip for the maintainer)
+# 4. Owner-only files (skip for the maintainer)
 if [ "$AUTHOR" != "$OWNER_LOGIN" ]; then
   changed=$(gh pr diff "$PR" --name-only 2>/dev/null || true)
   forbidden=$(printf '%s\n' "$changed" | grep -E '^(VERSION$|version\.py$|\.github/workflows/|\.github/scripts/|\.github/CODEOWNERS$|CODEOWNERS$)' || true)
@@ -94,7 +80,7 @@ $files_list
   fi
 fi
 
-# 6. Python syntax
+# 5. Python syntax
 py_err_file="${RUNNER_TEMP:-/tmp}/py_err.txt"
 if ! python3 -m py_compile *.py 2>"$py_err_file"; then
   append "❌ **Python syntax error.**
@@ -106,7 +92,7 @@ $(cat "$py_err_file")
    Run locally: \`python3 -m py_compile *.py\`"
 fi
 
-# 7. Bash syntax
+# 6. Bash syntax
 bash_errs=""
 for f in *.sh; do
   [ -f "$f" ] || continue
@@ -124,7 +110,7 @@ $bash_errs
    Run locally: \`for f in *.sh; do bash -n \"\$f\"; done\`"
 fi
 
-# 8. Ruff lint
+# 7. Ruff lint
 if ! ruff_out=$(ruff check . 2>&1); then
   append "❌ **Ruff lint failed.**
 
