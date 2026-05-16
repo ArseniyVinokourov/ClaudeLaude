@@ -26,7 +26,7 @@ from config import (OWNER_ID, PROJECTS_DIR, HOOK_PORT,
                     is_killed, activate_kill, deactivate_kill)
 import audit
 import telegram as tg
-from sessions import Session, SessionManager
+from sessions import MODE_PRESETS, Session, SessionManager
 from hooks import HookBridge
 
 # ── state ────────────────────────────────────────────────────────────
@@ -348,6 +348,47 @@ def _build_summary(texts: list[str], ops: list[str]) -> str:
         parts.append(f"⚙️ {len(ops)} ops")
     parts.append(tg.esc(combined))
     return "\n".join(parts)
+
+
+# ── session context for claude --append-system-prompt ────────────────
+
+def _session_context(session) -> str:
+    """Return the per-turn context appended to Claude's system prompt.
+
+    Tells Claude it's running inside the ClaudeLaude Telegram bot, plus
+    the topic/display-mode/mode it currently lives in and the bot
+    commands the user can hit from Telegram.
+    """
+    display = "mobile"
+    if session.topic_id:
+        with state.lock:
+            display = state.topic_display_mode.get(
+                session.topic_id, DEFAULT_DISPLAY)
+    lines = [
+        "## ClaudeLaude bot session",
+        "You are running inside ClaudeLaude — a Telegram bot that exposes "
+        "Claude Code over Telegram Forum Topics. Each topic is one session; "
+        "the owner reads your output in the Telegram client.",
+        "",
+        f"- topic_id: {session.topic_id}",
+        f"- session_id (bot): {session.sid}",
+        f"- cwd: {session.cwd}",
+        f"- display: {display} (mobile = 35-char width, no tables, no <pre>)",
+        f"- mode: {session.mode}",
+        "",
+        "Owner-side commands (sent from Telegram, not by you):",
+        "/new /sessions /resume /history /stop /restart /interrupt "
+        "/usage /display /mode /menu /help /update /stop_bot.",
+        "",
+        "Constraints:",
+        "- Telegram messages cap at 4096 chars; the bot splits long output.",
+        "- Markdown tables and <pre> blocks render badly in Telegram — "
+        "prefer key:value lists.",
+        "- Inline buttons truncate at ~25 chars on mobile.",
+        "- Photos/files the owner sends arrive as attachment paths in "
+        "your user message.",
+    ]
+    return "\n".join(lines)
 
 
 # ── noise filter ─────────────────────────────────────────────────────
@@ -1315,6 +1356,35 @@ def cmd_history(session, chat_id, thread_id, args):
     tg.send("\n".join(lines), chat_id, thread_id=thread_id)
 
 
+def cmd_mode(session, chat_id, thread_id, args):
+    if not session:
+        if thread_id:
+            tg.send("Use in a session topic", chat_id, thread_id=thread_id)
+        else:
+            fid = forum()
+            if fid:
+                _ephemeral(fid, "Use in a session topic", seconds=5)
+        return
+    name = args.strip().lower()
+    if not name:
+        lines = [f"<b>Current mode:</b> {tg.esc(session.mode)}", "", "Modes:"]
+        for key, preset in MODE_PRESETS.items():
+            marker = "•" if key == session.mode else " "
+            lines.append(f"{marker} <code>{key}</code> — {tg.esc(preset['label'])}")
+        lines.append("")
+        lines.append("Set with <code>/mode &lt;name&gt;</code>.")
+        tg.send("\n".join(lines), chat_id, thread_id=thread_id)
+        return
+    if not mgr.set_mode(session.sid, name):
+        valid = ", ".join(MODE_PRESETS.keys())
+        tg.send(f"Unknown mode: <code>{tg.esc(name)}</code>\nAvailable: {valid}",
+                chat_id, thread_id=thread_id)
+        return
+    preset = MODE_PRESETS[name]
+    tg.send(f"\U0001f3af Mode: <b>{tg.esc(name)}</b> — {tg.esc(preset['label'])}",
+            chat_id, thread_id=thread_id)
+
+
 def cmd_display(chat_id, thread_id, args):
     if not thread_id:
         fid = forum()
@@ -1780,6 +1850,7 @@ _HELP_TEXT = (
     "/history [N] — last N events (default 30)\n"
     "/usage — session tokens + account limits\n"
     "/display [mobile|desktop] — toggle view\n"
+    "/mode [default|terse|verbose|beginner|plan] — response style\n"
     "\n"
     "<b>Other</b>\n"
     "/update — check for bot updates\n"
@@ -1795,14 +1866,14 @@ _HELP_TEXT = (
 
 _KNOWN_COMMANDS = {
     "/setup", "/new", "/sessions", "/resume", "/history", "/stop",
-    "/interrupt", "/restart", "/usage", "/display", "/test_perm",
+    "/interrupt", "/restart", "/usage", "/display", "/mode", "/test_perm",
     "/update", "/stop_bot", "/help", "/start", "/menu",
     "/kill", "/audit",
 }
 
 _HELP_DOCUMENTED_COMMANDS = {
     "/new", "/sessions", "/resume", "/stop", "/interrupt", "/restart",
-    "/history", "/usage", "/display", "/update",
+    "/history", "/usage", "/display", "/mode", "/update",
     "/menu", "/help", "/stop_bot",
 }
 
@@ -1952,6 +2023,7 @@ mgr = SessionManager(
     on_tool_use=on_tool_use,
     on_thinking=on_thinking,
     on_session_stop=_on_session_stop,
+    on_session_context=_session_context,
 )
 bridge = HookBridge(
     on_notification=on_hook_notification,
@@ -2281,6 +2353,8 @@ def _handle_command(cmd, args, chat_id, thread_id, session):
         cmd_usage(session, chat_id, thread_id)
     elif cmd == "/display":
         cmd_display(chat_id, thread_id, args)
+    elif cmd == "/mode":
+        cmd_mode(session, chat_id, thread_id, args)
     elif cmd == "/update":
         cmd_update(chat_id, thread_id)
     elif cmd == "/test_perm":

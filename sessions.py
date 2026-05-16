@@ -22,6 +22,55 @@ _CLAUDE_BIN = (shutil.which("claude")
                or os.path.expanduser("~/.local/bin/claude"))
 
 
+MODE_PRESETS: dict[str, dict] = {
+    "default": {
+        "style": "",
+        "permission_mode": "auto",
+        "label": "normal behavior",
+    },
+    "terse": {
+        "style": (
+            "Response style: terse. Reply in 1-3 short sentences of plain "
+            "prose. No preambles, no recap of what the user just said, no "
+            "trailing summaries. Lists only when they carry distinct items."
+        ),
+        "permission_mode": "auto",
+        "label": "1-3 sentence answers",
+    },
+    "verbose": {
+        "style": (
+            "Response style: verbose. Explain context, alternatives, and "
+            "tradeoffs. Walk through reasoning before conclusions. Cite "
+            "specific files and lines when relevant."
+        ),
+        "permission_mode": "auto",
+        "label": "full reasoning and context",
+    },
+    "beginner": {
+        "style": (
+            "Response style: beginner-friendly. Define jargon the first "
+            "time it appears. Show small concrete examples. Prefer plain "
+            "language over idiomatic shorthand."
+        ),
+        "permission_mode": "auto",
+        "label": "explains as it goes",
+    },
+    "plan": {
+        "style": (
+            "Permission mode: plan (read-only). You cannot edit files or "
+            "run mutating commands. Investigate and propose a plan; the "
+            "user will switch modes to execute."
+        ),
+        "permission_mode": "plan",
+        "label": "read-only research mode",
+    },
+}
+
+
+def valid_mode(name: str) -> bool:
+    return name in MODE_PRESETS
+
+
 @dataclass
 class HistoryEntry:
     ts: float
@@ -48,6 +97,7 @@ class Session:
     total_cache_create: int = 0
     total_cost_usd: float = 0.0
     topic_label: str = ""
+    mode: str = "default"
     turn_input_tokens: int = 0
     turn_output_tokens: int = 0
     pending_images: list[str] = field(default_factory=list)
@@ -68,12 +118,14 @@ class SessionManager:
                  on_result: Callable,
                  on_tool_use: Callable,
                  on_thinking: Callable,
-                 on_session_stop: Callable | None = None):
+                 on_session_stop: Callable | None = None,
+                 on_session_context: Callable[["Session"], str] | None = None):
         self._on_assistant = on_assistant_message
         self._on_result = on_result
         self._on_tool_use = on_tool_use
         self._on_thinking = on_thinking
         self._on_session_stop = on_session_stop
+        self._on_session_context = on_session_context
         self._sessions: dict[str, Session] = {}
         self._topic_map: dict[int, str] = {}
         self._cwd_map: dict[str, str] = {}
@@ -93,6 +145,16 @@ class SessionManager:
         ).start()
         self._persist()
         return session
+
+    def set_mode(self, sid: str, mode: str) -> bool:
+        if not valid_mode(mode):
+            return False
+        session = self._sessions.get(sid)
+        if not session:
+            return False
+        session.mode = mode
+        self._persist()
+        return True
 
     def stop(self, sid: str, reason: str = "stopped"):
         session = self._sessions.get(sid)
@@ -278,6 +340,7 @@ class SessionManager:
                     "total_cache_read": s.total_cache_read,
                     "total_cache_create": s.total_cache_create,
                     "total_cost_usd": s.total_cost_usd,
+                    "mode": s.mode,
                     "history": history_tail,
                 })
             try:
@@ -329,6 +392,7 @@ class SessionManager:
                 total_cache_create=r.get("total_cache_create", 0),
                 total_cost_usd=r.get("total_cost_usd", 0.0),
                 topic_label=r.get("topic_label", ""),
+                mode=r.get("mode", "default") if valid_mode(r.get("mode", "default")) else "default",
                 history=history,
             )
             self._sessions[sid] = session
@@ -375,8 +439,22 @@ class SessionManager:
         from config import is_killed
         if is_killed():
             return
+        preset = MODE_PRESETS.get(session.mode, MODE_PRESETS["default"])
         cmd = [_CLAUDE_BIN, "-p", text, "--output-format", "stream-json",
-               "--verbose", "--permission-mode", "auto"]
+               "--verbose", "--permission-mode", preset["permission_mode"]]
+        append_parts: list[str] = []
+        if self._on_session_context is not None:
+            try:
+                ctx = self._on_session_context(session)
+                if ctx:
+                    append_parts.append(ctx)
+            except Exception as e:
+                print(f"[session {session.sid}] context callback error: {e}",
+                      file=sys.stderr, flush=True)
+        if preset["style"]:
+            append_parts.append(preset["style"])
+        if append_parts:
+            cmd.extend(["--append-system-prompt", "\n\n".join(append_parts)])
         if session.claude_session_id:
             cmd.extend(["--resume", session.claude_session_id])
         if getattr(session, '_fork', False):

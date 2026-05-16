@@ -829,3 +829,128 @@ def test_terminal_watcher_offset_init(bot, tmp_path, monkeypatch):
     # pending_terminal_msgs still has the entry
     with bot.mod.state.lock:
         assert csid in bot.mod.state.pending_terminal_msgs
+
+
+# ── session-quality: context injection + /mode ──────────────────────
+
+def _start_bot_session(bot, tmp_path, name="demo"):
+    cwd = tmp_path / name
+    cwd.mkdir(exist_ok=True)
+    bot.tg.inject_update(text_update(
+        f"/new {cwd}",
+        owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id,
+    ))
+    _drain_updates(bot)
+    bot.tg.reset()
+    return cwd
+
+
+def _append_system_prompt(cmd: list[str]) -> str:
+    """Extract --append-system-prompt value from a claude spawn cmd, or ''."""
+    for i, tok in enumerate(cmd):
+        if tok == "--append-system-prompt" and i + 1 < len(cmd):
+            return cmd[i + 1]
+    return ""
+
+
+def _permission_mode(cmd: list[str]) -> str:
+    for i, tok in enumerate(cmd):
+        if tok == "--permission-mode" and i + 1 < len(cmd):
+            return cmd[i + 1]
+    return ""
+
+
+def test_session_context_is_appended(bot, tmp_path):
+    cwd = _start_bot_session(bot, tmp_path)
+    bot.tg.inject_update(text_update(
+        "say hi", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, thread_id=100,
+    ))
+    _drain_updates(bot)
+    bot.claude.wait_for_spawns(1)
+
+    cmd = bot.claude.last_spawn()["cmd"]
+    appended = _append_system_prompt(cmd)
+    assert "ClaudeLaude bot session" in appended
+    assert "topic_id: 100" in appended
+    assert str(cwd) in appended
+    assert "mode: default" in appended
+    assert _permission_mode(cmd) == "auto"
+
+
+def test_mode_plan_switches_permission(bot, tmp_path):
+    _start_bot_session(bot, tmp_path)
+    bot.tg.inject_update(text_update(
+        "/mode plan", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, thread_id=100,
+    ))
+    _drain_updates(bot)
+    bot.tg.inject_update(text_update(
+        "investigate", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, thread_id=100,
+    ))
+    _drain_updates(bot)
+    bot.claude.wait_for_spawns(1)
+
+    cmd = bot.claude.last_spawn()["cmd"]
+    assert _permission_mode(cmd) == "plan"
+    assert "mode: plan" in _append_system_prompt(cmd)
+
+
+def test_mode_terse_injects_style(bot, tmp_path):
+    _start_bot_session(bot, tmp_path)
+    bot.tg.inject_update(text_update(
+        "/mode terse", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, thread_id=100,
+    ))
+    _drain_updates(bot)
+    bot.tg.inject_update(text_update(
+        "go", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, thread_id=100,
+    ))
+    _drain_updates(bot)
+    bot.claude.wait_for_spawns(1)
+
+    appended = _append_system_prompt(bot.claude.last_spawn()["cmd"])
+    assert "Response style: terse" in appended
+    # Style addendum + context both present
+    assert "ClaudeLaude bot session" in appended
+
+
+def test_mode_unknown_rejected_and_persisted_default(bot, tmp_path):
+    _start_bot_session(bot, tmp_path)
+    bot.tg.reset()
+    bot.tg.inject_update(text_update(
+        "/mode bogus", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, thread_id=100,
+    ))
+    _drain_updates(bot)
+
+    replies = [m["text"] for m in bot.tg.calls_of("sendMessage")
+               if m.get("message_thread_id") == 100]
+    assert any("Unknown mode" in t for t in replies), replies
+
+    # Session.mode untouched
+    sid = bot.mod.mgr._topic_map[100]
+    assert bot.mod.mgr._sessions[sid].mode == "default"
+
+
+def test_mode_persists_across_restore(bot, tmp_path, monkeypatch):
+    import json
+    _start_bot_session(bot, tmp_path)
+    bot.tg.inject_update(text_update(
+        "/mode verbose", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, thread_id=100,
+    ))
+    _drain_updates(bot)
+
+    sid = bot.mod.mgr._topic_map[100]
+    assert bot.mod.mgr._sessions[sid].mode == "verbose"
+
+    # Persistence file written
+    import sessions as sess_mod
+    with open(sess_mod._PERSIST_PATH) as f:
+        records = json.load(f)
+    rec = next(r for r in records if r["sid"] == sid)
+    assert rec["mode"] == "verbose"
