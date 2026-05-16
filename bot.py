@@ -634,6 +634,7 @@ def _resolve_hook_session(claude_session_id, data):
     if claude_session_id:
         s = mgr.register_terminal(claude_session_id, topic_id, cwd=cwd)
         s.topic_label = label
+        mgr._persist()
         return s
     _log(f"registered topic {topic_id} (no claude session_id)")
     sid = uuid.uuid4().hex[:8]
@@ -917,6 +918,7 @@ def _spawn_session(cwd, name=None):
         state.topic_labels[topic_id] = label
     s = mgr.create(cwd=cwd, name=name, topic_id=topic_id)
     s.topic_label = label
+    mgr._persist()
     audit.log("session_start", cwd, sid=s.sid)
     send_to_topic(topic_id,
                   f"▶️ <code>{tg.esc(cwd)}</code>")
@@ -1015,7 +1017,7 @@ def _short_cwd(cwd: str, limit: int = 48) -> str:
 
 def cmd_sessions(chat_id, thread_id=None):
     all_sessions = [s for s in mgr._sessions.values()
-                    if s.claude_session_id and s.topic_id]
+                    if s.topic_id]
     all_sessions.sort(key=lambda s: (not s.alive, -_session_last_active(s)))
     if not all_sessions:
         if not thread_id:
@@ -1563,7 +1565,7 @@ def cmd_test_perm(chat_id, thread_id=None):
             with urllib.request.urlopen(req, timeout=130) as resp:
                 body = json.loads(resp.read().decode())
                 dec = body.get("hookSpecificOutput", {}).get(
-                    "permissionDecision", "?")
+                    "decision", {}).get("behavior", "?")
                 if thread_id:
                     tg.send(f"Test OK! Decision: {tg.esc(dec)}",
                             chat_id, thread_id=thread_id)
