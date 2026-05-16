@@ -274,6 +274,45 @@ def test_sessions_command_lists(bot, tmp_path):
     assert "demo" in msgs[-1]["text"]
 
 
+def test_pre_turn_session_visible_and_persisted(bot, tmp_path):
+    """A /new'd session must show up in /sessions and persist even before
+    its first turn (when claude_session_id is still unassigned)."""
+    cwd = tmp_path / "fresh"
+    cwd.mkdir(exist_ok=True)
+    bot.tg.inject_update(text_update(
+        f"/new {cwd}",
+        owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
+    ))
+    _drain_updates(bot)
+
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    assert sess.claude_session_id is None
+    assert sess.topic_id
+
+    import json
+    import os
+    persist_path = os.environ["BOT_SESSIONS_FILE"]
+    assert os.path.exists(persist_path)
+    records = json.load(open(persist_path))
+    rec = next((r for r in records if r["sid"] == sess.sid), None)
+    assert rec is not None, \
+        f"pre-turn session missing from persist: {records}"
+    assert rec.get("topic_label"), \
+        f"topic_label not persisted for fresh session: {rec}"
+
+    bot.tg.reset()
+    bot.tg.inject_update(text_update(
+        "/sessions",
+        owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
+    ))
+    _drain_updates(bot)
+    msgs = [m for m in bot.tg.calls_of("sendMessage")
+            if "Sessions" in m.get("text", "")]
+    assert msgs, "no /sessions reply"
+    assert "fresh" in msgs[-1]["text"], \
+        f"pre-turn session not in /sessions: {msgs[-1]['text']}"
+
+
 # ── 7. permission Deny → bridge.decisions["deny"] ───────────────────
 
 def test_permission_flow_deny(bot, tmp_path):

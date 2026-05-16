@@ -257,7 +257,7 @@ class SessionManager:
             self._gc()
             records = []
             for s in self._sessions.values():
-                if not s.claude_session_id or not s.topic_id:
+                if not s.topic_id:
                     continue
                 history_tail = [
                     {"ts": h.ts, "kind": h.kind, "text": h.text}
