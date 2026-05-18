@@ -1018,7 +1018,7 @@ def test_hook_resolver_refuses_no_sid_no_cwd(bot, tmp_path):
 
 def test_interrupt_repaints_status_message(bot, tmp_path):
     """A live turn-status message should be edited to "⏹ Interrupted"."""
-    cwd = _start_bot_session(bot, tmp_path)
+    _start_bot_session(bot, tmp_path)
     sid = next(iter(bot.mod.mgr._sessions))
     session = bot.mod.mgr._sessions[sid]
     # Plant a live turn with an existing status message.
@@ -1040,11 +1040,10 @@ def test_interrupt_repaints_status_message(bot, tmp_path):
 def test_sticker_routed_to_claude_as_text(bot, tmp_path):
     """Sending a sticker in an active bot session feeds Claude a textual
     descriptor including emoji and pack name."""
-    cwd = _start_bot_session(bot, tmp_path)
-    sid = next(iter(bot.mod.mgr._sessions))
+    _start_bot_session(bot, tmp_path)
     captured: list[str] = []
     original = bot.mod.mgr.send_user_message
-    def _cap(sid_, text):
+    def _cap(_sid, text):
         captured.append(text)
         return True
     bot.mod.mgr.send_user_message = _cap
