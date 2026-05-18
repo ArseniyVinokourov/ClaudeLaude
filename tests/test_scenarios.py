@@ -1517,7 +1517,7 @@ def test_record_topic_msg_trims_buffer(bot):
 
 # ── Terminal mirror (#51 + #56) ─────────────────────────────────────
 
-def _make_fake_jsonl(tmp_path, csid: str, cwd: str) -> "pathlib.Path":
+def _make_fake_jsonl(tmp_path, csid: str, cwd: str):
     """Create the JSONL path Claude Code would write to for given csid/cwd."""
     import pathlib
     encoded = cwd.replace("/", "-")
@@ -1529,7 +1529,8 @@ def _make_fake_jsonl(tmp_path, csid: str, cwd: str) -> "pathlib.Path":
 def test_mirror_register_creates_topic_and_starts_follower(bot, tmp_path):
     """POST /hook/open_in_bot via on_open_in_bot creates a forum topic
     and registers the mirror. JSONL follower picks up appended events."""
-    import json as _json, time as _time
+    import json as _json
+    import time as _time
     csid = "mirror-test-1"
     cwd = str(tmp_path / "mirror_project_1")
     (tmp_path / "mirror_project_1").mkdir()
