@@ -2411,6 +2411,39 @@ def _topic_healthcheck():
             if not tg.topic_alive(fid, session.topic_id, name=label):
                 _invalidate_and_stop(session, "topic deleted")
 
+        # Mirrors: probe topic existence, dtach socket presence, and
+        # JSONL freshness. A mirror with a vanished topic is dropped;
+        # a vanished dtach socket flips the mirror to output-only;
+        # a JSONL untouched for > 30 min implies the terminal session
+        # has ended.
+        for mirror in mirror_mgr.list():
+            if not mirror.alive:
+                continue
+            with state.lock:
+                label = state.topic_labels.get(mirror.topic_id)
+            if not label:
+                label = f"mirror {mirror.csid[:8]}"
+            if not tg.topic_alive(fid, mirror.topic_id, name=label):
+                print(f"[mirror] topic gone for {mirror.csid[:8]} — unregistering",
+                      file=sys.stderr, flush=True)
+                mirror_mgr.unregister(mirror.csid)
+                continue
+            if mirror.dtach_sock and not os.path.exists(mirror.dtach_sock):
+                send_to_topic(
+                    mirror.topic_id,
+                    "\U0001f50c Terminal closed — mirror is now output-only")
+                mirror_mgr.set_dtach_sock(mirror.csid, None)
+            try:
+                jmtime = os.path.getmtime(mirror.jsonl_path)
+            except OSError:
+                jmtime = 0
+            if jmtime and time.time() - jmtime > 1800:
+                send_to_topic(
+                    mirror.topic_id,
+                    "\U0001f50c Terminal session looks idle (no transcript "
+                    "activity in 30 min) — closing the mirror")
+                mirror_mgr.unregister(mirror.csid)
+
 
 def _cleanup_terminal_pending(csid: str):
     """Remove stale messages from a terminal topic after session progressed."""
