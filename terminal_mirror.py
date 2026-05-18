@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from collections.abc import Callable
 
@@ -129,12 +130,91 @@ class TerminalMirrorManager:
                 self.start_follower(m)
 
     def _follow_loop(self, mirror: TerminalMirror):
-        # Implemented in step 2 (JSONL follower).
-        pass
+        """Tail the JSONL transcript and project each new event.
 
-    def _save_offset(self, mirror: TerminalMirror):
-        """Persist last_offset without rewriting unrelated state."""
-        self._persist()
+        Polls 2 Hz. Survives the file not existing yet (waits up to
+        60 s for the terminal to write its first event), gracefully
+        ignores partial lines (no trailing newline → roll back and
+        retry), and snaps offset back to 0 if the file shrinks
+        (rotation / replacement).
+        """
+        def log(msg):
+            print(f"[mirror {mirror.csid[:8]}] {msg}",
+                  file=sys.stderr, flush=True)
+
+        # 1. Wait for the JSONL file to appear.
+        deadline = time.time() + 60
+        while mirror.alive and not os.path.exists(mirror.jsonl_path):
+            if time.time() > deadline:
+                log(f"jsonl never appeared at {mirror.jsonl_path}")
+                return
+            time.sleep(1)
+        if not mirror.alive:
+            return
+
+        try:
+            f = open(mirror.jsonl_path, "rb")
+        except OSError as e:
+            log(f"open failed: {e}")
+            return
+
+        try:
+            # If saved offset is past EOF (file truncated / replaced),
+            # restart from the beginning.
+            f.seek(0, os.SEEK_END)
+            file_size = f.tell()
+            start = mirror.last_offset
+            if start > file_size:
+                log(f"file shrank ({file_size} < {start}); restarting at 0")
+                start = 0
+                mirror.last_offset = 0
+            f.seek(start)
+
+            idle_ticks = 0
+            events_since_save = 0
+            while mirror.alive:
+                pos_before = f.tell()
+                line = f.readline()
+                if not line:
+                    time.sleep(0.5)
+                    idle_ticks += 1
+                    # Persist offset roughly every 30 s of idle so a
+                    # restart resumes near the current tail rather
+                    # than at the last delivered event.
+                    if idle_ticks >= 60 and events_since_save > 0:
+                        self._persist()
+                        events_since_save = 0
+                        idle_ticks = 0
+                    continue
+                if not line.endswith(b"\n"):
+                    # Partial line — back off, wait for the writer to
+                    # finish, retry.
+                    f.seek(pos_before)
+                    time.sleep(0.3)
+                    continue
+
+                idle_ticks = 0
+                mirror.last_offset = f.tell()
+                try:
+                    event = json.loads(line.decode("utf-8", errors="replace"))
+                except json.JSONDecodeError:
+                    continue
+                try:
+                    self._on_event(mirror, event)
+                except Exception as e:
+                    log(f"on_event error: {e}")
+                events_since_save += 1
+                # Batch offset saves: every 5 events.
+                if events_since_save >= 5:
+                    self._persist()
+                    events_since_save = 0
+        finally:
+            try:
+                f.close()
+            except Exception:
+                pass
+            # Final offset save on exit.
+            self._persist()
 
     # ── persistence ─────────────────────────────────────────────────
 
