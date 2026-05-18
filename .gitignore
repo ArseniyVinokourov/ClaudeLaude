@@ -2,6 +2,7 @@
 .env
 .state.json
 .sessions.json
+.mirrors.json
 
 # Python
 .venv/

@@ -2320,6 +2320,16 @@ def on_open_in_bot(csid, cwd, dtach_sock):
     existing = mirror_mgr.by_csid(csid)
     if existing:
         url = _topic_url(existing.topic_id)
+        # If the previous follower thread died (e.g. JSONL hadn't been
+        # written yet on first registration), restart it now that the
+        # user is invoking the command again with the file likely
+        # already in place.
+        if not existing.follower or not existing.follower.is_alive():
+            mirror_mgr.start_follower(existing)
+        # Also refresh the dtach socket binding — the user may have
+        # re-launched their terminal under the shim, getting a new socket.
+        if dtach_sock and existing.dtach_sock != dtach_sock:
+            mirror_mgr.set_dtach_sock(csid, dtach_sock)
         return {"status": "ok", "topic_url": url, "existing": True}
     name = os.path.basename(cwd.rstrip("/")) or "terminal"
     ts = time.strftime("%H:%M")
