@@ -1513,3 +1513,162 @@ def test_record_topic_msg_trims_buffer(bot):
     # Tail kept, head dropped.
     assert buf[-1] == 1000 + (_FORK_BACKFILL * 3 - 1)
     assert buf[0] == 1000 + (_FORK_BACKFILL * 3 - _FORK_BACKFILL)
+
+
+# ── Terminal mirror (#51 + #56) ─────────────────────────────────────
+
+def _make_fake_jsonl(tmp_path, csid: str, cwd: str) -> "pathlib.Path":
+    """Create the JSONL path Claude Code would write to for given csid/cwd."""
+    import pathlib
+    encoded = cwd.replace("/", "-")
+    proj_dir = pathlib.Path.home() / ".claude" / "projects" / encoded
+    proj_dir.mkdir(parents=True, exist_ok=True)
+    return proj_dir / f"{csid}.jsonl"
+
+
+def test_mirror_register_creates_topic_and_starts_follower(bot, tmp_path):
+    """POST /hook/open_in_bot via on_open_in_bot creates a forum topic
+    and registers the mirror. JSONL follower picks up appended events."""
+    import json as _json, time as _time
+    csid = "mirror-test-1"
+    cwd = str(tmp_path / "mirror_project_1")
+    (tmp_path / "mirror_project_1").mkdir()
+    jp = _make_fake_jsonl(tmp_path, csid, cwd)
+    try:
+        result = bot.mod.on_open_in_bot(csid, cwd, None)
+        assert "topic_url" in result, result
+        topic_calls = bot.tg.calls_of("createForumTopic")
+        assert len(topic_calls) == 1, topic_calls
+        # Mirror is in registry
+        m = bot.mod.mirror_mgr.by_csid(csid)
+        assert m is not None
+        assert m.cwd == cwd
+
+        # Append an assistant event; follower should pick it up.
+        with open(jp, "w") as f:
+            f.write(_json.dumps({
+                "type": "assistant",
+                "message": {"content": [
+                    {"type": "text", "text": "hello from terminal"},
+                ]},
+            }) + "\n")
+
+        # Give the follower up to 2.5s to read + project.
+        deadline = _time.time() + 2.5
+        found = None
+        while _time.time() < deadline:
+            for params in bot.tg.calls_of("sendMessage"):
+                if (params.get("message_thread_id") == m.topic_id
+                        and "hello from terminal" in params.get("text", "")):
+                    found = params
+                    break
+            if found:
+                break
+            _time.sleep(0.05)
+        assert found, ("expected assistant text projected into topic; "
+                       f"got calls: {bot.tg.calls_of('sendMessage')[-5:]}")
+    finally:
+        bot.mod.mirror_mgr.unregister(csid)
+        try:
+            jp.unlink()
+            jp.parent.rmdir()
+        except OSError:
+            pass
+
+
+def test_mirror_register_idempotent(bot, tmp_path):
+    """Second call for the same csid returns the existing topic_url."""
+    csid = "mirror-test-2"
+    cwd = str(tmp_path / "mirror_project_2")
+    (tmp_path / "mirror_project_2").mkdir()
+    try:
+        r1 = bot.mod.on_open_in_bot(csid, cwd, None)
+        r2 = bot.mod.on_open_in_bot(csid, cwd, None)
+        assert r1.get("topic_url") == r2.get("topic_url")
+        assert r2.get("existing") is True
+        assert len(bot.tg.calls_of("createForumTopic")) == 1
+    finally:
+        bot.mod.mirror_mgr.unregister(csid)
+
+
+def test_mirror_input_bridge_pushes_to_dtach(bot, tmp_path, monkeypatch):
+    """Text typed in a mirror topic with dtach_sock set should be pushed
+    via push_to_dtach. Output-only mirrors should refuse with an ephemeral."""
+    csid = "mirror-test-3"
+    cwd = str(tmp_path / "mirror_project_3")
+    (tmp_path / "mirror_project_3").mkdir()
+
+    # Patch push_to_dtach so we don't shell out to a real dtach.
+    pushes: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        bot.mod, "push_to_dtach",
+        lambda sock, text, **kw: (pushes.append((sock, text)) or True),
+    )
+
+    try:
+        bot.mod.on_open_in_bot(csid, cwd, "/tmp/fake.sock")
+        m = bot.mod.mirror_mgr.by_csid(csid)
+        assert m and m.dtach_sock == "/tmp/fake.sock"
+
+        bot.tg.inject_update(text_update(
+            "ls -la", owner_id=bot.owner_id,
+            forum_chat_id=bot.forum_chat_id,
+            thread_id=m.topic_id,
+        ))
+        _drain_updates(bot)
+        assert pushes == [("/tmp/fake.sock", "ls -la")], pushes
+    finally:
+        bot.mod.mirror_mgr.unregister(csid)
+
+
+def test_mirror_input_bridge_output_only_rejects(bot, tmp_path, monkeypatch):
+    """Mirror without dtach_sock should not call push_to_dtach; it should
+    surface an output-only notice."""
+    csid = "mirror-test-4"
+    cwd = str(tmp_path / "mirror_project_4")
+    (tmp_path / "mirror_project_4").mkdir()
+
+    pushes: list[tuple] = []
+    monkeypatch.setattr(
+        bot.mod, "push_to_dtach",
+        lambda *a, **kw: (pushes.append(a) or True),
+    )
+
+    try:
+        bot.mod.on_open_in_bot(csid, cwd, None)
+        m = bot.mod.mirror_mgr.by_csid(csid)
+        assert m and m.dtach_sock is None
+
+        bot.tg.inject_update(text_update(
+            "echo hi", owner_id=bot.owner_id,
+            forum_chat_id=bot.forum_chat_id,
+            thread_id=m.topic_id,
+        ))
+        _drain_updates(bot)
+        assert pushes == [], "push_to_dtach should not be called for output-only mirror"
+        # An ephemeral notice should mention "Output-only"
+        notices = [
+            p.get("text", "") for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == m.topic_id
+            and "Output-only" in p.get("text", "")
+        ]
+        assert notices, "expected an Output-only ephemeral"
+    finally:
+        bot.mod.mirror_mgr.unregister(csid)
+
+
+def test_mirror_persist_and_restore(bot_env, tmp_path):
+    """Mirror records survive a fresh TerminalMirrorManager instance."""
+    import importlib
+    import terminal_mirror as tm
+    importlib.reload(tm)
+    csid = "mirror-persist-1"
+    cwd = str(tmp_path / "persist_project")
+    (tmp_path / "persist_project").mkdir()
+    mgr1 = tm.TerminalMirrorManager(lambda *a, **kw: None)
+    mgr1.register(csid, cwd, 555, dtach_sock="/tmp/persist.sock")
+    mgr2 = tm.TerminalMirrorManager(lambda *a, **kw: None)
+    restored = mgr2.by_csid(csid)
+    assert restored is not None
+    assert restored.topic_id == 555
+    assert restored.dtach_sock == "/tmp/persist.sock"
