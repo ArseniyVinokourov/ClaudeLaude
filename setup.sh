@@ -190,6 +190,77 @@ if [[ "$SETUP_BOT_CMD" =~ ^[Yy] ]]; then
     fi
 fi
 
+# ── Mirror PATH shim (~/.local/bin/claude) ───────────────────────────
+bold "\nTerminal-mirror shim (optional)"
+echo "Installs a tiny wrapper at ~/.local/bin/claude that routes"
+echo "interactive 'claude' invocations through dtach so the bot's"
+echo "/bot mirror command can stream input from your phone into the"
+echo "running session. Non-interactive runs (-p, --version, piped)"
+echo "are forwarded straight to the real claude."
+echo ""
+
+SHIM_SRC="$SCRIPT_DIR/scripts/claude-shim"
+SHIM_BIN_DIR="$HOME/.local/bin"
+SHIM_CLAUDE="$SHIM_BIN_DIR/claude"
+SHIM_CLAUDEBOT="$SHIM_BIN_DIR/claude-bot"
+
+if ! command -v dtach &>/dev/null; then
+    warn "'dtach' is not installed. Mirror will be output-only until you install it."
+    echo "  Debian/Ubuntu: sudo apt install dtach"
+    echo "  macOS:         brew install dtach"
+fi
+
+REAL_CLAUDE=""
+# Resolve real claude by skipping anything in ~/.local/bin/.
+old_IFS="$IFS"; IFS=:
+for d in $PATH; do
+    cand="$d/claude"
+    [ -x "$cand" ] || continue
+    cand_real="$(readlink -f "$cand" 2>/dev/null || echo "$cand")"
+    # Skip if this resolves to either of our planned shim paths.
+    [ "$cand_real" = "$(readlink -f "$SHIM_CLAUDE" 2>/dev/null || echo "$SHIM_CLAUDE")" ] && continue
+    [ "$cand_real" = "$(readlink -f "$SHIM_CLAUDEBOT" 2>/dev/null || echo "$SHIM_CLAUDEBOT")" ] && continue
+    REAL_CLAUDE="$cand"
+    break
+done
+IFS="$old_IFS"
+
+if [ -z "$REAL_CLAUDE" ]; then
+    warn "No 'claude' binary found on PATH — skipping shim install."
+    echo "Install Claude Code first, then re-run setup.sh."
+else
+    echo "Real claude: $REAL_CLAUDE"
+    read -rp "Install transparent shim at $SHIM_CLAUDE? [Y/n]: " INSTALL_SHIM
+    INSTALL_SHIM="${INSTALL_SHIM:-Y}"
+
+    if [[ "$INSTALL_SHIM" =~ ^[Yy] ]]; then
+        mkdir -p "$SHIM_BIN_DIR"
+        cp "$SHIM_SRC" "$SHIM_CLAUDE"
+        cp "$SHIM_SRC" "$SHIM_CLAUDEBOT"
+        chmod +x "$SHIM_CLAUDE" "$SHIM_CLAUDEBOT"
+        ok "Installed $SHIM_CLAUDE and $SHIM_CLAUDEBOT"
+
+        # Verify PATH ordering — shim must come before the real claude.
+        case ":$PATH:" in
+            *:"$SHIM_BIN_DIR":*) PATH_OK=1 ;;
+            *) PATH_OK=0 ;;
+        esac
+        if [ "$PATH_OK" = "0" ]; then
+            warn "$SHIM_BIN_DIR is not in your PATH."
+            echo "Add this to your shell rc (~/.bashrc / ~/.zshrc):"
+            echo "    export PATH=\"\$HOME/.local/bin:\$PATH\""
+        else
+            # Confirm the shim wins. `command -v claude` should now
+            # point at our shim (or at least, our shim should come
+            # first in PATH lookups). We don't try to verify it from
+            # a fresh shell — just trust the ordering.
+            ok "PATH includes $SHIM_BIN_DIR"
+        fi
+    else
+        ok "Skipping transparent shim. Use 'claude-bot' explicitly if you want mirror."
+    fi
+fi
+
 # ── bot profile (one-time branding) ──────────────────────────────────
 bold "\nBot profile"
 echo "Set the bot's display name, short description (search preview),"
