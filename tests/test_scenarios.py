@@ -474,6 +474,42 @@ def test_invalidate_session_cleans_maps(bot, tmp_path):
     assert bot.mod.mgr.by_claude_session_id("claude-orphan") is None
 
 
+# ── 10b. topic_alive probe (production path) → invalidate ──────────
+
+def test_topic_alive_probe_invalidates_dead(bot, tmp_path):
+    """Regression: when a topic is gone, the production silent probe
+    (telegram.topic_alive via editForumTopic) must return False so the
+    healthcheck can invalidate the session. Without this, the bot keeps
+    orphaned sessions whose topic the user has already deleted.
+    """
+    import telegram as tg_mod
+    cwd = tmp_path / "demo"
+    cwd.mkdir(exist_ok=True)
+    bot.tg.inject_update(text_update(
+        f"/new {cwd}",
+        owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
+    ))
+    _drain_updates(bot)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    bot.mod.mgr.link_claude_id("claude-probed", sess)
+
+    # Sanity: live topic probes True.
+    assert tg_mod.topic_alive(bot.forum_chat_id, sess.topic_id,
+                              name="anything") is True
+
+    # Mark topic as dead → editForumTopic probe must surface as False.
+    bot.tg.dead_topics.add(sess.topic_id)
+    assert tg_mod.topic_alive(bot.forum_chat_id, sess.topic_id,
+                              name="anything") is False
+
+    # And the bot's invalidate path drops every routing map.
+    bot.mod._invalidate_and_stop(sess, "topic deleted")
+    assert sess.alive is False
+    assert bot.mod.mgr.by_topic(sess.topic_id) is None
+    assert bot.mod.mgr.by_cwd(str(cwd)) is None
+    assert bot.mod.mgr.by_claude_session_id("claude-probed") is None
+
+
 # ── 11. markdown table → mobile list ────────────────────────────────
 
 def test_markdown_table_to_mobile_list(bot):

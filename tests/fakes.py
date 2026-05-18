@@ -44,15 +44,19 @@ class FakeTelegram:
                 self._update_queue.clear()
             return {"ok": True, "result": ups}
 
-        if method == "sendMessage":
+        if method in ("sendMessage", "editForumTopic"):
             tid = params.get("message_thread_id")
             if tid is not None and tid in self.dead_topics:
                 # Mimic Telegram's "message thread not found" 400.
                 # _req raises HTTPError on 4xx; tests use the topic_alive
                 # probe which catches Exception, so this is consistent.
+                # Production silent probe uses editForumTopic (see
+                # telegram.topic_alive), so the same fault must surface there.
                 import requests
                 resp = _FakeResponse(400, b'{"ok":false,"description":"thread not found"}')
                 raise requests.HTTPError("400", response=resp)
+        if method == "sendMessage":
+            tid = params.get("message_thread_id")
             mid = self._next_msg_id
             self._next_msg_id += 1
             self.messages[mid] = {
