@@ -169,6 +169,27 @@ print('ok')
     ok "Claude Code hooks configured in $SETTINGS_FILE"
 fi
 
+# ── smoke test ───────────────────────────────────────────────────────
+bold "\nSmoke test"
+
+if .venv/bin/python -c "import bot, telegram, sessions, hooks, config, version" 2>/tmp/claudelaude_smoke.log; then
+    ok "Python imports OK"
+else
+    warn "Python import check failed (see /tmp/claudelaude_smoke.log)"
+fi
+
+if command -v curl &>/dev/null; then
+    BOT_TOKEN_CHECK=$(grep '^BOT_TOKEN=' .env 2>/dev/null | cut -d= -f2-)
+    if [ -n "$BOT_TOKEN_CHECK" ]; then
+        if curl -fsS --max-time 10 "https://api.telegram.org/bot${BOT_TOKEN_CHECK}/getMe" \
+            | grep -q '"ok":true'; then
+            ok "Telegram getMe OK"
+        else
+            warn "Telegram getMe failed — check BOT_TOKEN in .env"
+        fi
+    fi
+fi
+
 # ── done ─────────────────────────────────────────────────────────────
 bold "\n--- Setup complete ---"
 echo ""

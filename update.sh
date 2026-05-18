@@ -14,6 +14,14 @@ warn() { echo -e "${C_YELLOW}⚠${C_RESET} $*"; }
 err()  { echo -e "${C_RED}✗${C_RESET} $*"; }
 bold() { echo -e "${C_BOLD}$*${C_RESET}"; }
 
+# Portable sha256: sha256sum on Linux/WSL, shasum -a 256 on macOS.
+# Stored as a command (not a function) so it can be invoked via xargs.
+if command -v sha256sum &>/dev/null; then
+    SHA256=(sha256sum)
+else
+    SHA256=(shasum -a 256)
+fi
+
 # ── parse flags ────────────────────────────────────────────────────
 NON_INTERACTIVE=false
 POLICY_OVERRIDE=""
@@ -97,7 +105,7 @@ if [ -f "$BOT_DIR/.dist_checksums" ]; then
     while IFS='  ' read -r expected_hash filepath; do
         [ -z "$filepath" ] && continue
         [ ! -f "$BOT_DIR/$filepath" ] && continue
-        actual_hash=$(sha256sum "$BOT_DIR/$filepath" | cut -d' ' -f1)
+        actual_hash=$("${SHA256[@]}" "$BOT_DIR/$filepath" | cut -d' ' -f1)
         if [ "$actual_hash" != "$expected_hash" ]; then
             MODIFIED_FILES+=("$filepath")
         fi
@@ -173,7 +181,7 @@ fi
 ok "Dependencies updated"
 
 # ── regenerate checksums ──────────────────────────────────────────
-git ls-files | xargs sha256sum > .dist_checksums 2>/dev/null || true
+git ls-files | xargs "${SHA256[@]}" > .dist_checksums 2>/dev/null || true
 ok "Checksums updated"
 
 # ── offer hooks update ────────────────────────────────────────────
