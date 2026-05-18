@@ -1091,3 +1091,425 @@ def test_user_text_gets_eyes_reaction(bot, tmp_path):
     payload = json.loads(last.get("reaction", "[]"))
     assert any(r.get("emoji") == "👀" for r in payload), \
         f"expected 👀 reaction, got {payload}"
+
+
+# ── status timer hourglass rotates per tick (Batch A #2) ──────────────
+
+def test_status_hourglass_rotates(bot):
+    """⏳ and ⌛ alternate each 3-second tick when no tool ops have run."""
+    from bot import _format_status, TurnState
+    now = time.time()
+    turn = TurnState()
+    # Elapsed 0s → ⏳
+    turn.started_at = now
+    assert _format_status(turn).startswith("⏳"), _format_status(turn)
+    # Elapsed 3s → ⌛
+    turn.started_at = now - 3
+    assert _format_status(turn).startswith("⌛"), _format_status(turn)
+    # Elapsed 6s → ⏳
+    turn.started_at = now - 6
+    assert _format_status(turn).startswith("⏳"), _format_status(turn)
+    # Elapsed 9s → ⌛
+    turn.started_at = now - 9
+    assert _format_status(turn).startswith("⌛"), _format_status(turn)
+    # When a tool op is recorded, the ⚙️ status replaces the hourglass.
+    turn.started_at = now
+    turn.tool_ops.append("$ ls")
+    assert _format_status(turn).startswith("⚙"), _format_status(turn)
+
+
+# ── tool_use parsing: Claude Code 2.1.143 nested-content format ──────
+
+def test_tool_use_inside_assistant_message(bot, tmp_path):
+    """Claude Code 2.1.143+ emits tool_use as a content block inside the
+    assistant message. We must surface it as on_tool_use, not drop it."""
+    _start_bot_session(bot, tmp_path)
+    bot.tg.reset()
+    bot.claude.script([
+        {"type": "system", "session_id": "nested-tool"},
+        # Real 2.1.143 shape: assistant message whose content list mixes
+        # text and tool_use blocks.
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Bash",
+             "input": {"command": "ls /tmp", "description": "list"}},
+        ]}},
+        {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "x",
+             "content": "fake output"},
+        ]}},
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "done"},
+        ]}},
+        {"type": "result", "session_id": "nested-tool",
+         "usage": {"input_tokens": 1, "output_tokens": 1}},
+    ])
+    bot.tg.inject_update(text_update(
+        "list", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, thread_id=100,
+    ))
+    _drain_updates(bot)
+    bot.tg.wait_for_call("sendMessage", message_thread_id=100, timeout=3)
+
+    # The status message must show the Bash op, proving on_tool_use ran.
+    status_texts = [
+        m["text"] for m in bot.tg.calls_of("editMessageText")
+    ] + [
+        m["text"] for m in bot.tg.calls_of("sendMessage")
+    ]
+    assert any("ls /tmp" in t and "⚙" in t for t in status_texts), \
+        f"tool_use inside assistant message was not surfaced: {status_texts}"
+
+
+# ── reaction lifecycle 👀→🔥→⚡→👍 (Batch A #5) ────────────────────────
+
+def _reaction_emojis(bot) -> list[str]:
+    import json as _json
+    out: list[str] = []
+    for r in bot.tg.calls_of("setMessageReaction"):
+        payload = _json.loads(r.get("reaction", "[]"))
+        out.extend(p.get("emoji") for p in payload)
+    return out
+
+
+def test_reaction_lifecycle_text_only(bot, tmp_path):
+    """Text-only turn: 👀 (receive) → 🔥 (streaming) → 👍 (done)."""
+    _start_bot_session(bot, tmp_path)
+    bot.tg.reset()
+    bot.claude.script([
+        {"type": "system", "session_id": "lc-text"},
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "hi"},
+        ]}},
+        {"type": "result", "session_id": "lc-text",
+         "usage": {"input_tokens": 1, "output_tokens": 1}},
+    ])
+    bot.tg.inject_update(text_update(
+        "hello", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, thread_id=100,
+    ))
+    _drain_updates(bot)
+    bot.tg.wait_for_call("sendMessage", message_thread_id=100, timeout=3)
+    bot.tg.wait_for_call("setMessageReaction", count=3, timeout=3)
+
+    emojis = _reaction_emojis(bot)
+    assert "👀" in emojis, emojis
+    assert "🔥" in emojis, emojis
+    assert "👍" in emojis, emojis
+    assert emojis.index("👀") < emojis.index("🔥") < emojis.index("👍"), emojis
+
+
+def test_reaction_lifecycle_with_tool_use(bot, tmp_path):
+    """Tool-using turn: 👀 → ⚡ (tool) → 👍 (done). 🔥 is skipped because
+    ⚡ takes precedence over the streaming flag."""
+    _start_bot_session(bot, tmp_path)
+    bot.tg.reset()
+    bot.claude.script([
+        {"type": "system", "session_id": "lc-tool"},
+        {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "listed"},
+        ]}},
+        {"type": "result", "session_id": "lc-tool",
+         "usage": {"input_tokens": 1, "output_tokens": 1}},
+    ])
+    bot.tg.inject_update(text_update(
+        "go", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, thread_id=100,
+    ))
+    _drain_updates(bot)
+    bot.tg.wait_for_call("sendMessage", message_thread_id=100, timeout=3)
+    bot.tg.wait_for_call("setMessageReaction", count=3, timeout=3)
+
+    emojis = _reaction_emojis(bot)
+    assert "👀" in emojis, emojis
+    assert "⚡" in emojis, emojis
+    assert "👍" in emojis, emojis
+    # 🔥 must NOT appear once ⚡ has taken over.
+    assert "🔥" not in emojis, emojis
+    assert emojis.index("👀") < emojis.index("⚡") < emojis.index("👍"), emojis
+
+
+# ── contextual sendChatAction (Batch A #4) ────────────────────────────
+
+def test_chat_action_upload_document_for_read(bot, tmp_path):
+    """Read tool → sendChatAction(action="upload_document")."""
+    _start_bot_session(bot, tmp_path)
+    bot.tg.reset()
+    bot.claude.script([
+        {"type": "system", "session_id": "ca-read"},
+        {"type": "tool_use", "name": "Read",
+         "input": {"file_path": "/tmp/foo"}},
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "ok"},
+        ]}},
+        {"type": "result", "session_id": "ca-read",
+         "usage": {"input_tokens": 1, "output_tokens": 1}},
+    ])
+    bot.tg.inject_update(text_update(
+        "read foo", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, thread_id=100,
+    ))
+    _drain_updates(bot)
+    bot.tg.wait_for_call("sendMessage", message_thread_id=100, timeout=3)
+    actions = [c.get("action") for c in bot.tg.calls_of("sendChatAction")]
+    assert "upload_document" in actions, \
+        f"Read should map to upload_document; got {actions}"
+
+
+def test_chat_action_find_location_for_websearch(bot, tmp_path):
+    """WebSearch tool → sendChatAction(action="find_location")."""
+    _start_bot_session(bot, tmp_path)
+    bot.tg.reset()
+    bot.claude.script([
+        {"type": "system", "session_id": "ca-web"},
+        {"type": "tool_use", "name": "WebSearch", "input": {"query": "x"}},
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "ok"},
+        ]}},
+        {"type": "result", "session_id": "ca-web",
+         "usage": {"input_tokens": 1, "output_tokens": 1}},
+    ])
+    bot.tg.inject_update(text_update(
+        "search", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, thread_id=100,
+    ))
+    _drain_updates(bot)
+    bot.tg.wait_for_call("sendMessage", message_thread_id=100, timeout=3)
+    actions = [c.get("action") for c in bot.tg.calls_of("sendChatAction")]
+    assert "find_location" in actions, \
+        f"WebSearch should map to find_location; got {actions}"
+
+
+def test_chat_action_mapper_unit(bot):
+    """Direct unit test of the tool→action mapping.
+
+    Pulls _chat_action_for_tool through the `bot` fixture so config.py
+    picks up the test BOT_TOKEN env-stub instead of trying to read .env.
+    """
+    fn = bot.mod._chat_action_for_tool
+    assert fn(None) == "typing"
+    assert fn("Bash") == "typing"
+    assert fn("Read") == "upload_document"
+    assert fn("Edit") == "upload_document"
+    assert fn("Write") == "upload_document"
+    assert fn("Glob") == "upload_document"
+    assert fn("WebFetch") == "find_location"
+    assert fn("WebSearch") == "find_location"
+    assert fn("UnknownTool") == "typing"
+
+
+# ── sendMediaGroup for multi-image output (Batch A #15) ──────────────
+
+def test_multi_image_uses_send_media_group(bot, tmp_path, monkeypatch):
+    """When a turn finishes with 2+ pending images, the bot should call
+    telegram.send_media_group once (album) instead of sendPhoto N times."""
+    _start_bot_session(bot, tmp_path)
+    sid = next(iter(bot.mod.mgr._sessions))
+    sess = bot.mod.mgr._sessions[sid]
+    bot.mod.mgr.link_claude_id("mg-sess", sess)
+
+    # Stage 3 real-on-disk image files; on_result checks os.path.isfile.
+    paths = []
+    for i in range(3):
+        p = tmp_path / f"img{i}.png"
+        p.write_bytes(b"\x89PNG\r\n\x1a\n")  # minimal PNG header
+        paths.append(str(p))
+    sess.pending_images.extend(paths)
+
+    # Stub send_media_group / send_photo so we observe call shape.
+    import telegram as tg_mod
+    group_calls: list[tuple] = []
+    photo_calls: list[tuple] = []
+    monkeypatch.setattr(tg_mod, "send_media_group",
+                        lambda chat_id, paths, thread_id=None:
+                        group_calls.append((chat_id, list(paths), thread_id)) or [])
+    monkeypatch.setattr(tg_mod, "send_photo",
+                        lambda chat_id, p, caption="", thread_id=None:
+                        photo_calls.append((chat_id, p, thread_id)) or None)
+
+    bot.mod.on_result(sess, "", "")
+
+    assert len(group_calls) == 1, group_calls
+    chat_id, sent_paths, thread = group_calls[0]
+    assert chat_id == bot.forum_chat_id
+    assert sent_paths == paths
+    assert thread == sess.topic_id
+    assert photo_calls == [], photo_calls
+    assert sess.pending_images == []
+
+
+def test_single_image_uses_send_photo(bot, tmp_path, monkeypatch):
+    """One image → keep using sendPhoto (no album needed)."""
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    p = tmp_path / "only.png"
+    p.write_bytes(b"\x89PNG\r\n\x1a\n")
+    sess.pending_images.append(str(p))
+
+    import telegram as tg_mod
+    group_calls: list = []
+    photo_calls: list = []
+    monkeypatch.setattr(tg_mod, "send_media_group",
+                        lambda chat_id, paths, thread_id=None:
+                        group_calls.append(1) or [])
+    monkeypatch.setattr(tg_mod, "send_photo",
+                        lambda chat_id, p, caption="", thread_id=None:
+                        photo_calls.append(p) or None)
+
+    bot.mod.on_result(sess, "", "")
+    assert group_calls == [], group_calls
+    assert photo_calls == [str(p)], photo_calls
+
+
+# ── copyMessages backfill on /fork (Batch A #14) ─────────────────────
+
+def test_fork_backfills_recent_messages(bot, tmp_path):
+    """Forking a session should copy the parent topic's last N messages
+    into the fresh fork topic via copyMessages."""
+    _start_bot_session(bot, tmp_path)
+    parent = next(iter(bot.mod.mgr._sessions.values()))
+    bot.mod.mgr.link_claude_id("parent-claude", parent)
+
+    # Drive a full turn so user msg + assistant reply land in the topic
+    # and accumulate in state.recent_msgs.
+    bot.claude.script([
+        {"type": "system", "session_id": "parent-claude"},
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "reply A"},
+        ]}},
+        {"type": "result", "session_id": "parent-claude",
+         "usage": {"input_tokens": 1, "output_tokens": 1}},
+    ])
+    bot.tg.inject_update(text_update(
+        "first prompt", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, thread_id=parent.topic_id,
+    ))
+    _drain_updates(bot)
+    bot.tg.wait_for_call("sendMessage", message_thread_id=parent.topic_id,
+                         timeout=3)
+
+    # Sanity: rolling buffer captured something.
+    with bot.mod.state.lock:
+        recent = list(bot.mod.state.recent_msgs.get(parent.topic_id, []))
+    assert recent, "recent_msgs buffer was not populated"
+
+    bot.tg.reset()
+    # Click the fork callback for this session.
+    bot.tg.inject_update(callback_update(
+        f"fork:{parent.sid}",
+        owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
+    ))
+    _drain_updates(bot)
+
+    copy_calls = bot.tg.calls_of("copyMessages")
+    assert copy_calls, f"copyMessages was not called; calls: {bot.tg.calls}"
+    last = copy_calls[-1]
+    assert last["from_chat_id"] == bot.forum_chat_id
+    assert last["chat_id"] == bot.forum_chat_id
+    # New fork topic id (whatever was allocated by createForumTopic).
+    new_topic = last["message_thread_id"]
+    assert new_topic != parent.topic_id
+    # Backfilled IDs are a subset of the recorded buffer.
+    sent = list(last["message_ids"])
+    assert sent, last
+    assert all(mid in recent for mid in sent), (sent, recent)
+
+
+# ── my_chat_member + admin sanity (Batch A #16) ──────────────────────
+
+def test_allowed_updates_includes_my_chat_member(bot):
+    """telegram.poll() should subscribe to my_chat_member explicitly so
+    Telegram delivers our own membership changes."""
+    import telegram as tg_mod
+    tg_mod.poll(offset=0, timeout=0)
+    last = bot.tg.calls_of("getUpdates")[-1]
+    assert "my_chat_member" in last.get("allowed_updates", []), \
+        f"my_chat_member missing from allowed_updates: {last}"
+
+
+def test_handle_my_chat_member_audits(bot):
+    """A my_chat_member update is logged to the audit trail."""
+    import audit
+    bot.mod._handle_my_chat_member({
+        "chat": {"id": -9001, "title": "Test group", "type": "supergroup"},
+        "from": {"id": bot.owner_id},
+        "date": 0,
+        "old_chat_member": {"status": "member",
+                            "user": {"id": 1, "is_bot": True}},
+        "new_chat_member": {"status": "administrator",
+                            "user": {"id": 1, "is_bot": True}},
+    })
+    time.sleep(0.1)  # background audit writer
+    entries = audit.tail(10)
+    assert any(e.get("event") == "my_chat_member"
+               and "member -> administrator" in e.get("detail", "")
+               for e in entries), entries
+
+
+def test_admin_sanity_logs_warning_for_non_admin(bot, capsys):
+    """When getChatMember reports owner as plain member, sanity check
+    emits a warning instead of crashing."""
+    import telegram as tg_mod
+    original_req = tg_mod._req
+
+    def fake_req(method, params=None):
+        if method == "getChatMember":
+            return {"ok": True, "result": {"status": "member",
+                                            "user": {"id": bot.owner_id}}}
+        return original_req(method, params)
+
+    tg_mod._req = fake_req
+    try:
+        bot.mod._admin_sanity_check()
+    finally:
+        tg_mod._req = original_req
+
+    err = capsys.readouterr().err
+    assert "owner status" in err and "member" in err, err
+
+
+def test_setup_sh_brands_bot_profile():
+    """setup.sh should call setMyName/setMyShortDescription/setMyDescription
+    so a fresh install lands with a proper TG-side profile."""
+    import pathlib
+    src = pathlib.Path(__file__).resolve().parent.parent / "setup.sh"
+    text = src.read_text()
+    assert "/setMyName" in text, "setMyName missing from setup.sh"
+    assert "/setMyShortDescription" in text, \
+        "setMyShortDescription missing from setup.sh"
+    assert "/setMyDescription" in text, "setMyDescription missing from setup.sh"
+    assert "/setMyProfilePhoto" in text, \
+        "setMyProfilePhoto missing from setup.sh"
+
+
+def test_admin_sanity_silent_for_admin(bot, capsys):
+    """When owner is admin, sanity check is silent."""
+    import telegram as tg_mod
+    original_req = tg_mod._req
+
+    def fake_req(method, params=None):
+        if method == "getChatMember":
+            return {"ok": True, "result": {"status": "administrator"}}
+        return original_req(method, params)
+
+    tg_mod._req = fake_req
+    try:
+        bot.mod._admin_sanity_check()
+    finally:
+        tg_mod._req = original_req
+    err = capsys.readouterr().err
+    assert "WARN" not in err, err
+
+
+def test_record_topic_msg_trims_buffer(bot):
+    """Rolling buffer caps at _FORK_BACKFILL entries."""
+    from bot import _record_topic_msg, _FORK_BACKFILL, state
+    tid = 7777
+    for i in range(_FORK_BACKFILL * 3):
+        _record_topic_msg(tid, 1000 + i)
+    with state.lock:
+        buf = list(state.recent_msgs.get(tid, []))
+    assert len(buf) == _FORK_BACKFILL
+    # Tail kept, head dropped.
+    assert buf[-1] == 1000 + (_FORK_BACKFILL * 3 - 1)
+    assert buf[0] == 1000 + (_FORK_BACKFILL * 3 - _FORK_BACKFILL)

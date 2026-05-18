@@ -238,6 +238,79 @@ def send_photo(chat_id: int, photo_path: str, caption: str = "",
         return None
 
 
+def copy_messages(chat_id: int, from_chat_id: int, message_ids: list[int],
+                  thread_id: int | None = None,
+                  remove_caption: bool = False) -> list[int]:
+    """Silently duplicate up to 100 messages into another chat/topic.
+
+    Unlike forwardMessage, copyMessage produces fresh messages without a
+    "Forwarded from" header. Used here to backfill context into a fork
+    topic. Returns the new message ids; empty on failure.
+    """
+    if not message_ids:
+        return []
+    params: dict = {
+        "chat_id": chat_id,
+        "from_chat_id": from_chat_id,
+        "message_ids": sorted(set(message_ids))[:100],
+    }
+    if thread_id:
+        params["message_thread_id"] = thread_id
+    if remove_caption:
+        params["remove_caption"] = True
+    try:
+        r = _req("copyMessages", params)
+        return [m.get("message_id") for m in r.get("result", [])
+                if m.get("message_id")]
+    except Exception as e:
+        _log(f"copy_messages error: {e}")
+        return []
+
+
+def send_media_group(chat_id: int, photo_paths: list[str],
+                     thread_id: int | None = None) -> list[int]:
+    """Send 2–10 photos as a single album. Returns list of message_ids.
+
+    Telegram caps an album at 10 items. Callers should split if more.
+    Mixed media types (photo+video) are also supported by sendMediaGroup
+    but this helper handles photos only.
+    """
+    if not photo_paths:
+        return []
+    if len(photo_paths) > 10:
+        photo_paths = photo_paths[:10]
+    media: list[dict] = []
+    files: dict = {}
+    handles: list = []
+    try:
+        for i, path in enumerate(photo_paths):
+            attach = f"photo{i}"
+            media.append({"type": "photo", "media": f"attach://{attach}"})
+            fh = open(path, "rb")
+            handles.append(fh)
+            files[attach] = fh
+        data: dict = {
+            "chat_id": chat_id,
+            "media": json.dumps(media),
+        }
+        if thread_id:
+            data["message_thread_id"] = thread_id
+        r = _session.post(f"{API}/sendMediaGroup", data=data,
+                          files=files, timeout=60)
+        r.raise_for_status()
+        results = r.json().get("result", []) or []
+        return [m.get("message_id") for m in results if m.get("message_id")]
+    except Exception as e:
+        _log(f"send_media_group error: {e}")
+        return []
+    finally:
+        for fh in handles:
+            try:
+                fh.close()
+            except Exception:
+                pass
+
+
 def send_document(chat_id: int, doc_path: str, caption: str = "",
                   thread_id: int | None = None) -> int | None:
     params: dict = {"chat_id": chat_id}
@@ -338,7 +411,9 @@ def topic_alive(chat_id: int, thread_id: int, name: str | None = None) -> bool:
 # ── forum topics ────────────────────────────────────────────────────
 
 def poll(offset: int | None = None, timeout: int = 30) -> list[dict]:
-    params: dict = {"timeout": timeout, "allowed_updates": ["message", "callback_query"]}
+    params: dict = {"timeout": timeout,
+                    "allowed_updates": ["message", "callback_query",
+                                        "my_chat_member"]}
     if offset is not None:
         params["offset"] = offset
     try:

@@ -169,6 +169,47 @@ print('ok')
     ok "Claude Code hooks configured in $SETTINGS_FILE"
 fi
 
+# ── bot profile (one-time branding) ──────────────────────────────────
+bold "\nBot profile"
+echo "Set the bot's display name, short description (search preview),"
+echo "and long description (shown in the empty-chat screen)."
+echo "Press Enter to keep current values."
+echo ""
+
+BOT_TOKEN_BRAND=$(grep '^BOT_TOKEN=' .env 2>/dev/null | cut -d= -f2-)
+if [ -n "$BOT_TOKEN_BRAND" ] && command -v curl &>/dev/null; then
+    read -rp "   Bot name [ClaudeLaude]: " BOT_NAME
+    BOT_NAME="${BOT_NAME:-ClaudeLaude}"
+    read -rp "   Short description [Claude Code in Telegram]: " BOT_SHORT
+    BOT_SHORT="${BOT_SHORT:-Claude Code in Telegram}"
+    DEFAULT_LONG="Run Claude Code sessions from Telegram. Forum topics per session, permission requests, file/image upload, /usage, /history."
+    read -rp "   Long description [default]: " BOT_LONG
+    BOT_LONG="${BOT_LONG:-$DEFAULT_LONG}"
+
+    API="https://api.telegram.org/bot${BOT_TOKEN_BRAND}"
+    brand_ok=true
+    curl -fsS --max-time 10 -X POST "${API}/setMyName" \
+        --data-urlencode "name=${BOT_NAME}" >/dev/null || brand_ok=false
+    curl -fsS --max-time 10 -X POST "${API}/setMyShortDescription" \
+        --data-urlencode "short_description=${BOT_SHORT}" >/dev/null || brand_ok=false
+    curl -fsS --max-time 10 -X POST "${API}/setMyDescription" \
+        --data-urlencode "description=${BOT_LONG}" >/dev/null || brand_ok=false
+    if $brand_ok; then
+        ok "Bot profile updated"
+    else
+        warn "Bot profile partially updated — check token and try again."
+    fi
+
+    if [ -f assets/bot_avatar.png ]; then
+        curl -fsS --max-time 30 -X POST "${API}/setMyProfilePhoto" \
+            -F "photo=@assets/bot_avatar.png" >/dev/null \
+            && ok "Bot avatar set from assets/bot_avatar.png" \
+            || warn "Failed to set bot avatar."
+    fi
+else
+    warn "Skipping profile setup (no BOT_TOKEN or curl)."
+fi
+
 # ── smoke test ───────────────────────────────────────────────────────
 bold "\nSmoke test"
 

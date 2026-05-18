@@ -40,8 +40,15 @@ _ICON_ACTIVE = "5417915203100613993"   # 💬
 _ICON_TERMINAL = "5350554349074391003" # 💻
 _ICON_STOPPED = ""                     # removes custom emoji → color dot
 
+# How many recent messages to copy from the parent topic into a fork.
+# 5 is enough to see the last user prompt + assistant answer; more clutters
+# the fresh fork. copyMessages is capped at 100 by the API anyway.
+_FORK_BACKFILL = 5
+
 # Telegram free-tier reaction set is small; these are picked for clarity.
-_REACT_RECEIVED = "👀"
+_REACT_RECEIVED = "👀"   # bot got the message
+_REACT_STREAMING = "🔥"  # claude is producing text
+_REACT_TOOL = "⚡"        # claude reached for a tool
 _REACT_DONE = "👍"
 _REACT_INTERRUPTED = "🤷"
 _REACT_ERROR = "😨"
@@ -60,8 +67,16 @@ class TurnState:
     _timer_thread: threading.Thread | None = None
     interrupted: bool = False
     # User-message ids (in the topic) whose response is awaited; their
-    # reaction is upgraded from 👀 to ✅ when the turn ends.
+    # reaction is upgraded from 👀 → 🔥/⚡ → 👍 across the turn.
     user_msg_ids: list[int] = field(default_factory=list)
+    # Progress flags: once True, the relevant 🔥/⚡ reaction has fired and
+    # later events do not regress (⚡ tool wins over 🔥 stream).
+    streamed: bool = False
+    tooled: bool = False
+    # Raw name of most recent tool ("Read", "Bash", "WebFetch", …) — drives
+    # the contextual sendChatAction indicator. Stays after the tool ends so
+    # the timer thread keeps refreshing the same action mid-thinking.
+    last_tool_name: str | None = None
 
 
 class BotState:
@@ -81,6 +96,9 @@ class BotState:
         # terminal watcher: claude_session_id → [(msg_id, chat_id, kind)]
         # kind: "perm:<short_id>" | "notification"
         self.pending_terminal_msgs: dict[str, list[tuple[int, int, str]]] = {}
+        # Rolling window of recent message_ids per session topic, used to
+        # backfill context when a fork is created. Trimmed to _FORK_BACKFILL.
+        self.recent_msgs: dict[int, list[int]] = {}
 
 
 state = BotState()
@@ -261,6 +279,7 @@ def _enqueue_user_input(session, text: str, chat_id: int,
         _react_user_msg(msg_id, chat_id, _REACT_RECEIVED)
         turn = _get_turn(session)
         turn.user_msg_ids.append(msg_id)
+        _record_topic_msg(session.topic_id, msg_id)
 
 
 def _is_noisy_tool(tool, inp):
@@ -280,6 +299,55 @@ def _react_user_msg(msg_id: int, chat_id: int, emoji: str | None):
     except Exception as e:
         print(f"[react] {emoji!r} on {msg_id} failed: {e}",
               file=sys.stderr, flush=True)
+
+
+def _record_topic_msg(topic_id: int | None, msg_id: int | None):
+    """Push a message id into the per-topic rolling window used for fork
+    backfill. Trims to _FORK_BACKFILL most-recent ids. Silently no-ops on
+    missing inputs so callers don't need to branch."""
+    if not topic_id or not msg_id:
+        return
+    with state.lock:
+        buf = state.recent_msgs.setdefault(topic_id, [])
+        buf.append(int(msg_id))
+        if len(buf) > _FORK_BACKFILL:
+            del buf[:-_FORK_BACKFILL]
+
+
+def _chat_action_for_tool(name: str | None) -> str:
+    """Map a Claude tool name to a Telegram chat-action verb.
+
+    Telegram shows the action ("typing", "uploading photo", …) beneath
+    the chat title. Matching the verb to what Claude is actually doing
+    turns the indicator into a live status hint without adding a UI
+    element. Unknown / no-tool → typing.
+    """
+    if not name:
+        return "typing"
+    n = name.lower()
+    if n in ("read", "glob", "grep", "ls", "edit", "write", "notebookedit",
+             "multiedit"):
+        return "upload_document"
+    if n in ("webfetch", "websearch"):
+        return "find_location"
+    if "image" in n or "screenshot" in n or n in ("notebookread",):
+        return "upload_photo"
+    return "typing"
+
+
+def _react_progress(turn: TurnState, emoji: str):
+    """Refresh in-flight reaction on every user message awaiting a reply.
+
+    Used during the turn to swap 👀 → 🔥 (text streaming) or 👀 → ⚡
+    (tool use). Idempotent; safe if user_msg_ids is empty.
+    """
+    if not turn.user_msg_ids:
+        return
+    fid = forum()
+    if not fid:
+        return
+    for mid in turn.user_msg_ids:
+        _react_user_msg(mid, fid, emoji)
 
 
 def _react_for_turn(turn: TurnState, kind: str = "completed"):
@@ -302,6 +370,13 @@ def _react_for_turn(turn: TurnState, kind: str = "completed"):
     for mid in turn.user_msg_ids:
         _react_user_msg(mid, fid, emoji)
     turn.user_msg_ids.clear()
+    # Progress flags are per-turn; the turn object is reused across turns
+    # in the same session, so reset them now or the next turn would skip
+    # 🔥/⚡ entirely. last_tool_name resets too so the indicator falls back
+    # to "typing" at the next turn's start.
+    turn.streamed = False
+    turn.tooled = False
+    turn.last_tool_name = None
 
 
 def _format_status(turn: TurnState) -> str:
@@ -309,8 +384,11 @@ def _format_status(turn: TurnState) -> str:
     mins, secs = divmod(elapsed, 60)
     ts = f"{mins}:{secs:02d}"
     n = len(turn.tool_ops)
+    # Hourglass rotates each 3s tick so the timer feels alive even
+    # when no tool ops have happened yet.
+    glass = "⌛" if (elapsed // 3) % 2 else "⏳"
     if n == 0:
-        return f"⏳ {ts}"
+        return f"{glass} {ts}"
     last = turn.tool_ops[-1]
     if n > 1:
         return f"⚙️ <code>{tg.esc(last)}</code> ({n}) — {ts}"
@@ -388,6 +466,12 @@ def _turn_timer(session, turn: TurnState):
             if text != turn._last_status_text:
                 tg.edit(mid, text, fid, buttons=_interrupt_button(session))
                 turn._last_status_text = text
+        # Telegram hides the chat-action indicator after ~5s; refresh it
+        # on every tick (3s) so the verb stays visible for the full turn.
+        if fid and session.topic_id:
+            tg.send_chat_action(fid,
+                                action=_chat_action_for_tool(turn.last_tool_name),
+                                thread_id=session.topic_id)
 
 
 # ── compact / expand ────────────────────────────────────────────────
@@ -483,6 +567,11 @@ def on_assistant(session, text):
     if text.strip().lower() in _NOISE_TEXTS:
         return
     turn = _get_turn(session)
+    # Upgrade reaction to 🔥 on first real assistant text, but not over ⚡
+    # if a tool was already used in this turn.
+    if not turn.streamed and not turn.tooled:
+        _react_progress(turn, _REACT_STREAMING)
+        turn.streamed = True
     _finish_status(session, turn)
     with state.lock:
         mode = state.topic_display_mode.get(session.topic_id, DEFAULT_DISPLAY)
@@ -493,6 +582,8 @@ def on_assistant(session, text):
         ids = tg.send_long(text, fid, thread_id=session.topic_id, markdown=True)
         turn.msg_ids.extend(ids)
         turn.msg_texts.append(text)
+        for mid in ids:
+            _record_topic_msg(session.topic_id, mid)
         mid = tg.send(_format_status(turn), fid, thread_id=session.topic_id,
                       buttons=_interrupt_button(session))
         turn.status_msg_id = mid
@@ -508,10 +599,17 @@ def on_result(session, result_text, summary):
     if not fid:
         return
 
-    # Send pending images
-    for img_path in list(session.pending_images):
-        if os.path.isfile(img_path):
-            tg.send_photo(fid, img_path, thread_id=session.topic_id)
+    # Send pending images. 2+ → bundle into a single sendMediaGroup album
+    # so multi-chart output renders as one block instead of N separate
+    # photos. Telegram caps an album at 10 items; the rest spill over as
+    # individual sendPhoto calls.
+    imgs = [p for p in session.pending_images if os.path.isfile(p)]
+    if len(imgs) >= 2:
+        tg.send_media_group(fid, imgs[:10], thread_id=session.topic_id)
+        for extra in imgs[10:]:
+            tg.send_photo(fid, extra, thread_id=session.topic_id)
+    elif imgs:
+        tg.send_photo(fid, imgs[0], thread_id=session.topic_id)
     session.pending_images.clear()
 
     if turn.msg_ids:
@@ -645,6 +743,17 @@ def on_tool_use(session, tool, inp):
               if isinstance(inp, dict) else f"{tool}: {inp}",
               sid=session.sid)
     turn = _get_turn(session)
+    turn.last_tool_name = tool
+    # Push a fresh contextual chat-action so the indicator under the chat
+    # title matches what Claude is doing right now.
+    fid = forum()
+    if fid:
+        tg.send_chat_action(fid, action=_chat_action_for_tool(tool),
+                            thread_id=session.topic_id)
+    # Upgrade reaction to ⚡ on first tool use; ⚡ overrides 🔥.
+    if not turn.tooled:
+        _react_progress(turn, _REACT_TOOL)
+        turn.tooled = True
     if not _is_noisy_tool(tool, inp):
         compact = _compact_tool_msg(tool, inp)
         turn.tool_ops.append(compact)
@@ -2310,6 +2419,7 @@ def main():
     threading.Thread(target=_auto_update_loop, daemon=True).start()
     _refresh_usage_cache()
     _sync_dashboard()
+    _admin_sanity_check()
 
     offset = None
     while bot_running:
@@ -2325,6 +2435,50 @@ def main():
         mgr.stop(s.sid)
 
 
+def _admin_sanity_check():
+    """On startup, verify the bot is an admin in the linked forum group.
+
+    Fail-fast warning is much easier to read than the cryptic 400 from
+    createForumTopic that surfaces only when the first session is opened.
+    Silent no-op when no forum is linked yet (fresh install).
+    """
+    fid = forum()
+    if not fid or not OWNER_ID:
+        return
+    try:
+        r = tg._req("getChatMember", {"chat_id": fid, "user_id": OWNER_ID})
+        status = (r.get("result", {}) or {}).get("status", "")
+    except Exception as e:
+        print(f"[setup] getChatMember failed: {e}",
+              file=sys.stderr, flush=True)
+        return
+    if status not in ("creator", "administrator"):
+        print(f"[setup] WARN: owner status in forum group is '{status}'. "
+              "Bot expects owner to be admin so /new can manage topics.",
+              file=sys.stderr, flush=True)
+
+
+def _handle_my_chat_member(mcm: dict):
+    """React when our own admin/member status changes in some chat.
+
+    Useful for setup-flow visibility: the bot logs when it's added to a
+    new group or promoted to admin so the owner can spot mis-configured
+    state without diffing /audit. Forum auto-link only happens via
+    /setup — we don't auto-claim a new group as the forum.
+    """
+    chat = mcm.get("chat", {}) or {}
+    new_member = (mcm.get("new_chat_member") or {})
+    old_member = (mcm.get("old_chat_member") or {})
+    chat_id = chat.get("id")
+    title = chat.get("title", "?")
+    new_status = new_member.get("status", "?")
+    old_status = old_member.get("status", "?")
+    print(f"[my_chat_member] chat={chat_id} title={title!r} "
+          f"{old_status}→{new_status}", file=sys.stderr, flush=True)
+    audit.log("my_chat_member",
+              f"{title} ({chat_id}): {old_status} -> {new_status}")
+
+
 def _handle_update(u):
     global bot_running
 
@@ -2334,6 +2488,11 @@ def _handle_update(u):
         if cb.get("from", {}).get("id") != OWNER_ID:
             return
         _handle_callback(cb, cb.get("data", ""))
+        return
+
+    mcm = u.get("my_chat_member")
+    if mcm:
+        _handle_my_chat_member(mcm)
         return
 
     msg = u.get("message", {})
@@ -2648,6 +2807,17 @@ def _handle_callback(cb, data):
                         session.topic_label = label
                         send_to_topic(topic_id,
                                       f"\U0001f500 Fork of <b>{tg.esc(parent.name)}</b>")
+                        # Copy the last few messages from the parent topic
+                        # so the fork doesn't open empty — the user sees
+                        # the point they branched from.
+                        if parent.topic_id:
+                            with state.lock:
+                                recent = list(state.recent_msgs.get(
+                                    parent.topic_id, []))
+                            if recent:
+                                tg.copy_messages(
+                                    fid, fid, recent[-_FORK_BACKFILL:],
+                                    thread_id=topic_id)
                         _send_fork_summary(parent, topic_id)
                         url = _topic_url(topic_id)
                         if url:
