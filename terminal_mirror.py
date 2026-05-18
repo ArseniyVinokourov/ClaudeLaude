@@ -13,6 +13,8 @@ external; healthcheck handles disappearance.
 """
 import json
 import os
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -23,6 +25,34 @@ _PERSIST_PATH = os.environ.get(
     "BOT_MIRRORS_FILE",
     os.path.join(os.path.dirname(__file__), ".mirrors.json"),
 )
+
+
+_DTACH_BIN = shutil.which("dtach") or os.path.expanduser("~/.local/bin/dtach")
+
+
+def push_to_dtach(sock_path: str, text: str, timeout: float = 3.0) -> bool:
+    """Send text into a running dtach session via `dtach -p`.
+
+    `dtach -p` reads stdin and writes it to the master's PTY input.
+    A trailing carriage return is appended so the receiving program
+    sees a complete line. Returns False on any failure (missing
+    socket, missing dtach binary, timeout, non-zero exit).
+    """
+    if not sock_path or not os.path.exists(sock_path):
+        return False
+    if not _DTACH_BIN or not os.path.exists(_DTACH_BIN):
+        return False
+    payload = text if text.endswith("\r") else text + "\r"
+    try:
+        proc = subprocess.run(
+            [_DTACH_BIN, "-p", sock_path],
+            input=payload.encode("utf-8"),
+            timeout=timeout,
+            capture_output=True,
+        )
+        return proc.returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
 
 
 def jsonl_path_for(csid: str, cwd: str) -> str:

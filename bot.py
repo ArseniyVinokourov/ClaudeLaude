@@ -28,7 +28,7 @@ import audit
 import telegram as tg
 from sessions import MODE_PRESETS, Session, SessionManager
 from hooks import HookBridge
-from terminal_mirror import TerminalMirrorManager
+from terminal_mirror import TerminalMirrorManager, push_to_dtach
 
 # ── state ────────────────────────────────────────────────────────────
 
@@ -2642,10 +2642,44 @@ def _handle_update(u):
     thread_id = msg.get("message_thread_id")
     msg_id = msg.get("message_id")
     session = mgr.by_topic(thread_id) if thread_id else None
+    mirror = mirror_mgr.by_topic(thread_id) if thread_id and not session else None
 
     fid = forum()
     if not thread_id and fid and chat_id == fid and msg_id:
         tg.delete(msg_id, chat_id)
+
+    # ── Terminal-mirror topic: forward text into the terminal session
+    # via dtach, or politely reject if input isn't bridged.
+    if mirror:
+        photos = msg.get("photo")
+        document = msg.get("document")
+        sticker = msg.get("sticker")
+        if photos or document or sticker:
+            _ephemeral(chat_id,
+                       "\U0001f501 Mirror does not bridge files/stickers — type text",
+                       thread_id=thread_id, seconds=5)
+            return
+        if not text:
+            return
+        if not mirror.dtach_sock:
+            _ephemeral(chat_id,
+                       "\U0001f501 Output-only mirror — terminal input is not bridged "
+                       "(start your terminal claude via the shim to enable it)",
+                       thread_id=thread_id, seconds=8)
+            return
+        if msg_id:
+            tg.set_message_reaction(chat_id, msg_id, _REACT_RECEIVED)
+        ok = push_to_dtach(mirror.dtach_sock, text)
+        if not ok:
+            if msg_id:
+                tg.set_message_reaction(chat_id, msg_id, _REACT_ERROR)
+            _ephemeral(chat_id,
+                       "❌ Could not deliver to terminal "
+                       "(dtach socket missing or unresponsive)",
+                       thread_id=thread_id, seconds=8)
+            mirror_mgr.set_dtach_sock(mirror.csid, None)
+        audit.log("mirror_input", text[:200], sid=mirror.csid)
+        return
 
     # Handle photo/document attachments
     photos = msg.get("photo")
