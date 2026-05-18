@@ -990,3 +990,105 @@ def test_mode_persists_across_restore(bot, tmp_path, monkeypatch):
         records = json.load(f)
     rec = next(r for r in records if r["sid"] == sid)
     assert rec["mode"] == "verbose"
+
+
+# ── hook DoS guard ──────────────────────────────────────────────────
+
+def test_hook_resolver_refuses_empty_payload(bot, tmp_path):
+    """An empty hook body must NOT spawn a forum topic."""
+    before = len(bot.tg.calls_of("createForumTopic"))
+    result = bot.mod._resolve_hook_session("", {})
+    after = len(bot.tg.calls_of("createForumTopic"))
+    assert result is None
+    assert after == before, "empty hook payload caused topic creation (DoS)"
+
+
+def test_hook_resolver_refuses_no_sid_no_cwd(bot, tmp_path):
+    """Payload with hook_event_name but no session_id/cwd is still rejected."""
+    before = len(bot.tg.calls_of("createForumTopic"))
+    result = bot.mod._resolve_hook_session(
+        "", {"hook_event_name": "Notification", "message": "ping"}
+    )
+    after = len(bot.tg.calls_of("createForumTopic"))
+    assert result is None
+    assert after == before
+
+
+# ── /interrupt UX ───────────────────────────────────────────────────
+
+def test_interrupt_repaints_status_message(bot, tmp_path):
+    """A live turn-status message should be edited to "⏹ Interrupted"."""
+    cwd = _start_bot_session(bot, tmp_path)
+    sid = next(iter(bot.mod.mgr._sessions))
+    session = bot.mod.mgr._sessions[sid]
+    # Plant a live turn with an existing status message.
+    turn = bot.mod._get_turn(session)
+    turn.status_msg_id = 9999
+    # Patch interrupt to no-op success.
+    bot.mod.mgr.interrupt = lambda _sid: True
+    bot.tg.reset()
+    bot.mod._do_interrupt(session, bot.forum_chat_id, session.topic_id)
+    edits = [m for m in bot.tg.calls_of("editMessageText")
+             if m.get("message_id") == 9999]
+    assert any("Interrupted" in e.get("text", "") for e in edits), \
+        f"no status edit to 'Interrupted': {edits}"
+    assert turn.interrupted is True
+
+
+# ── stickers as input ──────────────────────────────────────────────
+
+def test_sticker_routed_to_claude_as_text(bot, tmp_path):
+    """Sending a sticker in an active bot session feeds Claude a textual
+    descriptor including emoji and pack name."""
+    cwd = _start_bot_session(bot, tmp_path)
+    sid = next(iter(bot.mod.mgr._sessions))
+    captured: list[str] = []
+    original = bot.mod.mgr.send_user_message
+    def _cap(sid_, text):
+        captured.append(text)
+        return True
+    bot.mod.mgr.send_user_message = _cap
+    try:
+        bot.tg.inject_update({
+            "update_id": 9001,
+            "message": {
+                "message_id": 4242,
+                "from": {"id": bot.owner_id},
+                "chat": {"id": bot.forum_chat_id, "type": "supergroup"},
+                "message_thread_id": 100,
+                "date": 0,
+                "sticker": {
+                    "file_id": "X", "file_unique_id": "Y",
+                    "width": 512, "height": 512, "is_animated": False,
+                    "is_video": False, "type": "regular",
+                    "emoji": "🚀", "set_name": "RocketPack",
+                },
+            },
+        })
+        _drain_updates(bot)
+    finally:
+        bot.mod.mgr.send_user_message = original
+    assert captured, "send_user_message never called for sticker"
+    assert "🚀" in captured[0]
+    assert "RocketPack" in captured[0]
+
+
+# ── reactions on user messages ──────────────────────────────────────
+
+def test_user_text_gets_eyes_reaction(bot, tmp_path):
+    """Sending plain text in an active bot session triggers setMessageReaction
+    with 👀 on the user's message."""
+    _start_bot_session(bot, tmp_path)
+    bot.tg.reset()
+    bot.tg.inject_update(text_update(
+        "say hi", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, thread_id=100,
+    ))
+    _drain_updates(bot)
+    reactions = bot.tg.calls_of("setMessageReaction")
+    assert reactions, f"no setMessageReaction call: {bot.tg.calls}"
+    last = reactions[-1]
+    import json
+    payload = json.loads(last.get("reaction", "[]"))
+    assert any(r.get("emoji") == "👀" for r in payload), \
+        f"expected 👀 reaction, got {payload}"

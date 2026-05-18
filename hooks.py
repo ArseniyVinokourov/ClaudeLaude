@@ -22,6 +22,22 @@ def _log(msg):
     print(f"[hooks {ts}] {msg}", file=sys.stderr, flush=True)
 
 
+def _looks_like_hook_payload(body) -> bool:
+    """Cheap shape check for Claude Code hook bodies.
+
+    Real PreToolUse / Notification / PermissionRequest payloads always carry
+    a non-empty session_id and a non-empty hook_event_name. Bodies without
+    both are treated as garbage (curl probes, port scans, broken clients)
+    and dropped without invoking the bot callbacks.
+    """
+    if not isinstance(body, dict):
+        return False
+    sid = body.get("session_id") or body.get("sessionId")
+    event = body.get("hook_event_name") or body.get("hookEventName")
+    return bool(sid and isinstance(sid, str)
+                and event and isinstance(event, str))
+
+
 class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
@@ -89,6 +105,18 @@ class HookBridge:
                     body = {}
 
                 path = self.path.rstrip("/")
+
+                if path == "/hook/notification" or path == "/hook/permission":
+                    # DoS guard: every legitimate Claude Code hook payload
+                    # carries a non-empty session_id AND hook_event_name.
+                    # Reject malformed/empty bodies without invoking the bot
+                    # callback (which would otherwise create a forum topic).
+                    if not _looks_like_hook_payload(body):
+                        _log(f"reject {path}: payload missing required fields "
+                             f"(keys={list(body.keys()) if isinstance(body, dict) else type(body).__name__})")
+                        self.send_response(400)
+                        self.end_headers()
+                        return
 
                 if path == "/hook/notification":
                     self._handle_notification(body)

@@ -40,6 +40,12 @@ _ICON_ACTIVE = "5417915203100613993"   # 💬
 _ICON_TERMINAL = "5350554349074391003" # 💻
 _ICON_STOPPED = ""                     # removes custom emoji → color dot
 
+# Telegram free-tier reaction set is small; these are picked for clarity.
+_REACT_RECEIVED = "👀"
+_REACT_DONE = "👍"
+_REACT_INTERRUPTED = "🤷"
+_REACT_ERROR = "😨"
+
 
 @dataclass
 class TurnState:
@@ -52,6 +58,10 @@ class TurnState:
     started_at: float = field(default_factory=time.time)
     stop_event: threading.Event = field(default_factory=threading.Event)
     _timer_thread: threading.Thread | None = None
+    interrupted: bool = False
+    # User-message ids (in the topic) whose response is awaited; their
+    # reaction is upgraded from 👀 to ✅ when the turn ends.
+    user_msg_ids: list[int] = field(default_factory=list)
 
 
 class BotState:
@@ -235,6 +245,24 @@ def _get_turn(session) -> TurnState:
         return state.turns[session.sid]
 
 
+def _enqueue_user_input(session, text: str, chat_id: int,
+                         msg_id: int | None, thread_id: int | None):
+    """Send a user message into Claude and wire up the 👀→👍 reaction.
+
+    Used for plain text, sticker descriptors, and file-attached prompts.
+    Reacting up-front gives the user immediate feedback that the bot saw
+    the message even before Claude starts streaming.
+    """
+    ok = mgr.send_user_message(session.sid, text)
+    if not ok:
+        tg.send("⚠️ Session died", chat_id, thread_id=thread_id)
+        return
+    if msg_id and chat_id:
+        _react_user_msg(msg_id, chat_id, _REACT_RECEIVED)
+        turn = _get_turn(session)
+        turn.user_msg_ids.append(msg_id)
+
+
 def _is_noisy_tool(tool, inp):
     if tool in _NOISE_TOOLS:
         return True
@@ -243,6 +271,37 @@ def _is_noisy_tool(tool, inp):
         if any(p in path for p in _NOISE_PATHS):
             return True
     return False
+
+
+def _react_user_msg(msg_id: int, chat_id: int, emoji: str | None):
+    """Set/clear a reaction on a user message. Silent on failure."""
+    try:
+        tg.set_message_reaction(chat_id, msg_id, emoji)
+    except Exception as e:
+        print(f"[react] {emoji!r} on {msg_id} failed: {e}",
+              file=sys.stderr, flush=True)
+
+
+def _react_for_turn(turn: TurnState, kind: str = "completed"):
+    """Upgrade per-user-message reactions to a final-state emoji.
+
+    Called from _end_turn. kind ∈ {"completed", "error"}; if the turn was
+    interrupted, that takes precedence.
+    """
+    if not turn.user_msg_ids:
+        return
+    fid = forum()
+    if not fid:
+        return
+    if turn.interrupted:
+        emoji = _REACT_INTERRUPTED
+    elif kind == "error":
+        emoji = _REACT_ERROR
+    else:
+        emoji = _REACT_DONE
+    for mid in turn.user_msg_ids:
+        _react_user_msg(mid, fid, emoji)
+    turn.user_msg_ids.clear()
 
 
 def _format_status(turn: TurnState) -> str:
@@ -290,15 +349,33 @@ def _finish_status(session, turn: TurnState):
 
 
 def _end_turn(turn: TurnState):
-    """Stop timer thread and clean up status message."""
+    """Stop timer thread and clean up status message.
+
+    On a normal turn end the status message is deleted right away. On an
+    interrupted turn it sticks as "⏹ Interrupted" for ~3s so the user sees
+    the final state before it disappears.
+    """
     turn.stop_event.set()
     if turn._timer_thread:
         turn._timer_thread.join(timeout=5)
         turn._timer_thread = None
     fid = forum()
     if fid and turn.status_msg_id:
-        tg.delete(turn.status_msg_id, fid)
+        mid = turn.status_msg_id
+        if turn.interrupted:
+            try:
+                tg.edit(mid, "⏹ Interrupted", fid)
+            except Exception:
+                pass
+
+            def _del_later(mid=mid, fid=fid):
+                time.sleep(3)
+                tg.delete(mid, fid)
+            threading.Thread(target=_del_later, daemon=True).start()
+        else:
+            tg.delete(mid, fid)
         turn.status_msg_id = None
+    _react_for_turn(turn, "completed")
 
 
 def _turn_timer(session, turn: TurnState):
@@ -649,6 +726,13 @@ def _resolve_hook_session(claude_session_id, data):
         if existing and existing.is_bot_spawned:
             _log(f"skipping bot-spawned session for cwd={cwd}")
 
+    # DoS guard: with neither a session_id nor a cwd we have nothing to
+    # anchor a topic to — refuse rather than spawning a "terminal — HH:MM"
+    # topic for every malformed POST that slipped past hooks.py.
+    if not claude_session_id and not cwd:
+        _log("refuse: no session_id and no cwd, not creating topic")
+        return None
+
     fid = forum()
     if not fid:
         _log("no forum chat configured")
@@ -662,7 +746,8 @@ def _resolve_hook_session(claude_session_id, data):
     label = (f"{dirname} #{n} — {ts}" if n > 1
              else f"{dirname} — {ts}")
     try:
-        topic_id = tg.create_forum_topic(fid, label, icon_color=0x6FB9F0)
+        topic_id = tg.create_forum_topic(fid, label, icon_color=0x6FB9F0,
+                                          icon_custom_emoji_id=_ICON_TERMINAL)
         _log(f"created topic {topic_id}")
     except Exception as e:
         _log(f"create_forum_topic FAILED: {e}")
@@ -1446,9 +1531,25 @@ def _do_interrupt(session, chat_id, thread_id):
         _ephemeral(chat_id, "Nothing to interrupt.",
                    thread_id=thread_id, seconds=5)
         return
+    edited = False
+    with state.lock:
+        turn = state.turns.get(session.sid)
+    if turn:
+        turn.interrupted = True
+        fid = forum()
+        if fid and turn.status_msg_id:
+            try:
+                tg.edit(turn.status_msg_id, "⏹ Interrupted", fid)
+                turn._last_status_text = "⏹ Interrupted"
+                edited = True
+            except Exception as e:
+                print(f"[interrupt] status edit failed: {e}",
+                      file=sys.stderr, flush=True)
     _cancel_session_perms(session.sid, "interrupted")
-    _ephemeral(chat_id, "⏹ Turn interrupted.",
-               thread_id=thread_id, seconds=5)
+    if not edited:
+        # No live status to repaint (or edit failed) — fall back to ephemeral.
+        _ephemeral(chat_id, "⏹ Turn interrupted.",
+                   thread_id=thread_id, seconds=5)
 
 
 def cmd_restart(chat_id, thread_id):
@@ -2291,12 +2392,29 @@ def _handle_update(u):
                          else f"[Attached file: {dest}]")
             audit.log("user_message", f"[file] {filename}",
                       sid=session.sid)
-            if not mgr.send_user_message(session.sid, user_text):
-                tg.send("⚠️ Session died", chat_id,
-                        thread_id=thread_id)
+            _enqueue_user_input(session, user_text, chat_id, msg_id, thread_id)
         else:
             tg.send("❌ Download failed", chat_id,
                     thread_id=thread_id)
+        return
+
+    # Handle stickers: pass emoji + pack name as text so Claude has context.
+    sticker = msg.get("sticker")
+    if sticker:
+        if not (session and session.is_bot_spawned and session.alive):
+            tg.send("Send stickers in an active session",
+                    chat_id, thread_id=thread_id)
+            return
+        emoji = sticker.get("emoji") or ""
+        set_name = sticker.get("set_name") or ""
+        if set_name:
+            descr = f"[Sticker: {emoji} from \"{set_name}\"]"
+        elif emoji:
+            descr = f"[Sticker: {emoji}]"
+        else:
+            descr = "[Sticker]"
+        audit.log("user_message", descr, sid=session.sid)
+        _enqueue_user_input(session, descr, chat_id, msg_id, thread_id)
         return
 
     if not text:
@@ -2312,10 +2430,7 @@ def _handle_update(u):
         audit.log("user_message", text,
                   sid=session.sid if session else None)
         if session and session.is_bot_spawned:
-            ok = mgr.send_user_message(session.sid, text)
-            if not ok:
-                tg.send("⚠️ Session died", chat_id,
-                        thread_id=thread_id)
+            _enqueue_user_input(session, text, chat_id, msg_id, thread_id)
         elif session:
             tg.send("Terminal session — use terminal",
                     chat_id, thread_id=thread_id)
