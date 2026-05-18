@@ -80,6 +80,16 @@ def bot(bot_env, monkeypatch: pytest.MonkeyPatch):
     # Stub auto-rename — it spawns its own claude subprocess via shell.
     monkeypatch.setattr(bot_mod, "_auto_rename_topic", lambda *a, **kw: None)
 
+    # Stub _ephemeral so the auto-delete daemon thread doesn't outlive the
+    # test: with the real impl, time.sleep(seconds) wakes up after the
+    # monkeypatch is reverted and the deleteMessage call hits real Telegram.
+    # Tests only assert on the send, not on the deferred delete.
+    import telegram as _tg_mod
+    def _ephemeral_no_timer(chat_id, text, thread_id=None, seconds=15,
+                            buttons=None):
+        return _tg_mod.send(text, chat_id, thread_id=thread_id, buttons=buttons)
+    monkeypatch.setattr(bot_mod, "_ephemeral", _ephemeral_no_timer)
+
     return SimpleNamespace(
         mod=bot_mod,
         tg=fake_tg,
