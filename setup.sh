@@ -169,6 +169,27 @@ print('ok')
     ok "Claude Code hooks configured in $SETTINGS_FILE"
 fi
 
+# ── Claude slash command: /bot ───────────────────────────────────────
+bold "\n/bot mirror slash command"
+echo "Installs ~/.claude/commands/bot.md so you can run '/bot mirror'"
+echo "inside any Claude session to open a Telegram topic for it."
+echo ""
+read -rp "Install /bot mirror command? [Y/n]: " SETUP_BOT_CMD
+SETUP_BOT_CMD="${SETUP_BOT_CMD:-Y}"
+
+if [[ "$SETUP_BOT_CMD" =~ ^[Yy] ]]; then
+    CMD_SRC="$SCRIPT_DIR/scripts/claude_commands/bot.md"
+    CMD_DST_DIR="$HOME/.claude/commands"
+    CMD_DST="$CMD_DST_DIR/bot.md"
+    if [ -f "$CMD_SRC" ]; then
+        mkdir -p "$CMD_DST_DIR"
+        cp "$CMD_SRC" "$CMD_DST"
+        ok "Installed $CMD_DST"
+    else
+        warn "Slash command source missing at $CMD_SRC — skipping"
+    fi
+fi
+
 # ── bot profile (one-time branding) ──────────────────────────────────
 bold "\nBot profile"
 echo "Set the bot's display name, short description (search preview),"
@@ -213,7 +234,7 @@ fi
 # ── smoke test ───────────────────────────────────────────────────────
 bold "\nSmoke test"
 
-if .venv/bin/python -c "import bot, telegram, sessions, hooks, config, version" 2>/tmp/claudelaude_smoke.log; then
+if .venv/bin/python -c "import bot, telegram, sessions, hooks, config, version, terminal_mirror" 2>/tmp/claudelaude_smoke.log; then
     ok "Python imports OK"
 else
     warn "Python import check failed (see /tmp/claudelaude_smoke.log)"
