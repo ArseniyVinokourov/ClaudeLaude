@@ -535,13 +535,39 @@ class SessionManager:
                 self._persist()
 
         elif etype == "assistant":
+            # Claude Code 2.1.143+ packs tool_use as a content block inside
+            # the assistant message instead of emitting it as a separate
+            # top-level event. We extract both: text blocks → on_assistant,
+            # tool_use blocks → on_tool_use. The old top-level shape is
+            # still handled below for forward-compatibility.
             msg = event.get("message")
+            text = ""
             if isinstance(msg, dict):
                 content = msg.get("content", [])
-                text = "".join(
-                    b.get("text", "") for b in content
-                    if isinstance(b, dict) and b.get("type") == "text"
-                ) if isinstance(content, list) else ""
+                if isinstance(content, list):
+                    text = "".join(
+                        b.get("text", "") for b in content
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    )
+                    for b in content:
+                        if not isinstance(b, dict):
+                            continue
+                        if b.get("type") != "tool_use":
+                            continue
+                        tool = b.get("name") or "?"
+                        inp = b.get("input") or {}
+                        session.history.append(
+                            HistoryEntry(
+                                time.time(), "tool",
+                                f"{tool}: "
+                                f"{json.dumps(inp, ensure_ascii=False)[:200]}")
+                        )
+                        if tool == "Write":
+                            path = inp.get("file_path", "")
+                            if any(path.lower().endswith(ext)
+                                   for ext in _IMAGE_EXTS):
+                                session.pending_images.append(path)
+                        self._on_tool_use(session, tool, inp)
             elif isinstance(msg, str):
                 text = msg
             else:

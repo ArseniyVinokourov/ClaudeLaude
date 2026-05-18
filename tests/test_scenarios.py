@@ -1118,6 +1118,48 @@ def test_status_hourglass_rotates(bot):
     assert _format_status(turn).startswith("⚙"), _format_status(turn)
 
 
+# ── tool_use parsing: Claude Code 2.1.143 nested-content format ──────
+
+def test_tool_use_inside_assistant_message(bot, tmp_path):
+    """Claude Code 2.1.143+ emits tool_use as a content block inside the
+    assistant message. We must surface it as on_tool_use, not drop it."""
+    _start_bot_session(bot, tmp_path)
+    bot.tg.reset()
+    bot.claude.script([
+        {"type": "system", "session_id": "nested-tool"},
+        # Real 2.1.143 shape: assistant message whose content list mixes
+        # text and tool_use blocks.
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Bash",
+             "input": {"command": "ls /tmp", "description": "list"}},
+        ]}},
+        {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "x",
+             "content": "fake output"},
+        ]}},
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "done"},
+        ]}},
+        {"type": "result", "session_id": "nested-tool",
+         "usage": {"input_tokens": 1, "output_tokens": 1}},
+    ])
+    bot.tg.inject_update(text_update(
+        "list", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, thread_id=100,
+    ))
+    _drain_updates(bot)
+    bot.tg.wait_for_call("sendMessage", message_thread_id=100, timeout=3)
+
+    # The status message must show the Bash op, proving on_tool_use ran.
+    status_texts = [
+        m["text"] for m in bot.tg.calls_of("editMessageText")
+    ] + [
+        m["text"] for m in bot.tg.calls_of("sendMessage")
+    ]
+    assert any("ls /tmp" in t and "⚙" in t for t in status_texts), \
+        f"tool_use inside assistant message was not surfaced: {status_texts}"
+
+
 # ── reaction lifecycle 👀→🔥→⚡→👍 (Batch A #5) ────────────────────────
 
 def _reaction_emojis(bot) -> list[str]:

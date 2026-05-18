@@ -370,6 +370,13 @@ def _react_for_turn(turn: TurnState, kind: str = "completed"):
     for mid in turn.user_msg_ids:
         _react_user_msg(mid, fid, emoji)
     turn.user_msg_ids.clear()
+    # Progress flags are per-turn; the turn object is reused across turns
+    # in the same session, so reset them now or the next turn would skip
+    # 🔥/⚡ entirely. last_tool_name resets too so the indicator falls back
+    # to "typing" at the next turn's start.
+    turn.streamed = False
+    turn.tooled = False
+    turn.last_tool_name = None
 
 
 def _format_status(turn: TurnState) -> str:
