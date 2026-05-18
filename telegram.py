@@ -1,4 +1,5 @@
 """Thin Telegram Bot API wrapper — module-level functions."""
+import json
 import os
 import re
 import sys
@@ -355,16 +356,44 @@ def answer_callback(callback_id: str):
         _log(f"answer_callback error: {e}")
 
 
-_TOPIC_ICON_EMOJI_ID = "5417915203100613993"  # 💬
+def set_message_reaction(chat_id: int, msg_id: int, emoji: str | None):
+    """Set or clear a reaction on a message.
+
+    `emoji=None` (or empty) clears any reaction the bot set previously.
+    Telegram restricts unverified bots to its built-in reaction set —
+    use one of: 👍 👎 ❤ 🔥 🥰 👏 😁 🤔 🤯 😱 🤬 😢 🎉 🤩 🥱 🥴 😍 ❤‍🔥 🌚 💯
+    🤣 ⚡ 🍌 🏆 💔 🤨 😐 🤡 🤓 👻 👨‍💻 👀 🙈 😇 😨 🤝 ✍ 🤗 🫡 💅 🗿 🆒 💘
+    🙉 😘 🙊 😎 👾 🤷‍♂ 🤷 🤷‍♀ 😡 — anything else returns 400.
+    """
+    params: dict = {"chat_id": chat_id, "message_id": msg_id}
+    if emoji:
+        params["reaction"] = json.dumps(
+            [{"type": "emoji", "emoji": emoji}])
+    else:
+        params["reaction"] = "[]"
+    try:
+        _req("setMessageReaction", params)
+    except Exception as e:
+        _log(f"set_message_reaction error: {e}")
+
+
+_TOPIC_ICON_EMOJI_ID = "5417915203100613993"  # 💬 — default (bot session)
 
 
 def create_forum_topic(chat_id: int, label: str,
-                       icon_color: int = 0x6FB9F0) -> int | None:
+                       icon_color: int = 0x6FB9F0,
+                       icon_custom_emoji_id: str | None = None,
+                       ) -> int | None:
+    """Create a forum topic. Caller chooses the leading emoji — defaults
+    to 💬 (bot session). Pass an explicit ID (e.g. terminal 💻) to
+    differentiate session types in the topic list."""
     params: dict = {
         "chat_id": chat_id,
         "name": label[:128],
         "icon_color": icon_color,
-        "icon_custom_emoji_id": _TOPIC_ICON_EMOJI_ID,
+        "icon_custom_emoji_id": (icon_custom_emoji_id
+                                  if icon_custom_emoji_id is not None
+                                  else _TOPIC_ICON_EMOJI_ID),
     }
     r = _req("createForumTopic", params)
     return r.get("result", {}).get("message_thread_id")
