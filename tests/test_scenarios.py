@@ -1280,18 +1280,22 @@ def test_chat_action_find_location_for_websearch(bot, tmp_path):
         f"WebSearch should map to find_location; got {actions}"
 
 
-def test_chat_action_mapper_unit():
-    """Direct unit test of the tool→action mapping."""
-    from bot import _chat_action_for_tool
-    assert _chat_action_for_tool(None) == "typing"
-    assert _chat_action_for_tool("Bash") == "typing"
-    assert _chat_action_for_tool("Read") == "upload_document"
-    assert _chat_action_for_tool("Edit") == "upload_document"
-    assert _chat_action_for_tool("Write") == "upload_document"
-    assert _chat_action_for_tool("Glob") == "upload_document"
-    assert _chat_action_for_tool("WebFetch") == "find_location"
-    assert _chat_action_for_tool("WebSearch") == "find_location"
-    assert _chat_action_for_tool("UnknownTool") == "typing"
+def test_chat_action_mapper_unit(bot):
+    """Direct unit test of the tool→action mapping.
+
+    Pulls _chat_action_for_tool through the `bot` fixture so config.py
+    picks up the test BOT_TOKEN env-stub instead of trying to read .env.
+    """
+    fn = bot.mod._chat_action_for_tool
+    assert fn(None) == "typing"
+    assert fn("Bash") == "typing"
+    assert fn("Read") == "upload_document"
+    assert fn("Edit") == "upload_document"
+    assert fn("Write") == "upload_document"
+    assert fn("Glob") == "upload_document"
+    assert fn("WebFetch") == "find_location"
+    assert fn("WebSearch") == "find_location"
+    assert fn("UnknownTool") == "typing"
 
 
 # ── sendMediaGroup for multi-image output (Batch A #15) ──────────────
