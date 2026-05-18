@@ -2060,7 +2060,7 @@ _HELP_TEXT = (
     "/history [N] — last N events (default 30)\n"
     "/usage — session tokens + account limits\n"
     "/display [mobile|desktop] — toggle view\n"
-    "/mode [default|terse|verbose|beginner|plan] — response style\n"
+    "/mode [default|terse|verbose|beginner|plan|burn] — response style\n"
     "\n"
     "<b>Other</b>\n"
     "/update — check for bot updates\n"
