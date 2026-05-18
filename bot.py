@@ -28,6 +28,7 @@ import audit
 import telegram as tg
 from sessions import MODE_PRESETS, Session, SessionManager
 from hooks import HookBridge
+from terminal_mirror import TerminalMirrorManager
 
 # ── state ────────────────────────────────────────────────────────────
 
@@ -2235,9 +2236,121 @@ mgr = SessionManager(
     on_session_stop=_on_session_stop,
     on_session_context=_session_context,
 )
+
+
+def on_mirror_event(mirror, event):
+    """Project a JSONL event from a terminal session into its mirror topic.
+
+    Filters for content the owner cares about: user prompts (plain
+    text only), assistant text blocks, and tool_use one-liners.
+    Everything else (tool_result echoes, attachments, system events,
+    thinking blocks) is dropped.
+    """
+    fid = forum()
+    if not fid or not mirror.topic_id:
+        return
+    etype = event.get("type", "")
+
+    if etype == "user":
+        msg = event.get("message") or {}
+        content = msg.get("content")
+        text = ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            parts = []
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "text":
+                    parts.append(b.get("text", ""))
+            text = "".join(parts)
+        text = text.strip()
+        if not text:
+            return
+        tg.send(f"\U0001f464 {tg.esc(text[:3000])}",
+                fid, thread_id=mirror.topic_id)
+        return
+
+    if etype == "assistant":
+        msg = event.get("message") or {}
+        content = msg.get("content")
+        if not isinstance(content, list):
+            return
+        text_parts = []
+        tool_lines = []
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            btype = b.get("type")
+            if btype == "text":
+                text_parts.append(b.get("text", ""))
+            elif btype == "tool_use":
+                tool = b.get("name") or "?"
+                inp = b.get("input") or {}
+                if not _is_noisy_tool(tool, inp):
+                    tool_lines.append(_compact_tool_msg(tool, inp))
+        text = "".join(text_parts).strip()
+        if text:
+            tg.send_long(text, fid, thread_id=mirror.topic_id,
+                         markdown=True)
+        for line in tool_lines:
+            tg.send(f"⚙️ {tg.esc(line)}",
+                    fid, thread_id=mirror.topic_id)
+        return
+
+    if etype == "tool_use":
+        tool = event.get("name") or "?"
+        inp = event.get("input") or event.get("tool_input") or {}
+        if not _is_noisy_tool(tool, inp):
+            tg.send(f"⚙️ {tg.esc(_compact_tool_msg(tool, inp))}",
+                    fid, thread_id=mirror.topic_id)
+
+
+mirror_mgr = TerminalMirrorManager(on_event=on_mirror_event)
+
+
+def on_open_in_bot(csid, cwd, dtach_sock):
+    """Bot-side handler for POST /hook/open_in_bot.
+
+    Creates a mirror topic if one doesn't exist for this csid, starts
+    the JSONL follower, returns {status, topic_url}.
+    """
+    fid = forum()
+    if not fid:
+        return {"error": "bot has no forum chat configured"}
+    existing = mirror_mgr.by_csid(csid)
+    if existing:
+        url = _topic_url(existing.topic_id)
+        return {"status": "ok", "topic_url": url, "existing": True}
+    name = os.path.basename(cwd.rstrip("/")) or "terminal"
+    ts = time.strftime("%H:%M")
+    label = f"\U0001f501 {name} — {ts}"[:128]
+    try:
+        topic_id = tg.create_forum_topic(
+            fid, label, icon_color=0x6FB9F0,
+            icon_custom_emoji_id=_ICON_TERMINAL)
+    except Exception as e:
+        return {"error": f"create_forum_topic failed: {e}"}
+    if not topic_id:
+        return {"error": "create_forum_topic returned no id"}
+    with state.lock:
+        state.topic_labels[topic_id] = label
+    m = mirror_mgr.register(csid, cwd, topic_id, dtach_sock)
+    input_status = "enabled" if dtach_sock else "disabled (output-only)"
+    send_to_topic(
+        topic_id,
+        f"\U0001f501 <b>Mirror of terminal Claude</b>\n"
+        f"<code>{tg.esc(cwd)}</code>\n"
+        f"input: {input_status}",
+    )
+    mirror_mgr.start_follower(m)
+    url = _topic_url(topic_id)
+    return {"status": "ok", "topic_url": url, "existing": False}
+
+
 bridge = HookBridge(
     on_notification=on_hook_notification,
     on_permission=on_hook_permission,
+    on_open_in_bot=on_open_in_bot,
 )
 
 
@@ -2400,6 +2513,7 @@ def main():
                 state.topic_labels[s.topic_id] = s.topic_label
     bridge.start()
     _cleanup_general()
+    mirror_mgr.start_all_followers()
     threading.Thread(target=_topic_healthcheck, daemon=True).start()
     threading.Thread(target=_dashboard_loop, daemon=True).start()
     threading.Thread(target=_terminal_watcher, daemon=True).start()
