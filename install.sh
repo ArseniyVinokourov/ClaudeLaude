@@ -10,6 +10,15 @@ ok()   { echo -e "${C_GREEN}✓${C_RESET} $*"; }
 err()  { echo -e "${C_RED}✗${C_RESET} $*"; }
 bold() { echo -e "${C_BOLD}$*${C_RESET}"; }
 
+# Portable sha256: sha256sum on Linux/WSL, shasum -a 256 on macOS.
+sha256() {
+    if command -v sha256sum &>/dev/null; then
+        sha256sum "$@"
+    else
+        shasum -a 256 "$@"
+    fi
+}
+
 REPO_URL="https://github.com/ArseniyVinokourov/ClaudeLaude.git"
 DEFAULT_DIR="$HOME/claude-bot"
 
@@ -45,7 +54,7 @@ cd "$INSTALL_DIR"
 bash setup.sh
 
 # ── generate checksums ─────────────────────────────────────────────
-git ls-files | xargs sha256sum > .dist_checksums 2>/dev/null || true
+git ls-files | xargs sha256 > .dist_checksums 2>/dev/null || true
 
 # ── post-install instructions ──────────────────────────────────────
 echo ""
