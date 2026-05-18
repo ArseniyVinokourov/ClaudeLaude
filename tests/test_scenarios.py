@@ -954,6 +954,48 @@ def test_mode_terse_injects_style(bot, tmp_path):
     assert "ClaudeLaude bot session" in appended
 
 
+def test_mode_burn_injects_model_effort_budget(bot, tmp_path):
+    _start_bot_session(bot, tmp_path)
+    bot.tg.inject_update(text_update(
+        "/mode burn", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, thread_id=100,
+    ))
+    _drain_updates(bot)
+    bot.tg.inject_update(text_update(
+        "go", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, thread_id=100,
+    ))
+    _drain_updates(bot)
+    bot.claude.wait_for_spawns(1)
+
+    cmd = bot.claude.last_spawn()["cmd"]
+    assert "--model" in cmd
+    assert cmd[cmd.index("--model") + 1] == "claude-opus-4-7[1m]"
+    assert "--effort" in cmd
+    assert cmd[cmd.index("--effort") + 1] == "max"
+    assert "--max-budget-usd" in cmd
+    assert cmd[cmd.index("--max-budget-usd") + 1] == "5.0"
+    appended = _append_system_prompt(cmd)
+    assert "Burn mode" in appended
+    assert _permission_mode(cmd) == "auto"
+
+
+def test_mode_non_burn_omits_burn_flags(bot, tmp_path):
+    """Other modes must not leak burn-only flags into the spawn cmd."""
+    _start_bot_session(bot, tmp_path)
+    bot.tg.inject_update(text_update(
+        "go", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, thread_id=100,
+    ))
+    _drain_updates(bot)
+    bot.claude.wait_for_spawns(1)
+
+    cmd = bot.claude.last_spawn()["cmd"]
+    assert "--model" not in cmd
+    assert "--effort" not in cmd
+    assert "--max-budget-usd" not in cmd
+
+
 def test_mode_unknown_rejected_and_persisted_default(bot, tmp_path):
     _start_bot_session(bot, tmp_path)
     bot.tg.reset()

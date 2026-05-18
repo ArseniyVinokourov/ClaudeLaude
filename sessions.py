@@ -64,6 +64,21 @@ MODE_PRESETS: dict[str, dict] = {
         "permission_mode": "plan",
         "label": "read-only research mode",
     },
+    "burn": {
+        "style": (
+            "Burn mode: do not economize tokens or time. Push through to a "
+            "complete, verified result — don't stop at 'probably' or 'should "
+            "work'. Use the Agent tool aggressively, including parallel "
+            "Agent calls, for research and independent verification of any "
+            "non-trivial claim. Cite verifications (file:line, command "
+            "output) rather than asserting from memory."
+        ),
+        "permission_mode": "auto",
+        "model": "claude-opus-4-7[1m]",
+        "effort": "max",
+        "max_budget_usd": 5.0,
+        "label": "Opus 1M + max effort + parallel agents",
+    },
 }
 
 
@@ -442,6 +457,12 @@ class SessionManager:
         preset = MODE_PRESETS.get(session.mode, MODE_PRESETS["default"])
         cmd = [_CLAUDE_BIN, "-p", text, "--output-format", "stream-json",
                "--verbose", "--permission-mode", preset["permission_mode"]]
+        if preset.get("model"):
+            cmd.extend(["--model", preset["model"]])
+        if preset.get("effort"):
+            cmd.extend(["--effort", preset["effort"]])
+        if preset.get("max_budget_usd"):
+            cmd.extend(["--max-budget-usd", str(preset["max_budget_usd"])])
         append_parts: list[str] = []
         if self._on_session_context is not None:
             try:
