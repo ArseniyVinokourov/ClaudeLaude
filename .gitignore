@@ -25,6 +25,7 @@ hook_fallback.py
 .known_devices.json
 test_hook_probe*.txt
 temp/
+docs/internal/
 
 # Distribution artifacts
 *.tar.gz

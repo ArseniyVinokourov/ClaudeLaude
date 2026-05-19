@@ -1536,7 +1536,7 @@ def test_mirror_register_creates_topic_and_starts_follower(bot, tmp_path):
     (tmp_path / "mirror_project_1").mkdir()
     jp = _make_fake_jsonl(tmp_path, csid, cwd)
     try:
-        result = bot.mod.on_open_in_bot(csid, cwd, None)
+        result = bot.mod.on_open_in_bot(csid, cwd, None, None)
         assert "topic_url" in result, result
         topic_calls = bot.tg.calls_of("createForumTopic")
         assert len(topic_calls) == 1, topic_calls
@@ -1583,8 +1583,8 @@ def test_mirror_register_idempotent(bot, tmp_path):
     cwd = str(tmp_path / "mirror_project_2")
     (tmp_path / "mirror_project_2").mkdir()
     try:
-        r1 = bot.mod.on_open_in_bot(csid, cwd, None)
-        r2 = bot.mod.on_open_in_bot(csid, cwd, None)
+        r1 = bot.mod.on_open_in_bot(csid, cwd, None, None)
+        r2 = bot.mod.on_open_in_bot(csid, cwd, None, None)
         assert r1.get("topic_url") == r2.get("topic_url")
         assert r2.get("existing") is True
         assert len(bot.tg.calls_of("createForumTopic")) == 1
@@ -1592,24 +1592,25 @@ def test_mirror_register_idempotent(bot, tmp_path):
         bot.mod.mirror_mgr.unregister(csid)
 
 
-def test_mirror_input_bridge_pushes_to_dtach(bot, tmp_path, monkeypatch):
-    """Text typed in a mirror topic with dtach_sock set should be pushed
-    via push_to_dtach. Output-only mirrors should refuse with an ephemeral."""
+def test_mirror_input_bridge_pushes_to_tmux(bot, tmp_path, monkeypatch):
+    """Text typed in a mirror topic with tmux_pane set should be pushed
+    via push_to_tmux. Output-only mirrors should refuse with an ephemeral."""
     csid = "mirror-test-3"
     cwd = str(tmp_path / "mirror_project_3")
     (tmp_path / "mirror_project_3").mkdir()
 
-    # Patch push_to_dtach so we don't shell out to a real dtach.
-    pushes: list[tuple[str, str]] = []
+    # Patch push_to_tmux so we don't shell out to a real tmux.
+    pushes: list[tuple[str, str, str]] = []
     monkeypatch.setattr(
-        bot.mod, "push_to_dtach",
-        lambda sock, text, **kw: (pushes.append((sock, text)) or True),
+        bot.mod, "push_to_tmux",
+        lambda sock, pane, text, **kw: (pushes.append((sock, pane, text)) or True),
     )
 
     try:
-        bot.mod.on_open_in_bot(csid, cwd, "/tmp/fake.sock")
+        bot.mod.on_open_in_bot(csid, cwd, "/tmp/tmux-1000/default", "%42")
         m = bot.mod.mirror_mgr.by_csid(csid)
-        assert m and m.dtach_sock == "/tmp/fake.sock"
+        assert m and m.tmux_pane == "%42"
+        assert m.tmux_socket == "/tmp/tmux-1000/default"
 
         bot.tg.inject_update(text_update(
             "ls -la", owner_id=bot.owner_id,
@@ -1617,13 +1618,13 @@ def test_mirror_input_bridge_pushes_to_dtach(bot, tmp_path, monkeypatch):
             thread_id=m.topic_id,
         ))
         _drain_updates(bot)
-        assert pushes == [("/tmp/fake.sock", "ls -la")], pushes
+        assert pushes == [("/tmp/tmux-1000/default", "%42", "ls -la")], pushes
     finally:
         bot.mod.mirror_mgr.unregister(csid)
 
 
 def test_mirror_input_bridge_output_only_rejects(bot, tmp_path, monkeypatch):
-    """Mirror without dtach_sock should not call push_to_dtach; it should
+    """Mirror without tmux_pane should not call push_to_tmux; it should
     surface an output-only notice."""
     csid = "mirror-test-4"
     cwd = str(tmp_path / "mirror_project_4")
@@ -1631,14 +1632,14 @@ def test_mirror_input_bridge_output_only_rejects(bot, tmp_path, monkeypatch):
 
     pushes: list[tuple] = []
     monkeypatch.setattr(
-        bot.mod, "push_to_dtach",
+        bot.mod, "push_to_tmux",
         lambda *a, **kw: (pushes.append(a) or True),
     )
 
     try:
-        bot.mod.on_open_in_bot(csid, cwd, None)
+        bot.mod.on_open_in_bot(csid, cwd, None, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
-        assert m and m.dtach_sock is None
+        assert m and m.tmux_pane is None
 
         bot.tg.inject_update(text_update(
             "echo hi", owner_id=bot.owner_id,
@@ -1646,7 +1647,7 @@ def test_mirror_input_bridge_output_only_rejects(bot, tmp_path, monkeypatch):
             thread_id=m.topic_id,
         ))
         _drain_updates(bot)
-        assert pushes == [], "push_to_dtach should not be called for output-only mirror"
+        assert pushes == [], "push_to_tmux should not be called for output-only mirror"
         # An ephemeral notice should mention "Output-only"
         notices = [
             p.get("text", "") for p in bot.tg.calls_of("sendMessage")
@@ -1667,9 +1668,12 @@ def test_mirror_persist_and_restore(bot_env, tmp_path):
     cwd = str(tmp_path / "persist_project")
     (tmp_path / "persist_project").mkdir()
     mgr1 = tm.TerminalMirrorManager(lambda *a, **kw: None)
-    mgr1.register(csid, cwd, 555, dtach_sock="/tmp/persist.sock")
+    mgr1.register(csid, cwd, 555,
+                  tmux_socket="/tmp/tmux-1000/default",
+                  tmux_pane="%9")
     mgr2 = tm.TerminalMirrorManager(lambda *a, **kw: None)
     restored = mgr2.by_csid(csid)
     assert restored is not None
     assert restored.topic_id == 555
-    assert restored.dtach_sock == "/tmp/persist.sock"
+    assert restored.tmux_socket == "/tmp/tmux-1000/default"
+    assert restored.tmux_pane == "%9"

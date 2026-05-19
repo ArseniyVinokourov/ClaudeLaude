@@ -190,74 +190,94 @@ if [[ "$SETUP_BOT_CMD" =~ ^[Yy] ]]; then
     fi
 fi
 
-# ── Mirror PATH shim (~/.local/bin/claude) ───────────────────────────
-bold "\nTerminal-mirror shim (optional)"
-echo "Installs a tiny wrapper at ~/.local/bin/claude that routes"
-echo "interactive 'claude' invocations through dtach so the bot's"
-echo "/bot mirror command can stream input from your phone into the"
-echo "running session. Non-interactive runs (-p, --version, piped)"
-echo "are forwarded straight to the real claude."
+# ── Mirror (~/.bashrc claude() function) ─────────────────────────────
+bold "\nTerminal-mirror (optional)"
+echo "When enabled, the bot can stream input from a Telegram topic into"
+echo "your running terminal Claude — exactly as if you were typing at"
+echo "the keyboard. The mechanism: a tiny bash function in ~/.bashrc"
+echo "transparently runs 'claude' inside a tmux pane. The bot then uses"
+echo "'tmux send-keys' to type into that pane from Telegram."
+echo ""
+echo "Your everyday workflow stays identical — you keep typing 'claude'"
+echo "as before. The tmux pane is created with a status bar disabled, so"
+echo "visually it looks like a plain claude session. To bypass entirely"
+echo "for one shell, set CLAUDELAUDE_NO_TMUX=1 before running 'claude'."
 echo ""
 
-SHIM_SRC="$SCRIPT_DIR/scripts/claude-shim"
-SHIM_BIN_DIR="$HOME/.local/bin"
-SHIM_CLAUDE="$SHIM_BIN_DIR/claude"
-SHIM_CLAUDEBOT="$SHIM_BIN_DIR/claude-bot"
-
-if ! command -v dtach &>/dev/null; then
-    warn "'dtach' is not installed. Mirror will be output-only until you install it."
-    echo "  Debian/Ubuntu: sudo apt install dtach"
-    echo "  macOS:         brew install dtach"
-fi
-
-REAL_CLAUDE=""
-# Resolve real claude by skipping anything in ~/.local/bin/.
-old_IFS="$IFS"; IFS=:
-for d in $PATH; do
-    cand="$d/claude"
-    [ -x "$cand" ] || continue
-    cand_real="$(readlink -f "$cand" 2>/dev/null || echo "$cand")"
-    # Skip if this resolves to either of our planned shim paths.
-    [ "$cand_real" = "$(readlink -f "$SHIM_CLAUDE" 2>/dev/null || echo "$SHIM_CLAUDE")" ] && continue
-    [ "$cand_real" = "$(readlink -f "$SHIM_CLAUDEBOT" 2>/dev/null || echo "$SHIM_CLAUDEBOT")" ] && continue
-    REAL_CLAUDE="$cand"
-    break
-done
-IFS="$old_IFS"
-
-if [ -z "$REAL_CLAUDE" ]; then
-    warn "No 'claude' binary found on PATH — skipping shim install."
-    echo "Install Claude Code first, then re-run setup.sh."
+if ! command -v tmux &>/dev/null; then
+    warn "'tmux' is not installed. Mirror input bridge requires tmux."
+    echo "  Debian/Ubuntu: sudo apt install tmux"
+    echo "  macOS:         brew install tmux"
+    echo "Skipping mirror setup; install tmux and re-run setup.sh."
 else
-    echo "Real claude: $REAL_CLAUDE"
-    read -rp "Install transparent shim at $SHIM_CLAUDE? [Y/n]: " INSTALL_SHIM
-    INSTALL_SHIM="${INSTALL_SHIM:-Y}"
+    read -rp "Enable terminal mirror (adds a bash function to ~/.bashrc)? [Y/n]: " INSTALL_MIRROR
+    INSTALL_MIRROR="${INSTALL_MIRROR:-Y}"
 
-    if [[ "$INSTALL_SHIM" =~ ^[Yy] ]]; then
-        mkdir -p "$SHIM_BIN_DIR"
-        cp "$SHIM_SRC" "$SHIM_CLAUDE"
-        cp "$SHIM_SRC" "$SHIM_CLAUDEBOT"
-        chmod +x "$SHIM_CLAUDE" "$SHIM_CLAUDEBOT"
-        ok "Installed $SHIM_CLAUDE and $SHIM_CLAUDEBOT"
+    if [[ "$INSTALL_MIRROR" =~ ^[Yy] ]]; then
+        BASHRC="$HOME/.bashrc"
+        MARK_BEGIN="# >>> claudelaude mirror >>>"
+        MARK_END="# <<< claudelaude mirror <<<"
 
-        # Verify PATH ordering — shim must come before the real claude.
-        case ":$PATH:" in
-            *:"$SHIM_BIN_DIR":*) PATH_OK=1 ;;
-            *) PATH_OK=0 ;;
-        esac
-        if [ "$PATH_OK" = "0" ]; then
-            warn "$SHIM_BIN_DIR is not in your PATH."
-            echo "Add this to your shell rc (~/.bashrc / ~/.zshrc):"
-            echo "    export PATH=\"\$HOME/.local/bin:\$PATH\""
-        else
-            # Confirm the shim wins. `command -v claude` should now
-            # point at our shim (or at least, our shim should come
-            # first in PATH lookups). We don't try to verify it from
-            # a fresh shell — just trust the ordering.
-            ok "PATH includes $SHIM_BIN_DIR"
+        # Refuse to install if user has their own claude() / alias and
+        # it's not ours. Our marker block is exempt from this check.
+        if [ -f "$BASHRC" ] && grep -q "$MARK_BEGIN" "$BASHRC"; then
+            ok "Mirror block already present in ~/.bashrc — refreshing"
+            # Strip existing block before re-inserting (idempotent).
+            python3 -c "
+import re, pathlib
+p = pathlib.Path('$BASHRC')
+src = p.read_text()
+new = re.sub(r'\n?$MARK_BEGIN.*?$MARK_END\n?', '\n', src, flags=re.S)
+p.write_text(new)
+"
+        elif [ -f "$BASHRC" ] && grep -qE '^[[:space:]]*(alias[[:space:]]+claude=|claude\(\)[[:space:]]*\{|function[[:space:]]+claude[[:space:]]*[\{(])' "$BASHRC"; then
+            warn "An existing 'claude' alias/function was found in ~/.bashrc."
+            echo "  Refusing to overwrite. Remove or rename it, then re-run setup.sh."
+            echo "  To use the mirror without our wrapper, run 'clmirror' explicitly"
+            echo "  (set CLAUDELAUDE_MIRROR_FALLBACK_CMD=clmirror) — not yet shipped."
+            INSTALL_MIRROR=N
+        fi
+
+        if [[ "$INSTALL_MIRROR" =~ ^[Yy] ]]; then
+            # Backup ~/.bashrc once before our first edit.
+            if [ -f "$BASHRC" ] && [ ! -f "$BASHRC.before-claudelaude" ]; then
+                cp "$BASHRC" "$BASHRC.before-claudelaude"
+                ok "Backed up ~/.bashrc to ~/.bashrc.before-claudelaude"
+            fi
+
+            cat >> "$BASHRC" <<'BASHRC_BLOCK'
+
+# >>> claudelaude mirror >>>
+# Routes plain `claude` invocations through a dedicated tmux pane so the
+# ClaudeLaude bot can mirror the session into Telegram. To bypass for one
+# shell, set CLAUDELAUDE_NO_TMUX=1.
+claude() {
+    if [ -n "$TMUX" ] || [ -n "${CLAUDELAUDE_NO_TMUX:-}" ] \
+       || ! command -v tmux >/dev/null 2>&1; then
+        command claude "$@"
+        return $?
+    fi
+    local session_name="${CLAUDELAUDE_SESSION:-clmirror-$$}"
+    local cmd="command claude"
+    local a
+    for a in "$@"; do
+        cmd+=" $(printf '%q' "$a")"
+    done
+    if ! tmux has-session -t "$session_name" 2>/dev/null; then
+        tmux new-session -d -s "$session_name" "$cmd"
+        tmux set-option -t "$session_name" status off >/dev/null 2>&1 || true
+        tmux set-option -t "$session_name" mouse on >/dev/null 2>&1 || true
+        tmux set-option -t "$session_name" history-limit 100000 >/dev/null 2>&1 || true
+    fi
+    tmux attach-session -t "$session_name"
+}
+# <<< claudelaude mirror <<<
+BASHRC_BLOCK
+            ok "Installed mirror block in ~/.bashrc"
+            echo "  Open a new terminal (or 'source ~/.bashrc') for it to take effect."
         fi
     else
-        ok "Skipping transparent shim. Use 'claude-bot' explicitly if you want mirror."
+        ok "Skipping mirror. /bot mirror will run output-only when invoked."
     fi
 fi
 

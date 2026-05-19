@@ -28,7 +28,9 @@ import audit
 import telegram as tg
 from sessions import MODE_PRESETS, Session, SessionManager
 from hooks import HookBridge
-from terminal_mirror import TerminalMirrorManager, push_to_dtach
+from terminal_mirror import (
+    TerminalMirrorManager, push_to_tmux, tmux_pane_alive,
+)
 
 # ── state ────────────────────────────────────────────────────────────
 
@@ -283,6 +285,20 @@ def _enqueue_user_input(session, text: str, chat_id: int,
         _record_topic_msg(session.topic_id, msg_id)
 
 
+_BASH_READONLY_PREFIXES = (
+    "cat ", "ls", "pwd", "echo ", "printf ",
+    "find ", "grep ", "rg ", "ag ",
+    "head ", "tail ", "wc ", "awk ", "sed -n",
+    "git log", "git status", "git diff", "git blame",
+    "git branch", "git show", "git ls-files",
+    "gh pr list", "gh issue list", "gh release list",
+    "gh pr view", "gh issue view",
+    "which ", "type ", "command -v",
+    "stat ", "file ", "du ", "df ",
+    "ps ", "top ", "htop",
+)
+
+
 def _is_noisy_tool(tool, inp):
     if tool in _NOISE_TOOLS:
         return True
@@ -290,6 +306,28 @@ def _is_noisy_tool(tool, inp):
         path = inp.get("file_path", "")
         if any(p in path for p in _NOISE_PATHS):
             return True
+    if tool == "Bash":
+        cmd = inp.get("command", "") or ""
+        # Hide the slash command's own curl to the bot's hook endpoint —
+        # it's plumbing, not user-visible work.
+        if "/hook/open_in_bot" in cmd or f":{HOOK_PORT}/hook/" in cmd:
+            return True
+    return False
+
+
+def _is_mirror_noisy_tool(tool, inp):
+    """Stricter filter for the mirror channel: hide observational Bash
+    too (cat/grep/git log/etc) so the topic stays a clean conversation
+    transcript. Full tool trace is still visible in the terminal.
+    """
+    if _is_noisy_tool(tool, inp):
+        return True
+    if tool == "Bash":
+        cmd = (inp.get("command", "") or "").lstrip()
+        cmd_head = cmd.split(" 2>")[0].split(" |")[0].split(" &&")[0].lstrip()
+        for prefix in _BASH_READONLY_PREFIXES:
+            if cmd_head.startswith(prefix):
+                return True
     return False
 
 
@@ -782,7 +820,9 @@ def on_thinking(session):
 def _compact_tool_msg(tool, inp):
     if tool == "Bash":
         cmd = inp.get("command", "?")
-        return f"$ {cmd[:60]}" if len(cmd) <= 60 else f"$ {cmd[:57]}…"
+        # Collapse multi-line shell snippets into one displayable line.
+        cmd = cmd.replace("\n", " ; ").strip()
+        return f"$ {cmd[:50]}" if len(cmd) <= 50 else f"$ {cmd[:47]}…"
     if tool in ("Write", "Edit"):
         path = inp.get("file_path", "?")
         return f"{tool}: {os.path.basename(path)}"
@@ -2266,7 +2306,17 @@ def on_mirror_event(mirror, event):
         text = text.strip()
         if not text:
             return
-        tg.send(f"\U0001f464 {tg.esc(text[:3000])}",
+        # Skip slash-command boilerplate Claude Code injects as a user
+        # message: the <command-*> wrapper tags (event 1) and the body
+        # of ~/.claude/commands/<name>.md plus the trailing ARGUMENTS:
+        # line (event 2). Neither is real user input.
+        if ("<command-message>" in text
+                or "<command-name>" in text
+                or "<command-args>" in text):
+            return
+        if re.search(r'\nARGUMENTS:\s+\S', text):
+            return
+        tg.send(f"<blockquote>\U0001f464 {tg.esc(text[:3000])}</blockquote>",
                 fid, thread_id=mirror.topic_id)
         return
 
@@ -2286,7 +2336,7 @@ def on_mirror_event(mirror, event):
             elif btype == "tool_use":
                 tool = b.get("name") or "?"
                 inp = b.get("input") or {}
-                if not _is_noisy_tool(tool, inp):
+                if not _is_mirror_noisy_tool(tool, inp):
                     tool_lines.append(_compact_tool_msg(tool, inp))
         text = "".join(text_parts).strip()
         if text:
@@ -2295,12 +2345,22 @@ def on_mirror_event(mirror, event):
         for line in tool_lines:
             tg.send(f"⚙️ {tg.esc(line)}",
                     fid, thread_id=mirror.topic_id)
+        # Acknowledge any pending TG message: 👀 (received) → 👍 (claude
+        # answered) so the owner sees from Telegram that delivery worked
+        # end-to-end, not just up to the pane.
+        if (text or tool_lines) and mirror.pending_user_msg_id:
+            try:
+                tg.set_message_reaction(
+                    fid, mirror.pending_user_msg_id, _REACT_DONE)
+            except Exception:
+                pass
+            mirror.pending_user_msg_id = None
         return
 
     if etype == "tool_use":
         tool = event.get("name") or "?"
         inp = event.get("input") or event.get("tool_input") or {}
-        if not _is_noisy_tool(tool, inp):
+        if not _is_mirror_noisy_tool(tool, inp):
             tg.send(f"⚙️ {tg.esc(_compact_tool_msg(tool, inp))}",
                     fid, thread_id=mirror.topic_id)
 
@@ -2308,11 +2368,13 @@ def on_mirror_event(mirror, event):
 mirror_mgr = TerminalMirrorManager(on_event=on_mirror_event)
 
 
-def on_open_in_bot(csid, cwd, dtach_sock):
+def on_open_in_bot(csid, cwd, tmux_socket, tmux_pane):
     """Bot-side handler for POST /hook/open_in_bot.
 
     Creates a mirror topic if one doesn't exist for this csid, starts
-    the JSONL follower, returns {status, topic_url}.
+    the JSONL follower, returns {status, topic_url}. tmux_pane is the
+    pane id (e.g. "%42") of the terminal claude — bot uses it for
+    `tmux send-keys`. When empty, the mirror runs output-only.
     """
     fid = forum()
     if not fid:
@@ -2326,14 +2388,17 @@ def on_open_in_bot(csid, cwd, dtach_sock):
         # already in place.
         if not existing.follower or not existing.follower.is_alive():
             mirror_mgr.start_follower(existing)
-        # Also refresh the dtach socket binding — the user may have
-        # re-launched their terminal under the shim, getting a new socket.
-        if dtach_sock and existing.dtach_sock != dtach_sock:
-            mirror_mgr.set_dtach_sock(csid, dtach_sock)
+        # Also refresh the tmux binding — the user may have re-launched
+        # their terminal claude, getting a new pane id.
+        if tmux_pane and (existing.tmux_pane != tmux_pane
+                          or existing.tmux_socket != tmux_socket):
+            mirror_mgr.set_tmux_target(csid, tmux_socket, tmux_pane)
         return {"status": "ok", "topic_url": url, "existing": True}
     name = os.path.basename(cwd.rstrip("/")) or "terminal"
     ts = time.strftime("%H:%M")
-    label = f"\U0001f501 {name} — {ts}"[:128]
+    # Topic icon is the 💻 terminal emoji (icon_custom_emoji_id), so we
+    # don't double up with another decorative prefix here.
+    label = f"{name} mirror — {ts}"[:128]
     try:
         topic_id = tg.create_forum_topic(
             fid, label, icon_color=0x6FB9F0,
@@ -2344,14 +2409,16 @@ def on_open_in_bot(csid, cwd, dtach_sock):
         return {"error": "create_forum_topic returned no id"}
     with state.lock:
         state.topic_labels[topic_id] = label
-    m = mirror_mgr.register(csid, cwd, topic_id, dtach_sock)
-    input_status = "enabled" if dtach_sock else "disabled (output-only)"
-    send_to_topic(
-        topic_id,
-        f"\U0001f501 <b>Mirror of terminal Claude</b>\n"
-        f"<code>{tg.esc(cwd)}</code>\n"
-        f"input: {input_status}",
-    )
+    m = mirror_mgr.register(csid, cwd, topic_id, tmux_socket, tmux_pane)
+    if not tmux_pane:
+        # Only worth saying when input is NOT bridged — the default
+        # working case stays silent so the topic opens straight on
+        # the live transcript.
+        send_to_topic(
+            topic_id,
+            "\U0001f50c Mirror is output-only — start your terminal "
+            "claude inside tmux to enable typing from here.",
+        )
     mirror_mgr.start_follower(m)
     url = _topic_url(topic_id)
     return {"status": "ok", "topic_url": url, "existing": False}
@@ -2421,9 +2488,9 @@ def _topic_healthcheck():
             if not tg.topic_alive(fid, session.topic_id, name=label):
                 _invalidate_and_stop(session, "topic deleted")
 
-        # Mirrors: probe topic existence, dtach socket presence, and
+        # Mirrors: probe topic existence, tmux pane presence, and
         # JSONL freshness. A mirror with a vanished topic is dropped;
-        # a vanished dtach socket flips the mirror to output-only;
+        # a vanished tmux pane flips the mirror to output-only;
         # a JSONL untouched for > 30 min implies the terminal session
         # has ended.
         for mirror in mirror_mgr.list():
@@ -2438,11 +2505,12 @@ def _topic_healthcheck():
                       file=sys.stderr, flush=True)
                 mirror_mgr.unregister(mirror.csid)
                 continue
-            if mirror.dtach_sock and not os.path.exists(mirror.dtach_sock):
+            if (mirror.tmux_pane and
+                    not tmux_pane_alive(mirror.tmux_socket, mirror.tmux_pane)):
                 send_to_topic(
                     mirror.topic_id,
                     "\U0001f50c Terminal closed — mirror is now output-only")
-                mirror_mgr.set_dtach_sock(mirror.csid, None)
+                mirror_mgr.set_tmux_target(mirror.csid, None, None)
             try:
                 jmtime = os.path.getmtime(mirror.jsonl_path)
             except OSError:
@@ -2691,8 +2759,8 @@ def _handle_update(u):
     if not thread_id and fid and chat_id == fid and msg_id:
         tg.delete(msg_id, chat_id)
 
-    # ── Terminal-mirror topic: forward text into the terminal session
-    # via dtach, or politely reject if input isn't bridged.
+    # ── Terminal-mirror topic: forward text into the terminal claude
+    # via tmux send-keys, or politely reject if input isn't bridged.
     if mirror:
         photos = msg.get("photo")
         document = msg.get("document")
@@ -2704,23 +2772,28 @@ def _handle_update(u):
             return
         if not text:
             return
-        if not mirror.dtach_sock:
+        if not mirror.tmux_pane:
             _ephemeral(chat_id,
                        "\U0001f501 Output-only mirror — terminal input is not bridged "
-                       "(start your terminal claude via the shim to enable it)",
+                       "(start your terminal claude inside tmux to enable it)",
                        thread_id=thread_id, seconds=8)
             return
         if msg_id:
             tg.set_message_reaction(chat_id, msg_id, _REACT_RECEIVED)
-        ok = push_to_dtach(mirror.dtach_sock, text)
+        ok = push_to_tmux(mirror.tmux_socket, mirror.tmux_pane, text)
         if not ok:
             if msg_id:
                 tg.set_message_reaction(chat_id, msg_id, _REACT_ERROR)
             _ephemeral(chat_id,
                        "❌ Could not deliver to terminal "
-                       "(dtach socket missing or unresponsive)",
+                       "(tmux pane missing or unresponsive)",
                        thread_id=thread_id, seconds=8)
-            mirror_mgr.set_dtach_sock(mirror.csid, None)
+            mirror_mgr.set_tmux_target(mirror.csid, None, None)
+        else:
+            # Remember this msg so the JSONL follower can swap 👀 → 👍
+            # once claude actually replies (proves end-to-end delivery,
+            # not just send-keys success).
+            mirror.pending_user_msg_id = msg_id
         audit.log("mirror_input", text[:200], sid=mirror.csid)
         return
 
