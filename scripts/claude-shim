@@ -24,8 +24,25 @@ for d in $PATH; do
 done
 IFS="$old_IFS"
 
+# Fallback: Claude Code installs versioned binaries under
+# ~/.local/share/claude/versions/. If PATH doesn't have a non-shim
+# claude (e.g. the shim replaced the only claude symlink), pick the
+# highest-versioned binary from that directory. Survives self-update
+# because new versions land alongside old ones.
 if [ -z "$real_claude" ]; then
-    echo "claude-shim: no real claude binary found on PATH (after skipping $self)" >&2
+    versions_dir="$HOME/.local/share/claude/versions"
+    if [ -d "$versions_dir" ]; then
+        for cand in $(ls -1v "$versions_dir" 2>/dev/null | tac); do
+            full="$versions_dir/$cand"
+            [ -x "$full" ] || continue
+            real_claude="$full"
+            break
+        done
+    fi
+fi
+
+if [ -z "$real_claude" ]; then
+    echo "claude-shim: no real claude binary found on PATH or in $HOME/.local/share/claude/versions" >&2
     exit 127
 fi
 
