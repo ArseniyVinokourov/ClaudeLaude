@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# ClaudeLaude shim — routes interactive `claude` runs through dtach
+# so the bot can mirror the session (input via dtach socket, output
+# via JSONL follower). Non-interactive runs (-p, piped, --version,
+# --help, ...) are forwarded to the real claude binary unchanged.
+#
+# Installed by setup.sh as ~/.local/bin/claude (transparent shim) or
+# ~/.local/bin/claude-bot (explicit wrapper). The behavior is the same
+# in both cases — the script finds the next `claude` on PATH that is
+# NOT itself.
+set -euo pipefail
+
+self="$(readlink -f "$0")"
+real_claude=""
+old_IFS="$IFS"
+IFS=:
+for d in $PATH; do
+    candidate="$d/claude"
+    [ -x "$candidate" ] || continue
+    cand_resolved="$(readlink -f "$candidate" 2>/dev/null || echo "$candidate")"
+    [ "$cand_resolved" = "$self" ] && continue
+    real_claude="$candidate"
+    break
+done
+IFS="$old_IFS"
+
+# Fallback: Claude Code installs versioned binaries under
+# ~/.local/share/claude/versions/. If PATH doesn't have a non-shim
+# claude (e.g. the shim replaced the only claude symlink), pick the
+# highest-versioned binary from that directory. Survives self-update
+# because new versions land alongside old ones.
+if [ -z "$real_claude" ]; then
+    versions_dir="$HOME/.local/share/claude/versions"
+    if [ -d "$versions_dir" ]; then
+        for cand in $(ls -1v "$versions_dir" 2>/dev/null | tac); do
+            full="$versions_dir/$cand"
+            [ -x "$full" ] || continue
+            real_claude="$full"
+            break
+        done
+    fi
+fi
+
+if [ -z "$real_claude" ]; then
+    echo "claude-shim: no real claude binary found on PATH or in $HOME/.local/share/claude/versions" >&2
+    exit 127
+fi
+
+# Decide whether this invocation should be wrapped.
+is_interactive=1
+[ -t 0 ] || is_interactive=0
+for arg in "$@"; do
+    case "$arg" in
+        -p|--print|--version|-V|--help|-h)
+            is_interactive=0
+            ;;
+    esac
+done
+
+if [ "$is_interactive" = "0" ] || ! command -v dtach >/dev/null 2>&1; then
+    exec "$real_claude" "$@"
+fi
+
+# Allocate (or reuse) a per-shell dtach socket. $$ is this shim's
+# pid; each new terminal gets its own socket. The socket path is
+# exported so the /bot mirror slash command can pick it up.
+sock="${BOT_DTACH_SOCK:-/tmp/claude-bot-$$.sock}"
+export BOT_DTACH_SOCK="$sock"
+export BOT_HOOK_PORT="${BOT_HOOK_PORT:-9853}"
+trap 'rm -f "$sock"' EXIT
+exec dtach -A "$sock" "$real_claude" "$@"
