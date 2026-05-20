@@ -82,6 +82,12 @@ def bot(bot_env, monkeypatch: pytest.MonkeyPatch):
     # Stub auto-rename — it spawns its own claude subprocess via shell.
     monkeypatch.setattr(bot_mod, "_auto_rename_topic", lambda *a, **kw: None)
 
+    # Stub configure_tmux_session — it shells out to real tmux, but
+    # the global subprocess.Popen has been replaced with FakeClaudeFactory
+    # which only knows how to spawn a fake claude session, not tmux.
+    monkeypatch.setattr(bot_mod, "configure_tmux_session",
+                        lambda *a, **kw: None)
+
     # Stub _ephemeral so the auto-delete daemon thread doesn't outlive the
     # test: with the real impl, time.sleep(seconds) wakes up after the
     # monkeypatch is reverted and the deleteMessage call hits real Telegram.

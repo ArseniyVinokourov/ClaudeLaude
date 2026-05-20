@@ -61,6 +61,32 @@ def push_to_tmux(socket: str | None, pane: str,
         return False
 
 
+def configure_tmux_session(socket: str | None, pane: str | None,
+                           timeout: float = 2.0) -> None:
+    """Apply mirror-friendly options to the tmux session that owns `pane`.
+
+    Hides the status bar, enables mouse, and bumps scrollback to 100k.
+    These match the `claude()` wrapper installed by setup.sh, so the
+    experience is the same whether the owner used the wrapper or a
+    bare `tmux new -s mirror claude`. Best-effort: silent on errors.
+    """
+    if not pane or not _TMUX_BIN:
+        return
+    base = [_TMUX_BIN]
+    if socket:
+        base += ["-S", socket]
+    for opt, val in (("status", "off"),
+                     ("mouse", "on"),
+                     ("history-limit", "100000")):
+        try:
+            subprocess.run(
+                base + ["set-option", "-t", pane, opt, val],
+                timeout=timeout, capture_output=True,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+
 def tmux_pane_alive(socket: str | None, pane: str,
                     timeout: float = 2.0) -> bool:
     """Probe whether a given tmux pane still exists on the given server.
@@ -113,6 +139,33 @@ class TerminalMirror:
     # claude posts an assistant reply (so the bot can swap 👀 → 👍).
     pending_user_msg_id: int | None = field(default=None, repr=False)
     follower: threading.Thread | None = field(default=None, repr=False)
+    # Texts pushed into the pane via TG within the last few seconds.
+    # Used to suppress the JSONL echo that would otherwise duplicate
+    # the owner's own message back into the topic they sent it from.
+    _recent_injected: list = field(default_factory=list, repr=False)
+    _recent_lock: threading.Lock = field(default_factory=threading.Lock,
+                                         repr=False)
+
+    def note_injection(self, text: str) -> None:
+        """Record that `text` was just pushed into the pane from TG."""
+        with self._recent_lock:
+            self._recent_injected.append((text, time.time()))
+            if len(self._recent_injected) > 32:
+                del self._recent_injected[0]
+
+    def consume_recent_echo(self, text: str, ttl: float = 30.0) -> bool:
+        """Return True (and pop the entry) if `text` was injected recently.
+        Stale entries (> ttl seconds) are evicted on every call."""
+        now = time.time()
+        with self._recent_lock:
+            while (self._recent_injected
+                   and now - self._recent_injected[0][1] > ttl):
+                self._recent_injected.pop(0)
+            for i, (t, _ts) in enumerate(self._recent_injected):
+                if t == text:
+                    del self._recent_injected[i]
+                    return True
+        return False
 
 
 class TerminalMirrorManager:
@@ -145,6 +198,16 @@ class TerminalMirrorManager:
                 tmux_pane=tmux_pane or None,
                 jsonl_path=jsonl_path_for(csid, cwd),
             )
+            # Skip JSONL backfill: when /bot mirror is invoked mid-session
+            # the transcript may already contain dozens of past events.
+            # Projecting them all hammers TG (429 → 24-second backoff
+            # blocks the follower). The owner can still scroll the
+            # terminal for history.
+            try:
+                if os.path.exists(m.jsonl_path):
+                    m.last_offset = os.path.getsize(m.jsonl_path)
+            except OSError:
+                pass
             self._mirrors[csid] = m
             self._topic_map[topic_id] = csid
         self._persist()

@@ -1677,3 +1677,237 @@ def test_mirror_persist_and_restore(bot_env, tmp_path):
     assert restored.topic_id == 555
     assert restored.tmux_socket == "/tmp/tmux-1000/default"
     assert restored.tmux_pane == "%9"
+
+
+def test_mirror_register_skips_pre_existing_history(bot, tmp_path):
+    """When /bot mirror is invoked mid-session the JSONL transcript may
+    already hold dozens of past events. The new mirror must seek to EOF
+    and only project events appended AFTER registration — otherwise the
+    initial burst trips TG rate limits and stalls the follower."""
+    import json as _json
+    import time as _time
+    csid = "mirror-test-backfill-skip"
+    cwd = str(tmp_path / "mirror_project_backfill")
+    (tmp_path / "mirror_project_backfill").mkdir()
+    jp = _make_fake_jsonl(tmp_path, csid, cwd)
+    try:
+        # Pre-populate the JSONL with history that should NOT reach TG.
+        with open(jp, "w") as f:
+            for stale in ("stale-A", "stale-B", "stale-C"):
+                f.write(_json.dumps({
+                    "type": "assistant",
+                    "message": {"content": [{"type": "text",
+                                             "text": stale}]},
+                }) + "\n")
+
+        bot.mod.on_open_in_bot(csid, cwd, None, None)
+        m = bot.mod.mirror_mgr.by_csid(csid)
+        assert m is not None
+
+        # Append one new event after registration; only this one should
+        # reach the topic.
+        with open(jp, "a") as f:
+            f.write(_json.dumps({
+                "type": "assistant",
+                "message": {"content": [{"type": "text",
+                                         "text": "post-register-FRESH"}]},
+            }) + "\n")
+
+        deadline = _time.time() + 2.5
+        fresh_hit = False
+        while _time.time() < deadline:
+            for params in bot.tg.calls_of("sendMessage"):
+                if (params.get("message_thread_id") == m.topic_id
+                        and "post-register-FRESH" in params.get("text", "")):
+                    fresh_hit = True
+                    break
+            if fresh_hit:
+                break
+            _time.sleep(0.05)
+        assert fresh_hit, "fresh post-register event must be projected"
+
+        stale_hits = [
+            p for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == m.topic_id
+            and any(s in p.get("text", "")
+                    for s in ("stale-A", "stale-B", "stale-C"))
+        ]
+        assert not stale_hits, (
+            f"pre-register history must NOT be projected; "
+            f"got: {stale_hits}")
+    finally:
+        bot.mod.mirror_mgr.unregister(csid)
+        try:
+            jp.unlink()
+            jp.parent.rmdir()
+        except OSError:
+            pass
+
+
+def test_mirror_suppresses_tg_echo(bot, tmp_path, monkeypatch):
+    """When the owner types into the mirror topic, the text rides
+    send-keys into the pane → claude logs it as a `user` event → the
+    follower must NOT project it back as a blockquote (duplicate)."""
+    import json as _json
+    import time as _time
+    csid = "mirror-test-echo-suppress"
+    cwd = str(tmp_path / "mirror_project_echo")
+    (tmp_path / "mirror_project_echo").mkdir()
+    jp = _make_fake_jsonl(tmp_path, csid, cwd)
+
+    monkeypatch.setattr(
+        bot.mod, "push_to_tmux",
+        lambda sock, pane, text, **kw: True,
+    )
+
+    try:
+        bot.mod.on_open_in_bot(csid, cwd, "/tmp/tmux-1000/default", "%7")
+        m = bot.mod.mirror_mgr.by_csid(csid)
+        assert m is not None
+
+        # Owner types in the mirror topic — input bridge fires and
+        # notes the injection.
+        bot.tg.inject_update(text_update(
+            "ping from owner", owner_id=bot.owner_id,
+            forum_chat_id=bot.forum_chat_id,
+            thread_id=m.topic_id,
+        ))
+        _drain_updates(bot)
+
+        # Claude logs the same text as a `user` event in JSONL. This
+        # one must be SUPPRESSED (echo).
+        with open(jp, "a") as f:
+            f.write(_json.dumps({
+                "type": "user",
+                "message": {"content": "ping from owner"},
+            }) + "\n")
+            # An unrelated user event from another channel — must
+            # still be projected as a blockquote.
+            f.write(_json.dumps({
+                "type": "user",
+                "message": {"content": "typed-into-tmux-directly"},
+            }) + "\n")
+
+        deadline = _time.time() + 2.5
+        direct_hit = False
+        while _time.time() < deadline:
+            for params in bot.tg.calls_of("sendMessage"):
+                if (params.get("message_thread_id") == m.topic_id
+                        and "typed-into-tmux-directly"
+                            in params.get("text", "")):
+                    direct_hit = True
+                    break
+            if direct_hit:
+                break
+            _time.sleep(0.05)
+        assert direct_hit, "non-injected user event must be projected"
+
+        echo_hits = [
+            p for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == m.topic_id
+            and "ping from owner" in p.get("text", "")
+            and "blockquote" in p.get("text", "")
+        ]
+        assert not echo_hits, (
+            f"echo of TG-injected text must NOT be projected; "
+            f"got: {echo_hits}")
+    finally:
+        bot.mod.mirror_mgr.unregister(csid)
+        try:
+            jp.unlink()
+            jp.parent.rmdir()
+        except OSError:
+            pass
+
+
+def test_mirror_drops_slash_command_url_echo(bot, tmp_path):
+    """The /bot mirror slash command instructs Claude to print
+    `mirror: <topic_url>` plus a `tip:` / `output-only` line. That
+    assistant turn must NOT be projected — the owner already saw the
+    URL via the HTTP response."""
+    import json as _json
+    import time as _time
+    csid = "mirror-test-slashcmd-echo"
+    cwd = str(tmp_path / "mirror_project_slashcmd")
+    (tmp_path / "mirror_project_slashcmd").mkdir()
+    jp = _make_fake_jsonl(tmp_path, csid, cwd)
+    try:
+        bot.mod.on_open_in_bot(csid, cwd, None, None)
+        m = bot.mod.mirror_mgr.by_csid(csid)
+
+        with open(jp, "a") as f:
+            f.write(_json.dumps({
+                "type": "assistant",
+                "message": {"content": [{
+                    "type": "text",
+                    "text": (f"mirror: https://t.me/c/123/{m.topic_id}\n"
+                             f"output-only (claude is not inside tmux)"),
+                }]},
+            }) + "\n")
+            f.write(_json.dumps({
+                "type": "assistant",
+                "message": {"content": [{
+                    "type": "text",
+                    "text": "regular reply please project me",
+                }]},
+            }) + "\n")
+
+        deadline = _time.time() + 2.5
+        regular_hit = False
+        while _time.time() < deadline:
+            for params in bot.tg.calls_of("sendMessage"):
+                if (params.get("message_thread_id") == m.topic_id
+                        and "regular reply please project me"
+                            in params.get("text", "")):
+                    regular_hit = True
+                    break
+            if regular_hit:
+                break
+            _time.sleep(0.05)
+        assert regular_hit, "regular assistant text must be projected"
+
+        slashcmd_hits = [
+            p for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == m.topic_id
+            and "mirror: https://t.me/c/" in p.get("text", "")
+        ]
+        assert not slashcmd_hits, (
+            f"slash-command URL echo must NOT be projected; "
+            f"got: {slashcmd_hits}")
+    finally:
+        bot.mod.mirror_mgr.unregister(csid)
+        try:
+            jp.unlink()
+            jp.parent.rmdir()
+        except OSError:
+            pass
+
+
+def test_configure_tmux_session_runs_three_set_options(monkeypatch):
+    """configure_tmux_session must shell out to `tmux set-option` three
+    times: status off, mouse on, history-limit 100000 — matching what
+    setup.sh's `claude()` wrapper would have set up."""
+    import terminal_mirror as tm
+    calls: list[list[str]] = []
+
+    class _R:
+        returncode = 0
+
+    def _fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return _R()
+
+    monkeypatch.setattr(tm.subprocess, "run", _fake_run)
+    monkeypatch.setattr(tm, "_TMUX_BIN", "/usr/bin/tmux")
+    tm.configure_tmux_session("/tmp/tmux-1000/default", "%3")
+    suffixes = [tuple(c[-3:]) for c in calls]
+    assert ("status", "off", "%3") not in suffixes  # arg order check
+    # Real assertion: each invocation ends with set-option -t %3 <opt> <val>
+    flat = [(c[-2], c[-1]) for c in calls]
+    assert ("status", "off") in flat
+    assert ("mouse", "on") in flat
+    assert ("history-limit", "100000") in flat
+    # Every call routes via the explicit -S socket
+    for c in calls:
+        assert "-S" in c
+        assert "/tmp/tmux-1000/default" in c

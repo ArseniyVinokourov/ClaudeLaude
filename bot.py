@@ -29,7 +29,8 @@ import telegram as tg
 from sessions import MODE_PRESETS, Session, SessionManager
 from hooks import HookBridge
 from terminal_mirror import (
-    TerminalMirrorManager, push_to_tmux, tmux_pane_alive,
+    TerminalMirrorManager, configure_tmux_session,
+    push_to_tmux, tmux_pane_alive,
 )
 
 # ── state ────────────────────────────────────────────────────────────
@@ -2316,6 +2317,11 @@ def on_mirror_event(mirror, event):
             return
         if re.search(r'\nARGUMENTS:\s+\S', text):
             return
+        # Echo suppression: if this text was just pushed into the pane
+        # from the same mirror topic, the TG message is already visible
+        # there — projecting another `👤 …` blockquote would duplicate.
+        if mirror.consume_recent_echo(text):
+            return
         tg.send(f"<blockquote>\U0001f464 {tg.esc(text[:3000])}</blockquote>",
                 fid, thread_id=mirror.topic_id)
         return
@@ -2339,6 +2345,12 @@ def on_mirror_event(mirror, event):
                 if not _is_mirror_noisy_tool(tool, inp):
                     tool_lines.append(_compact_tool_msg(tool, inp))
         text = "".join(text_parts).strip()
+        # Drop the /bot mirror echo: its assistant turn just prints
+        # `mirror: <topic_url>` plus a `tip:` / `output-only` line —
+        # info the owner already sees via the HTTP response. Projecting
+        # it back into the topic it created produces visual noise.
+        if text.startswith("mirror: https://t.me/c/"):
+            text = ""
         if text:
             tg.send_long(text, fid, thread_id=mirror.topic_id,
                          markdown=True)
@@ -2393,6 +2405,8 @@ def on_open_in_bot(csid, cwd, tmux_socket, tmux_pane):
         if tmux_pane and (existing.tmux_pane != tmux_pane
                           or existing.tmux_socket != tmux_socket):
             mirror_mgr.set_tmux_target(csid, tmux_socket, tmux_pane)
+        if tmux_pane:
+            configure_tmux_session(tmux_socket, tmux_pane)
         return {"status": "ok", "topic_url": url, "existing": True}
     name = os.path.basename(cwd.rstrip("/")) or "terminal"
     ts = time.strftime("%H:%M")
@@ -2410,6 +2424,8 @@ def on_open_in_bot(csid, cwd, tmux_socket, tmux_pane):
     with state.lock:
         state.topic_labels[topic_id] = label
     m = mirror_mgr.register(csid, cwd, topic_id, tmux_socket, tmux_pane)
+    if tmux_pane:
+        configure_tmux_session(tmux_socket, tmux_pane)
     if not tmux_pane:
         # Only worth saying when input is NOT bridged — the default
         # working case stays silent so the topic opens straight on
@@ -2794,6 +2810,9 @@ def _handle_update(u):
             # once claude actually replies (proves end-to-end delivery,
             # not just send-keys success).
             mirror.pending_user_msg_id = msg_id
+            # Mark the text so the follower's user-event projection
+            # suppresses the echo back into this same topic.
+            mirror.note_injection(text)
         audit.log("mirror_input", text[:200], sid=mirror.csid)
         return
 
