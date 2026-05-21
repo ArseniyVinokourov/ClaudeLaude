@@ -61,32 +61,6 @@ def push_to_tmux(socket: str | None, pane: str,
         return False
 
 
-def configure_tmux_session(socket: str | None, pane: str | None,
-                           timeout: float = 2.0) -> None:
-    """Apply mirror-friendly options to the tmux session that owns `pane`.
-
-    Hides the status bar, enables mouse, and bumps scrollback to 100k.
-    These match the `claude()` wrapper installed by setup.sh, so the
-    experience is the same whether the owner used the wrapper or a
-    bare `tmux new -s mirror claude`. Best-effort: silent on errors.
-    """
-    if not pane or not _TMUX_BIN:
-        return
-    base = [_TMUX_BIN]
-    if socket:
-        base += ["-S", socket]
-    for opt, val in (("status", "off"),
-                     ("mouse", "on"),
-                     ("history-limit", "100000")):
-        try:
-            subprocess.run(
-                base + ["set-option", "-t", pane, opt, val],
-                timeout=timeout, capture_output=True,
-            )
-        except (subprocess.TimeoutExpired, OSError):
-            pass
-
-
 def tmux_pane_alive(socket: str | None, pane: str,
                     timeout: float = 2.0) -> bool:
     """Probe whether a given tmux pane still exists on the given server.
@@ -111,6 +85,28 @@ def tmux_pane_alive(socket: str | None, pane: str,
         return pane in ids
     except (subprocess.TimeoutExpired, OSError):
         return False
+
+
+def _tail_offset(path: str, max_bytes: int) -> int:
+    """Return a byte offset N bytes before EOF, snapped to the next
+    newline. Used to start the JSONL follower at the tail of an
+    existing transcript without spamming the topic with the full
+    history. If the file is smaller than max_bytes, returns 0."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return 0
+    if size <= max_bytes:
+        return 0
+    seek = size - max_bytes
+    try:
+        with open(path, "rb") as f:
+            f.seek(seek)
+            # Skip whatever partial line we landed in the middle of.
+            f.readline()
+            return f.tell()
+    except OSError:
+        return 0
 
 
 def jsonl_path_for(csid: str, cwd: str) -> str:
@@ -198,14 +194,15 @@ class TerminalMirrorManager:
                 tmux_pane=tmux_pane or None,
                 jsonl_path=jsonl_path_for(csid, cwd),
             )
-            # Skip JSONL backfill: when /bot mirror is invoked mid-session
-            # the transcript may already contain dozens of past events.
-            # Projecting them all hammers TG (429 → 24-second backoff
-            # blocks the follower). The owner can still scroll the
-            # terminal for history.
+            # Backfill the tail of the transcript so the topic isn't
+            # visually empty when it opens — but only the last ~8 KB
+            # (roughly the last 10-15 events). Combined with
+            # gate_send()'s 1-msg/s throttle this stays under TG's
+            # per-chat rate limit. The full older history stays
+            # accessible in the terminal scrollback.
             try:
                 if os.path.exists(m.jsonl_path):
-                    m.last_offset = os.path.getsize(m.jsonl_path)
+                    m.last_offset = _tail_offset(m.jsonl_path, 8000)
             except OSError:
                 pass
             self._mirrors[csid] = m
@@ -378,21 +375,40 @@ class TerminalMirrorManager:
                 records = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             return
+        kept = 0
+        dropped = 0
         for r in records:
             csid = r.get("csid")
             cwd = r.get("cwd", "")
             topic_id = r.get("topic_id")
             if not csid or not topic_id:
+                dropped += 1
+                continue
+            tmux_pane = r.get("tmux_pane") or None
+            tmux_socket = r.get("tmux_socket") or None
+            # A mirror persisted WITH a tmux pane but whose pane no
+            # longer exists is dead — the terminal exited. Drop the
+            # record on restore so the follower thread and healthcheck
+            # probes don't burn rate budget chasing a corpse. (Mirrors
+            # that were registered output-only — tmux_pane=None from
+            # the start — keep their record; they may still be useful
+            # for owner-side history.)
+            if tmux_pane and not tmux_pane_alive(tmux_socket, tmux_pane):
+                dropped += 1
                 continue
             m = TerminalMirror(
                 csid=csid, cwd=cwd, topic_id=topic_id,
-                tmux_socket=r.get("tmux_socket") or None,
-                tmux_pane=r.get("tmux_pane") or None,
+                tmux_socket=tmux_socket,
+                tmux_pane=tmux_pane,
                 jsonl_path=r.get("jsonl_path") or jsonl_path_for(csid, cwd),
                 last_offset=int(r.get("last_offset") or 0),
             )
             self._mirrors[csid] = m
             self._topic_map[topic_id] = csid
-        if records:
-            print(f"[mirror persist] restored {len(records)} mirror(s)",
-                  flush=True)
+            kept += 1
+        if kept or dropped:
+            print(f"[mirror persist] restored {kept} mirror(s), "
+                  f"dropped {dropped} dead", flush=True)
+        if dropped:
+            # Rewrite the persist file so the drop sticks.
+            self._persist()

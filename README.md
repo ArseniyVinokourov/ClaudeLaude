@@ -43,7 +43,7 @@ What it does
  - /display flips a topic between mobile (lists) and desktop (tables).
  - Unknown /commands are forwarded as plain text to the active
    session, so Claude's own slash commands keep working.
- - /bot mirror inside a terminal Claude session opens a Telegram
+ - /bot-mirror inside a terminal Claude session opens a Telegram
    topic for it: assistant output streams in, and you can type back
    into the running terminal from your phone (see docs/mirror.md).
 

@@ -1,4 +1,4 @@
-# Terminal mirror — `/bot mirror`
+# Terminal mirror — `/bot-mirror`
 
 Bridge a terminal Claude session to a Telegram topic. Read the
 conversation from your phone; type from the topic into the running
@@ -61,7 +61,7 @@ The wrapper also detects that you're already inside a tmux pane
 ## Using it
 
 1. Start Claude in any terminal: `claude` (the wrapper does the rest).
-2. Type `/bot mirror` inside Claude.
+2. Type `/bot-mirror` inside Claude.
 3. Claude calls the local bot's `/hook/open_in_bot` endpoint, the bot
    creates a forum topic in your group, and prints the URL.
 4. Open the URL on your phone. Output streams in.
@@ -70,7 +70,7 @@ The wrapper also detects that you're already inside a tmux pane
    as keystrokes — you see the characters appear in the input box and
    the line auto-submits.
 
-A second `/bot mirror` for the same session returns the same topic —
+A second `/bot-mirror` for the same session returns the same topic —
 the linkage is idempotent. If you re-launched terminal Claude (new
 tmux pane), it refreshes the input binding automatically.
 
@@ -83,6 +83,27 @@ reports this on registration and surfaces an ephemeral "Output-only
 mirror" notice if you try to type from Telegram. Output still works
 normally.
 
+## Running tmux manually (without the wrapper)
+
+You can skip the wrapper entirely and just launch Claude in a tmux
+session yourself: `tmux new -s mirror claude`. The mirror works the
+same way — the bot reads `$TMUX`/`$TMUX_PANE` from the slash-command
+context.
+
+If you go this route, you'll probably want to hide tmux's default
+green status bar (which the wrapper disables automatically). Add this
+to `~/.tmux.conf`:
+
+```
+set -g status off
+```
+
+The bot deliberately doesn't toggle this for you — calling
+`set-option status off` on a live session sends a SIGWINCH that makes
+Claude's TUI redraw and shuffle its visible scrollback, which is
+disorienting mid-conversation. Setting it once in your config
+prevents the bar from ever appearing, so no resize-and-redraw cycle.
+
 ## Lifecycle
 
 The bot's healthcheck (every 30 s) detects:
@@ -90,8 +111,10 @@ The bot's healthcheck (every 30 s) detects:
 - The mirror topic was deleted in Telegram → unregister silently.
 - The tmux pane disappeared (terminal exited or detached) → flip the
   mirror to output-only with a notice.
-- The JSONL hasn't been touched for 30 minutes → assume the terminal
-  session is idle/ended, post a notice, unregister.
+
+A long idle pause between turns is *not* a kill signal — the mirror
+stays alive as long as you want it to. Unregister it explicitly by
+deleting the topic in Telegram.
 
 Mirrors persist in `.mirrors.json` and are restored on bot restart.
 
@@ -114,7 +137,7 @@ tmux involved.
 
 ## Troubleshooting
 
-- "I typed `/bot mirror` and got 'connection refused'." — the bot
+- "I typed `/bot-mirror` and got 'connection refused'." — the bot
   isn't running. Start it: `cd <repo> && .venv/bin/python bot.py`.
 - "Mirror is output-only and I want input." — install tmux
   (`apt install tmux` / `brew install tmux`), re-run `./setup.sh`,

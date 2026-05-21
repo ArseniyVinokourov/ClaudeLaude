@@ -29,8 +29,7 @@ import telegram as tg
 from sessions import MODE_PRESETS, Session, SessionManager
 from hooks import HookBridge
 from terminal_mirror import (
-    TerminalMirrorManager, configure_tmux_session,
-    push_to_tmux, tmux_pane_alive,
+    TerminalMirrorManager, push_to_tmux, tmux_pane_alive,
 )
 
 # ── state ────────────────────────────────────────────────────────────
@@ -2293,6 +2292,12 @@ def on_mirror_event(mirror, event):
     etype = event.get("type", "")
 
     if etype == "user":
+        # System-injected user events (slash-command bodies, hook
+        # outputs, etc.) carry `isMeta: true` at the top level. Real
+        # user input is `isMeta: None/false`. Skip meta events
+        # universally — they are not what the owner typed.
+        if event.get("isMeta"):
+            return
         msg = event.get("message") or {}
         content = msg.get("content")
         text = ""
@@ -2307,15 +2312,12 @@ def on_mirror_event(mirror, event):
         text = text.strip()
         if not text:
             return
-        # Skip slash-command boilerplate Claude Code injects as a user
-        # message: the <command-*> wrapper tags (event 1) and the body
-        # of ~/.claude/commands/<name>.md plus the trailing ARGUMENTS:
-        # line (event 2). Neither is real user input.
+        # Belt-and-braces for older Claude Code builds that don't set
+        # isMeta yet: the wrapper-tags event still has the literal
+        # <command-*> markers.
         if ("<command-message>" in text
                 or "<command-name>" in text
                 or "<command-args>" in text):
-            return
-        if re.search(r'\nARGUMENTS:\s+\S', text):
             return
         # Echo suppression: if this text was just pushed into the pane
         # from the same mirror topic, the TG message is already visible
@@ -2345,7 +2347,7 @@ def on_mirror_event(mirror, event):
                 if not _is_mirror_noisy_tool(tool, inp):
                     tool_lines.append(_compact_tool_msg(tool, inp))
         text = "".join(text_parts).strip()
-        # Drop the /bot mirror echo: its assistant turn just prints
+        # Drop the /bot-mirror echo: its assistant turn just prints
         # `mirror: <topic_url>` plus a `tip:` / `output-only` line —
         # info the owner already sees via the HTTP response. Projecting
         # it back into the topic it created produces visual noise.
@@ -2405,9 +2407,8 @@ def on_open_in_bot(csid, cwd, tmux_socket, tmux_pane):
         if tmux_pane and (existing.tmux_pane != tmux_pane
                           or existing.tmux_socket != tmux_socket):
             mirror_mgr.set_tmux_target(csid, tmux_socket, tmux_pane)
-        if tmux_pane:
-            configure_tmux_session(tmux_socket, tmux_pane)
-        return {"status": "ok", "topic_url": url, "existing": True}
+        return {"status": "ok", "topic_url": url, "existing": True,
+                "input_bridge": bool(existing.tmux_pane)}
     name = os.path.basename(cwd.rstrip("/")) or "terminal"
     ts = time.strftime("%H:%M")
     # Topic icon is the 💻 terminal emoji (icon_custom_emoji_id), so we
@@ -2424,12 +2425,17 @@ def on_open_in_bot(csid, cwd, tmux_socket, tmux_pane):
     with state.lock:
         state.topic_labels[topic_id] = label
     m = mirror_mgr.register(csid, cwd, topic_id, tmux_socket, tmux_pane)
+    # Welcome so the freshly-created topic isn't visually empty (the
+    # slash-command URL echo is filtered out of the JSONL projection,
+    # so without this banner the user sees nothing until claude or the
+    # owner types something new).
     if tmux_pane:
-        configure_tmux_session(tmux_socket, tmux_pane)
-    if not tmux_pane:
-        # Only worth saying when input is NOT bridged — the default
-        # working case stays silent so the topic opens straight on
-        # the live transcript.
+        send_to_topic(
+            topic_id,
+            "\U0001fa9e Mirror attached. Type in this topic — keystrokes "
+            "go into the terminal pane.",
+        )
+    else:
         send_to_topic(
             topic_id,
             "\U0001f50c Mirror is output-only — start your terminal "
@@ -2437,7 +2443,8 @@ def on_open_in_bot(csid, cwd, tmux_socket, tmux_pane):
         )
     mirror_mgr.start_follower(m)
     url = _topic_url(topic_id)
-    return {"status": "ok", "topic_url": url, "existing": False}
+    return {"status": "ok", "topic_url": url, "existing": False,
+            "input_bridge": bool(tmux_pane)}
 
 
 bridge = HookBridge(
@@ -2504,11 +2511,12 @@ def _topic_healthcheck():
             if not tg.topic_alive(fid, session.topic_id, name=label):
                 _invalidate_and_stop(session, "topic deleted")
 
-        # Mirrors: probe topic existence, tmux pane presence, and
-        # JSONL freshness. A mirror with a vanished topic is dropped;
-        # a vanished tmux pane flips the mirror to output-only;
-        # a JSONL untouched for > 30 min implies the terminal session
-        # has ended.
+        # Mirrors: probe topic existence and tmux pane presence only.
+        # A mirror with a vanished topic is dropped; a vanished tmux
+        # pane flips the mirror to output-only. We deliberately do NOT
+        # close on JSONL idleness — a long pause between turns is the
+        # owner's choice (per [[no-hard-ceiling]]), not a signal to
+        # tear down the mirror behind their back.
         for mirror in mirror_mgr.list():
             if not mirror.alive:
                 continue
@@ -2527,16 +2535,6 @@ def _topic_healthcheck():
                     mirror.topic_id,
                     "\U0001f50c Terminal closed — mirror is now output-only")
                 mirror_mgr.set_tmux_target(mirror.csid, None, None)
-            try:
-                jmtime = os.path.getmtime(mirror.jsonl_path)
-            except OSError:
-                jmtime = 0
-            if jmtime and time.time() - jmtime > 1800:
-                send_to_topic(
-                    mirror.topic_id,
-                    "\U0001f50c Terminal session looks idle (no transcript "
-                    "activity in 30 min) — closing the mirror")
-                mirror_mgr.unregister(mirror.csid)
 
 
 def _cleanup_terminal_pending(csid: str):

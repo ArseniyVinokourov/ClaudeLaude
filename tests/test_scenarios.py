@@ -1592,6 +1592,32 @@ def test_mirror_register_idempotent(bot, tmp_path):
         bot.mod.mirror_mgr.unregister(csid)
 
 
+def test_mirror_response_input_bridge_flag(bot, tmp_path):
+    """Bot's open_in_bot response carries `input_bridge: bool` so the
+    slash command can branch on what the bot actually saw rather than
+    on its own (sometimes-empty) $TMUX_PANE check."""
+    csid_a = "mirror-bridge-on"
+    csid_b = "mirror-bridge-off"
+    cwd_a = str(tmp_path / "bridge_on")
+    cwd_b = str(tmp_path / "bridge_off")
+    (tmp_path / "bridge_on").mkdir()
+    (tmp_path / "bridge_off").mkdir()
+    try:
+        on_resp = bot.mod.on_open_in_bot(
+            csid_a, cwd_a, "/tmp/tmux-1000/default", "%5")
+        off_resp = bot.mod.on_open_in_bot(csid_b, cwd_b, None, None)
+        assert on_resp.get("input_bridge") is True, on_resp
+        assert off_resp.get("input_bridge") is False, off_resp
+        # On the existing-mirror return path the flag must still
+        # reflect actual tmux binding state.
+        on_resp_again = bot.mod.on_open_in_bot(
+            csid_a, cwd_a, "/tmp/tmux-1000/default", "%5")
+        assert on_resp_again.get("input_bridge") is True, on_resp_again
+    finally:
+        bot.mod.mirror_mgr.unregister(csid_a)
+        bot.mod.mirror_mgr.unregister(csid_b)
+
+
 def test_mirror_input_bridge_pushes_to_tmux(bot, tmp_path, monkeypatch):
     """Text typed in a mirror topic with tmux_pane set should be pushed
     via push_to_tmux. Output-only mirrors should refuse with an ephemeral."""
@@ -1659,11 +1685,14 @@ def test_mirror_input_bridge_output_only_rejects(bot, tmp_path, monkeypatch):
         bot.mod.mirror_mgr.unregister(csid)
 
 
-def test_mirror_persist_and_restore(bot_env, tmp_path):
+def test_mirror_persist_and_restore(bot_env, tmp_path, monkeypatch):
     """Mirror records survive a fresh TerminalMirrorManager instance."""
     import importlib
     import terminal_mirror as tm
     importlib.reload(tm)
+    # Restore-time pane liveness check would drop %9 (no real tmux
+    # server in the test); stub it to always-alive for this scenario.
+    monkeypatch.setattr(tm, "tmux_pane_alive", lambda *a, **kw: True)
     csid = "mirror-persist-1"
     cwd = str(tmp_path / "persist_project")
     (tmp_path / "persist_project").mkdir()
@@ -1679,62 +1708,86 @@ def test_mirror_persist_and_restore(bot_env, tmp_path):
     assert restored.tmux_pane == "%9"
 
 
-def test_mirror_register_skips_pre_existing_history(bot, tmp_path):
-    """When /bot mirror is invoked mid-session the JSONL transcript may
-    already hold dozens of past events. The new mirror must seek to EOF
-    and only project events appended AFTER registration — otherwise the
-    initial burst trips TG rate limits and stalls the follower."""
+def test_mirror_register_backfills_only_tail(bot, tmp_path):
+    """When /bot-mirror is invoked mid-session the JSONL transcript may
+    already hold dozens of past events. The new mirror should backfill
+    only the tail (last few events) so the topic has fresh context but
+    doesn't spam the full older history. Older events past the tail
+    window MUST stay out of the topic."""
     import json as _json
     import time as _time
-    csid = "mirror-test-backfill-skip"
+
+    csid = "mirror-test-backfill-tail"
     cwd = str(tmp_path / "mirror_project_backfill")
     (tmp_path / "mirror_project_backfill").mkdir()
     jp = _make_fake_jsonl(tmp_path, csid, cwd)
     try:
-        # Pre-populate the JSONL with history that should NOT reach TG.
+        # Pre-populate with >8KB of OLD history so it falls outside the
+        # tail window, then a couple recent events that should land.
+        # Each ancient event is ~3 KB → after 6 events the window has
+        # already rolled past them.
+        big_filler = "x" * 3000
         with open(jp, "w") as f:
-            for stale in ("stale-A", "stale-B", "stale-C"):
+            for i in range(6):
                 f.write(_json.dumps({
                     "type": "assistant",
-                    "message": {"content": [{"type": "text",
-                                             "text": stale}]},
+                    "message": {"content": [{
+                        "type": "text",
+                        "text": f"ancient-{i:02d}-{big_filler}",
+                    }]},
                 }) + "\n")
+            # Last 2 events — small, inside the 8 KB tail window.
+            f.write(_json.dumps({
+                "type": "assistant",
+                "message": {"content": [{"type": "text",
+                                         "text": "TAIL-recent-A"}]},
+            }) + "\n")
+            f.write(_json.dumps({
+                "type": "assistant",
+                "message": {"content": [{"type": "text",
+                                         "text": "TAIL-recent-B"}]},
+            }) + "\n")
 
         bot.mod.on_open_in_bot(csid, cwd, None, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
         assert m is not None
 
-        # Append one new event after registration; only this one should
-        # reach the topic.
+        # Append a brand-new event after registration.
         with open(jp, "a") as f:
             f.write(_json.dumps({
                 "type": "assistant",
                 "message": {"content": [{"type": "text",
-                                         "text": "post-register-FRESH"}]},
+                                         "text": "POST-FRESH"}]},
             }) + "\n")
 
         deadline = _time.time() + 2.5
-        fresh_hit = False
+        seen_fresh = False
         while _time.time() < deadline:
             for params in bot.tg.calls_of("sendMessage"):
                 if (params.get("message_thread_id") == m.topic_id
-                        and "post-register-FRESH" in params.get("text", "")):
-                    fresh_hit = True
+                        and "POST-FRESH" in params.get("text", "")):
+                    seen_fresh = True
                     break
-            if fresh_hit:
+            if seen_fresh:
                 break
             _time.sleep(0.05)
-        assert fresh_hit, "fresh post-register event must be projected"
+        assert seen_fresh, "fresh post-register event must be projected"
 
-        stale_hits = [
-            p for p in bot.tg.calls_of("sendMessage")
+        topic_texts = [
+            p.get("text", "")
+            for p in bot.tg.calls_of("sendMessage")
             if p.get("message_thread_id") == m.topic_id
-            and any(s in p.get("text", "")
-                    for s in ("stale-A", "stale-B", "stale-C"))
         ]
-        assert not stale_hits, (
-            f"pre-register history must NOT be projected; "
-            f"got: {stale_hits}")
+        # The earliest events (ancient-00, ancient-01) sit well outside
+        # the 8 KB tail window — they must NOT be projected.
+        for off_window in ("ancient-00", "ancient-01"):
+            assert not any(off_window in t for t in topic_texts), (
+                f"{off_window} is older than the tail window and must "
+                f"not reach the topic")
+
+        # The tail-recent ones SHOULD be projected (inside the window).
+        assert any("TAIL-recent-A" in t for t in topic_texts), topic_texts[-5:]
+        assert any("TAIL-recent-B" in t for t in topic_texts), topic_texts[-5:]
     finally:
         bot.mod.mirror_mgr.unregister(csid)
         try:
@@ -1821,7 +1874,7 @@ def test_mirror_suppresses_tg_echo(bot, tmp_path, monkeypatch):
 
 
 def test_mirror_drops_slash_command_url_echo(bot, tmp_path):
-    """The /bot mirror slash command instructs Claude to print
+    """The /bot-mirror slash command instructs Claude to print
     `mirror: <topic_url>` plus a `tip:` / `output-only` line. That
     assistant turn must NOT be projected — the owner already saw the
     URL via the HTTP response."""
@@ -1883,31 +1936,163 @@ def test_mirror_drops_slash_command_url_echo(bot, tmp_path):
             pass
 
 
-def test_configure_tmux_session_runs_three_set_options(monkeypatch):
-    """configure_tmux_session must shell out to `tmux set-option` three
-    times: status off, mouse on, history-limit 100000 — matching what
-    setup.sh's `claude()` wrapper would have set up."""
+def test_mirror_restore_drops_dead_tmux_panes(bot_env, tmp_path, monkeypatch):
+    """At bot restart, persisted mirrors whose tmux pane no longer
+    exists must be dropped — otherwise their followers and the
+    healthcheck loop burn TG rate budget probing topics for a
+    terminal that exited (rate-budget contention starves the active
+    mirror, backfill events get 429'd and never reach the topic).
+
+    Regression: 2026-05-21 — user had 4 alive mirrors and 4 zombie
+    ones from prior tests; rate-limit cascade hid backfill from a
+    fresh /bot-mirror. Verified by reverting the `tmux_pane_alive`
+    guard in `_restore` and watching this test fail."""
+    import importlib
+    import json as _json
     import terminal_mirror as tm
-    calls: list[list[str]] = []
+    importlib.reload(tm)
 
-    class _R:
-        returncode = 0
+    # Pretend tmux is installed but only ONE pane is alive.
+    def _fake_pane_alive(socket, pane, timeout=2.0):
+        return pane == "%alive"
+    monkeypatch.setattr(tm, "tmux_pane_alive", _fake_pane_alive)
 
-    def _fake_run(argv, **kwargs):
-        calls.append(list(argv))
-        return _R()
+    persist = tmp_path / ".mirrors.json"
+    persist.write_text(_json.dumps([
+        {"csid": "mirror-alive", "cwd": "/x", "topic_id": 1,
+         "tmux_socket": "/s", "tmux_pane": "%alive",
+         "jsonl_path": "/t/a.jsonl", "last_offset": 0},
+        {"csid": "mirror-dead", "cwd": "/x", "topic_id": 2,
+         "tmux_socket": "/s", "tmux_pane": "%dead",
+         "jsonl_path": "/t/d.jsonl", "last_offset": 0},
+        {"csid": "mirror-output-only", "cwd": "/x", "topic_id": 3,
+         "tmux_socket": None, "tmux_pane": None,
+         "jsonl_path": "/t/o.jsonl", "last_offset": 0},
+    ]))
+    monkeypatch.setattr(tm, "_PERSIST_PATH", str(persist))
 
-    monkeypatch.setattr(tm.subprocess, "run", _fake_run)
-    monkeypatch.setattr(tm, "_TMUX_BIN", "/usr/bin/tmux")
-    tm.configure_tmux_session("/tmp/tmux-1000/default", "%3")
-    suffixes = [tuple(c[-3:]) for c in calls]
-    assert ("status", "off", "%3") not in suffixes  # arg order check
-    # Real assertion: each invocation ends with set-option -t %3 <opt> <val>
-    flat = [(c[-2], c[-1]) for c in calls]
-    assert ("status", "off") in flat
-    assert ("mouse", "on") in flat
-    assert ("history-limit", "100000") in flat
-    # Every call routes via the explicit -S socket
-    for c in calls:
-        assert "-S" in c
-        assert "/tmp/tmux-1000/default" in c
+    mgr = tm.TerminalMirrorManager(lambda *a, **kw: None)
+
+    assert mgr.by_csid("mirror-alive") is not None, "alive must stay"
+    assert mgr.by_csid("mirror-dead") is None, (
+        "dead tmux pane must be dropped on restore")
+    assert mgr.by_csid("mirror-output-only") is not None, (
+        "output-only (pane=None from start) must stay — only "
+        "ex-bridged-but-now-dead is dropped")
+
+    # The persist file should reflect the drop.
+    on_disk = _json.loads(persist.read_text())
+    csids = {r["csid"] for r in on_disk}
+    assert csids == {"mirror-alive", "mirror-output-only"}, csids
+
+
+def test_mirror_drops_slash_command_body_via_is_meta(bot, tmp_path):
+    """When a custom slash command has no $ARGUMENTS (e.g. /bot-mirror),
+    Claude Code injects the command body as a USER event with
+    `isMeta: true` at the top level — there is no `ARGUMENTS:` trailer
+    to pattern-match on. Mirror projection must drop these meta events
+    so the topic isn't flooded with the markdown body of bot-mirror.md
+    (description, instructions, the entire bash block, etc).
+
+    Regression: this test was added 2026-05-21 after a screenshot of
+    the topic containing the literal `/bot-mirror` body. Verified by
+    reverting the `isMeta` guard once — this test fails — restoring it
+    — passes."""
+    import json as _json
+    import time as _time
+    csid = "mirror-test-ismeta-body"
+    cwd = str(tmp_path / "mirror_project_ismeta")
+    (tmp_path / "mirror_project_ismeta").mkdir()
+    jp = _make_fake_jsonl(tmp_path, csid, cwd)
+    try:
+        bot.mod.on_open_in_bot(csid, cwd, None, None)
+        m = bot.mod.mirror_mgr.by_csid(csid)
+
+        # Append the exact event shape Claude Code emits for the body
+        # of a no-args slash command: type=user + isMeta=True +
+        # message.content = markdown body.
+        body = (
+            "Mirror this terminal Claude session to a ClaudeLaude "
+            "Telegram topic.\nThe bot tails the JSONL transcript...\n"
+            "```bash\nPORT=\"${BOT_HOOK_PORT:-9853}\"\n...\n```\n"
+            "After running the Bash call, just print the captured "
+            "output as-is. SLASH_CMD_BODY_MARKER\n"
+        )
+        with open(jp, "a") as f:
+            f.write(_json.dumps({
+                "type": "user",
+                "isMeta": True,
+                "message": {"role": "user", "content": body},
+            }) + "\n")
+            # A real user message after the slash command — must STILL
+            # be projected.
+            f.write(_json.dumps({
+                "type": "user",
+                "message": {"role": "user", "content": "REAL_USER_INPUT"},
+            }) + "\n")
+
+        deadline = _time.time() + 2.5
+        real_hit = False
+        while _time.time() < deadline:
+            for params in bot.tg.calls_of("sendMessage"):
+                if (params.get("message_thread_id") == m.topic_id
+                        and "REAL_USER_INPUT" in params.get("text", "")):
+                    real_hit = True
+                    break
+            if real_hit:
+                break
+            _time.sleep(0.05)
+        assert real_hit, "real user input must be projected"
+
+        body_hits = [
+            p for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == m.topic_id
+            and "SLASH_CMD_BODY_MARKER" in p.get("text", "")
+        ]
+        assert not body_hits, (
+            f"slash-command body (isMeta=true) must NOT be projected; "
+            f"got: {body_hits}")
+    finally:
+        bot.mod.mirror_mgr.unregister(csid)
+        try:
+            jp.unlink()
+            jp.parent.rmdir()
+        except OSError:
+            pass
+
+
+def test_mirror_open_sends_welcome_message(bot, tmp_path):
+    """The freshly-created mirror topic must contain a single welcome
+    message — otherwise the topic looks empty (the slash-command URL
+    echo and the JSONL backfill are both filtered out, by design).
+    Phrasing branches on whether input bridge is available."""
+    csid_on = "mirror-welcome-bridged"
+    csid_off = "mirror-welcome-output-only"
+    cwd_on = str(tmp_path / "welcome_bridged")
+    cwd_off = str(tmp_path / "welcome_output_only")
+    (tmp_path / "welcome_bridged").mkdir()
+    (tmp_path / "welcome_output_only").mkdir()
+    try:
+        bot.mod.on_open_in_bot(
+            csid_on, cwd_on, "/tmp/tmux-1000/default", "%8")
+        m_on = bot.mod.mirror_mgr.by_csid(csid_on)
+        bridged = [
+            p.get("text", "")
+            for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == m_on.topic_id
+        ]
+        assert any("Mirror attached" in t for t in bridged), bridged
+        assert not any("output-only" in t.lower() for t in bridged), bridged
+
+        bot.mod.on_open_in_bot(csid_off, cwd_off, None, None)
+        m_off = bot.mod.mirror_mgr.by_csid(csid_off)
+        out_only = [
+            p.get("text", "")
+            for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == m_off.topic_id
+        ]
+        assert any("output-only" in t.lower() for t in out_only), out_only
+        assert not any("Mirror attached" in t for t in out_only), out_only
+    finally:
+        bot.mod.mirror_mgr.unregister(csid_on)
+        bot.mod.mirror_mgr.unregister(csid_off)

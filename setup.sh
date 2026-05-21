@@ -169,21 +169,23 @@ print('ok')
     ok "Claude Code hooks configured in $SETTINGS_FILE"
 fi
 
-# ── Claude slash command: /bot ───────────────────────────────────────
-bold "\n/bot mirror slash command"
-echo "Installs ~/.claude/commands/bot.md so you can run '/bot mirror'"
+# ── Claude slash command: /bot-mirror ────────────────────────────────
+bold "\n/bot-mirror slash command"
+echo "Installs ~/.claude/commands/bot-mirror.md so you can run /bot-mirror"
 echo "inside any Claude session to open a Telegram topic for it."
 echo ""
-read -rp "Install /bot mirror command? [Y/n]: " SETUP_BOT_CMD
+read -rp "Install /bot-mirror command? [Y/n]: " SETUP_BOT_CMD
 SETUP_BOT_CMD="${SETUP_BOT_CMD:-Y}"
 
 if [[ "$SETUP_BOT_CMD" =~ ^[Yy] ]]; then
-    CMD_SRC="$SCRIPT_DIR/scripts/claude_commands/bot.md"
+    CMD_SRC="$SCRIPT_DIR/scripts/claude_commands/bot-mirror.md"
     CMD_DST_DIR="$HOME/.claude/commands"
-    CMD_DST="$CMD_DST_DIR/bot.md"
+    CMD_DST="$CMD_DST_DIR/bot-mirror.md"
     if [ -f "$CMD_SRC" ]; then
         mkdir -p "$CMD_DST_DIR"
         cp "$CMD_SRC" "$CMD_DST"
+        # Drop the old `/bot mirror` name so the rename is clean.
+        rm -f "$CMD_DST_DIR/bot.md"
         ok "Installed $CMD_DST"
     else
         warn "Slash command source missing at $CMD_SRC — skipping"
@@ -264,7 +266,13 @@ claude() {
         cmd+=" $(printf '%q' "$a")"
     done
     if ! tmux has-session -t "$session_name" 2>/dev/null; then
-        tmux new-session -d -s "$session_name" "$cmd"
+        # Match initial pane size to the calling terminal so claude
+        # renders at the right size from frame one — no SIGWINCH on
+        # first attach, no garbled alt-screen reflow.
+        local cols rows
+        cols="${COLUMNS:-$(tput cols 2>/dev/null || echo 200)}"
+        rows="${LINES:-$(tput lines 2>/dev/null || echo 50)}"
+        tmux new-session -d -s "$session_name" -x "$cols" -y "$rows" "$cmd"
         tmux set-option -t "$session_name" status off >/dev/null 2>&1 || true
         tmux set-option -t "$session_name" mouse on >/dev/null 2>&1 || true
         tmux set-option -t "$session_name" history-limit 100000 >/dev/null 2>&1 || true
@@ -277,7 +285,7 @@ BASHRC_BLOCK
             echo "  Open a new terminal (or 'source ~/.bashrc') for it to take effect."
         fi
     else
-        ok "Skipping mirror. /bot mirror will run output-only when invoked."
+        ok "Skipping mirror. /bot-mirror will run output-only when invoked."
     fi
 fi
 
