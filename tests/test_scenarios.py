@@ -1536,7 +1536,7 @@ def test_mirror_register_creates_topic_and_starts_follower(bot, tmp_path):
     (tmp_path / "mirror_project_1").mkdir()
     jp = _make_fake_jsonl(tmp_path, csid, cwd)
     try:
-        result = bot.mod.on_open_in_bot(csid, cwd, None, None)
+        result = bot.mod.on_open_in_bot(csid, cwd, None)
         assert "topic_url" in result, result
         topic_calls = bot.tg.calls_of("createForumTopic")
         assert len(topic_calls) == 1, topic_calls
@@ -1583,8 +1583,8 @@ def test_mirror_register_idempotent(bot, tmp_path):
     cwd = str(tmp_path / "mirror_project_2")
     (tmp_path / "mirror_project_2").mkdir()
     try:
-        r1 = bot.mod.on_open_in_bot(csid, cwd, None, None)
-        r2 = bot.mod.on_open_in_bot(csid, cwd, None, None)
+        r1 = bot.mod.on_open_in_bot(csid, cwd, None)
+        r2 = bot.mod.on_open_in_bot(csid, cwd, None)
         assert r1.get("topic_url") == r2.get("topic_url")
         assert r2.get("existing") is True
         assert len(bot.tg.calls_of("createForumTopic")) == 1
@@ -1595,48 +1595,48 @@ def test_mirror_register_idempotent(bot, tmp_path):
 def test_mirror_response_input_bridge_flag(bot, tmp_path):
     """Bot's open_in_bot response carries `input_bridge: bool` so the
     slash command can branch on what the bot actually saw rather than
-    on its own (sometimes-empty) $TMUX_PANE check."""
+    on its own (sometimes-empty) socket-env check."""
     csid_a = "mirror-bridge-on"
     csid_b = "mirror-bridge-off"
     cwd_a = str(tmp_path / "bridge_on")
     cwd_b = str(tmp_path / "bridge_off")
     (tmp_path / "bridge_on").mkdir()
     (tmp_path / "bridge_off").mkdir()
+    sock = str(tmp_path / "fake.sock")
     try:
-        on_resp = bot.mod.on_open_in_bot(
-            csid_a, cwd_a, "/tmp/tmux-1000/default", "%5")
-        off_resp = bot.mod.on_open_in_bot(csid_b, cwd_b, None, None)
+        on_resp = bot.mod.on_open_in_bot(csid_a, cwd_a, sock)
+        off_resp = bot.mod.on_open_in_bot(csid_b, cwd_b, None)
         assert on_resp.get("input_bridge") is True, on_resp
         assert off_resp.get("input_bridge") is False, off_resp
         # On the existing-mirror return path the flag must still
-        # reflect actual tmux binding state.
-        on_resp_again = bot.mod.on_open_in_bot(
-            csid_a, cwd_a, "/tmp/tmux-1000/default", "%5")
+        # reflect actual dtach binding state.
+        on_resp_again = bot.mod.on_open_in_bot(csid_a, cwd_a, sock)
         assert on_resp_again.get("input_bridge") is True, on_resp_again
     finally:
         bot.mod.mirror_mgr.unregister(csid_a)
         bot.mod.mirror_mgr.unregister(csid_b)
 
 
-def test_mirror_input_bridge_pushes_to_tmux(bot, tmp_path, monkeypatch):
-    """Text typed in a mirror topic with tmux_pane set should be pushed
-    via push_to_tmux. Output-only mirrors should refuse with an ephemeral."""
+def test_mirror_input_bridge_pushes_to_dtach(bot, tmp_path, monkeypatch):
+    """Text typed in a mirror topic with a dtach socket set should be
+    pushed via push_to_dtach. Output-only mirrors must refuse with an
+    ephemeral."""
     csid = "mirror-test-3"
     cwd = str(tmp_path / "mirror_project_3")
     (tmp_path / "mirror_project_3").mkdir()
+    sock = str(tmp_path / "dtach.sock")
 
-    # Patch push_to_tmux so we don't shell out to a real tmux.
-    pushes: list[tuple[str, str, str]] = []
+    # Patch push_to_dtach so we don't shell out to a real dtach.
+    pushes: list[tuple[str, str]] = []
     monkeypatch.setattr(
-        bot.mod, "push_to_tmux",
-        lambda sock, pane, text, **kw: (pushes.append((sock, pane, text)) or True),
+        bot.mod, "push_to_dtach",
+        lambda s, text, **kw: (pushes.append((s, text)) or True),
     )
 
     try:
-        bot.mod.on_open_in_bot(csid, cwd, "/tmp/tmux-1000/default", "%42")
+        bot.mod.on_open_in_bot(csid, cwd, sock)
         m = bot.mod.mirror_mgr.by_csid(csid)
-        assert m and m.tmux_pane == "%42"
-        assert m.tmux_socket == "/tmp/tmux-1000/default"
+        assert m and m.dtach_socket == sock
 
         bot.tg.inject_update(text_update(
             "ls -la", owner_id=bot.owner_id,
@@ -1644,28 +1644,28 @@ def test_mirror_input_bridge_pushes_to_tmux(bot, tmp_path, monkeypatch):
             thread_id=m.topic_id,
         ))
         _drain_updates(bot)
-        assert pushes == [("/tmp/tmux-1000/default", "%42", "ls -la")], pushes
+        assert pushes == [(sock, "ls -la")], pushes
     finally:
         bot.mod.mirror_mgr.unregister(csid)
 
 
 def test_mirror_input_bridge_output_only_rejects(bot, tmp_path, monkeypatch):
-    """Mirror without tmux_pane should not call push_to_tmux; it should
-    surface an output-only notice."""
+    """Mirror without dtach_socket should not call push_to_dtach; it
+    should surface an output-only notice."""
     csid = "mirror-test-4"
     cwd = str(tmp_path / "mirror_project_4")
     (tmp_path / "mirror_project_4").mkdir()
 
     pushes: list[tuple] = []
     monkeypatch.setattr(
-        bot.mod, "push_to_tmux",
+        bot.mod, "push_to_dtach",
         lambda *a, **kw: (pushes.append(a) or True),
     )
 
     try:
-        bot.mod.on_open_in_bot(csid, cwd, None, None)
+        bot.mod.on_open_in_bot(csid, cwd, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
-        assert m and m.tmux_pane is None
+        assert m and m.dtach_socket is None
 
         bot.tg.inject_update(text_update(
             "echo hi", owner_id=bot.owner_id,
@@ -1673,7 +1673,7 @@ def test_mirror_input_bridge_output_only_rejects(bot, tmp_path, monkeypatch):
             thread_id=m.topic_id,
         ))
         _drain_updates(bot)
-        assert pushes == [], "push_to_tmux should not be called for output-only mirror"
+        assert pushes == [], "push_to_dtach should not be called for output-only mirror"
         # An ephemeral notice should mention "Output-only"
         notices = [
             p.get("text", "") for p in bot.tg.calls_of("sendMessage")
@@ -1690,22 +1690,21 @@ def test_mirror_persist_and_restore(bot_env, tmp_path, monkeypatch):
     import importlib
     import terminal_mirror as tm
     importlib.reload(tm)
-    # Restore-time pane liveness check would drop %9 (no real tmux
-    # server in the test); stub it to always-alive for this scenario.
-    monkeypatch.setattr(tm, "tmux_pane_alive", lambda *a, **kw: True)
+    # Restore-time socket liveness check would drop the fake path
+    # (no real dtach process backing it); stub it to always-alive
+    # for this scenario.
+    monkeypatch.setattr(tm, "dtach_socket_alive", lambda *a, **kw: True)
     csid = "mirror-persist-1"
     cwd = str(tmp_path / "persist_project")
+    sock = str(tmp_path / "persist.sock")
     (tmp_path / "persist_project").mkdir()
     mgr1 = tm.TerminalMirrorManager(lambda *a, **kw: None)
-    mgr1.register(csid, cwd, 555,
-                  tmux_socket="/tmp/tmux-1000/default",
-                  tmux_pane="%9")
+    mgr1.register(csid, cwd, 555, dtach_socket=sock)
     mgr2 = tm.TerminalMirrorManager(lambda *a, **kw: None)
     restored = mgr2.by_csid(csid)
     assert restored is not None
     assert restored.topic_id == 555
-    assert restored.tmux_socket == "/tmp/tmux-1000/default"
-    assert restored.tmux_pane == "%9"
+    assert restored.dtach_socket == sock
 
 
 def test_mirror_register_backfills_only_tail(bot, tmp_path):
@@ -1748,7 +1747,7 @@ def test_mirror_register_backfills_only_tail(bot, tmp_path):
                                          "text": "TAIL-recent-B"}]},
             }) + "\n")
 
-        bot.mod.on_open_in_bot(csid, cwd, None, None)
+        bot.mod.on_open_in_bot(csid, cwd, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
         assert m is not None
 
@@ -1799,22 +1798,24 @@ def test_mirror_register_backfills_only_tail(bot, tmp_path):
 
 def test_mirror_suppresses_tg_echo(bot, tmp_path, monkeypatch):
     """When the owner types into the mirror topic, the text rides
-    send-keys into the pane → claude logs it as a `user` event → the
-    follower must NOT project it back as a blockquote (duplicate)."""
+    push_to_dtach into claude's stdin → claude logs it as a `user`
+    event → the follower must NOT project it back as a blockquote
+    (duplicate)."""
     import json as _json
     import time as _time
     csid = "mirror-test-echo-suppress"
     cwd = str(tmp_path / "mirror_project_echo")
     (tmp_path / "mirror_project_echo").mkdir()
     jp = _make_fake_jsonl(tmp_path, csid, cwd)
+    sock = str(tmp_path / "echo.sock")
 
     monkeypatch.setattr(
-        bot.mod, "push_to_tmux",
-        lambda sock, pane, text, **kw: True,
+        bot.mod, "push_to_dtach",
+        lambda s, text, **kw: True,
     )
 
     try:
-        bot.mod.on_open_in_bot(csid, cwd, "/tmp/tmux-1000/default", "%7")
+        bot.mod.on_open_in_bot(csid, cwd, sock)
         m = bot.mod.mirror_mgr.by_csid(csid)
         assert m is not None
 
@@ -1838,7 +1839,7 @@ def test_mirror_suppresses_tg_echo(bot, tmp_path, monkeypatch):
             # still be projected as a blockquote.
             f.write(_json.dumps({
                 "type": "user",
-                "message": {"content": "typed-into-tmux-directly"},
+                "message": {"content": "typed-into-claude-directly"},
             }) + "\n")
 
         deadline = _time.time() + 2.5
@@ -1846,7 +1847,7 @@ def test_mirror_suppresses_tg_echo(bot, tmp_path, monkeypatch):
         while _time.time() < deadline:
             for params in bot.tg.calls_of("sendMessage"):
                 if (params.get("message_thread_id") == m.topic_id
-                        and "typed-into-tmux-directly"
+                        and "typed-into-claude-directly"
                             in params.get("text", "")):
                     direct_hit = True
                     break
@@ -1885,7 +1886,7 @@ def test_mirror_drops_slash_command_url_echo(bot, tmp_path):
     (tmp_path / "mirror_project_slashcmd").mkdir()
     jp = _make_fake_jsonl(tmp_path, csid, cwd)
     try:
-        bot.mod.on_open_in_bot(csid, cwd, None, None)
+        bot.mod.on_open_in_bot(csid, cwd, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
 
         with open(jp, "a") as f:
@@ -1894,7 +1895,7 @@ def test_mirror_drops_slash_command_url_echo(bot, tmp_path):
                 "message": {"content": [{
                     "type": "text",
                     "text": (f"mirror: https://t.me/c/123/{m.topic_id}\n"
-                             f"output-only (claude is not inside tmux)"),
+                             f"output-only (claude is not inside dtach)"),
                 }]},
             }) + "\n")
             f.write(_json.dumps({
@@ -1936,38 +1937,43 @@ def test_mirror_drops_slash_command_url_echo(bot, tmp_path):
             pass
 
 
-def test_mirror_restore_drops_dead_tmux_panes(bot_env, tmp_path, monkeypatch):
-    """At bot restart, persisted mirrors whose tmux pane no longer
+def test_mirror_restore_drops_dead_sockets(bot_env, tmp_path, monkeypatch):
+    """At bot restart, persisted mirrors whose dtach socket no longer
     exists must be dropped — otherwise their followers and the
     healthcheck loop burn TG rate budget probing topics for a
     terminal that exited (rate-budget contention starves the active
     mirror, backfill events get 429'd and never reach the topic).
 
-    Regression: 2026-05-21 — user had 4 alive mirrors and 4 zombie
-    ones from prior tests; rate-limit cascade hid backfill from a
-    fresh /bot-mirror. Verified by reverting the `tmux_pane_alive`
-    guard in `_restore` and watching this test fail."""
+    Legacy tmux-shaped records (tmux_socket / tmux_pane fields) must
+    also be dropped — the tmux session is no longer addressable in
+    the dtach-based world.
+
+    Regression: verified by reverting the `dtach_socket_alive` guard
+    in `_restore` and watching this test fail."""
     import importlib
     import json as _json
     import terminal_mirror as tm
     importlib.reload(tm)
 
-    # Pretend tmux is installed but only ONE pane is alive.
-    def _fake_pane_alive(socket, pane, timeout=2.0):
-        return pane == "%alive"
-    monkeypatch.setattr(tm, "tmux_pane_alive", _fake_pane_alive)
+    # Pretend dtach is installed but only ONE socket is alive.
+    def _fake_socket_alive(sock):
+        return sock == "/s/alive.sock"
+    monkeypatch.setattr(tm, "dtach_socket_alive", _fake_socket_alive)
 
     persist = tmp_path / ".mirrors.json"
     persist.write_text(_json.dumps([
         {"csid": "mirror-alive", "cwd": "/x", "topic_id": 1,
-         "tmux_socket": "/s", "tmux_pane": "%alive",
+         "dtach_socket": "/s/alive.sock",
          "jsonl_path": "/t/a.jsonl", "last_offset": 0},
         {"csid": "mirror-dead", "cwd": "/x", "topic_id": 2,
-         "tmux_socket": "/s", "tmux_pane": "%dead",
+         "dtach_socket": "/s/dead.sock",
          "jsonl_path": "/t/d.jsonl", "last_offset": 0},
         {"csid": "mirror-output-only", "cwd": "/x", "topic_id": 3,
-         "tmux_socket": None, "tmux_pane": None,
+         "dtach_socket": None,
          "jsonl_path": "/t/o.jsonl", "last_offset": 0},
+        {"csid": "mirror-legacy-tmux", "cwd": "/x", "topic_id": 4,
+         "tmux_socket": "/s", "tmux_pane": "%legacy",
+         "jsonl_path": "/t/l.jsonl", "last_offset": 0},
     ]))
     monkeypatch.setattr(tm, "_PERSIST_PATH", str(persist))
 
@@ -1975,10 +1981,12 @@ def test_mirror_restore_drops_dead_tmux_panes(bot_env, tmp_path, monkeypatch):
 
     assert mgr.by_csid("mirror-alive") is not None, "alive must stay"
     assert mgr.by_csid("mirror-dead") is None, (
-        "dead tmux pane must be dropped on restore")
+        "dead dtach socket must be dropped on restore")
     assert mgr.by_csid("mirror-output-only") is not None, (
-        "output-only (pane=None from start) must stay — only "
+        "output-only (socket=None from start) must stay — only "
         "ex-bridged-but-now-dead is dropped")
+    assert mgr.by_csid("mirror-legacy-tmux") is None, (
+        "legacy tmux-shaped records must be dropped on restore")
 
     # The persist file should reflect the drop.
     on_disk = _json.loads(persist.read_text())
@@ -2005,7 +2013,7 @@ def test_mirror_drops_slash_command_body_via_is_meta(bot, tmp_path):
     (tmp_path / "mirror_project_ismeta").mkdir()
     jp = _make_fake_jsonl(tmp_path, csid, cwd)
     try:
-        bot.mod.on_open_in_bot(csid, cwd, None, None)
+        bot.mod.on_open_in_bot(csid, cwd, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
 
         # Append the exact event shape Claude Code emits for the body
@@ -2074,7 +2082,7 @@ def test_mirror_open_sends_welcome_message(bot, tmp_path):
     (tmp_path / "welcome_output_only").mkdir()
     try:
         bot.mod.on_open_in_bot(
-            csid_on, cwd_on, "/tmp/tmux-1000/default", "%8")
+            csid_on, cwd_on, str(tmp_path / "welcome.sock"))
         m_on = bot.mod.mirror_mgr.by_csid(csid_on)
         bridged = [
             p.get("text", "")
@@ -2084,7 +2092,7 @@ def test_mirror_open_sends_welcome_message(bot, tmp_path):
         assert any("Mirror attached" in t for t in bridged), bridged
         assert not any("output-only" in t.lower() for t in bridged), bridged
 
-        bot.mod.on_open_in_bot(csid_off, cwd_off, None, None)
+        bot.mod.on_open_in_bot(csid_off, cwd_off, None)
         m_off = bot.mod.mirror_mgr.by_csid(csid_off)
         out_only = [
             p.get("text", "")

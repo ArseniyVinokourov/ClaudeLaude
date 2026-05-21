@@ -29,7 +29,7 @@ import telegram as tg
 from sessions import MODE_PRESETS, Session, SessionManager
 from hooks import HookBridge
 from terminal_mirror import (
-    TerminalMirrorManager, push_to_tmux, tmux_pane_alive,
+    TerminalMirrorManager, push_to_dtach, dtach_socket_alive,
 )
 
 # ── state ────────────────────────────────────────────────────────────
@@ -2382,13 +2382,14 @@ def on_mirror_event(mirror, event):
 mirror_mgr = TerminalMirrorManager(on_event=on_mirror_event)
 
 
-def on_open_in_bot(csid, cwd, tmux_socket, tmux_pane):
+def on_open_in_bot(csid, cwd, dtach_socket):
     """Bot-side handler for POST /hook/open_in_bot.
 
     Creates a mirror topic if one doesn't exist for this csid, starts
-    the JSONL follower, returns {status, topic_url}. tmux_pane is the
-    pane id (e.g. "%42") of the terminal claude — bot uses it for
-    `tmux send-keys`. When empty, the mirror runs output-only.
+    the JSONL follower, returns {status, topic_url}. dtach_socket is
+    the path to the unix socket of the wrapped claude (e.g.
+    `/tmp/clmirror-<pid>.sock`) — bot writes input via
+    `dtach -p <socket>`. When empty, the mirror runs output-only.
     """
     fid = forum()
     if not fid:
@@ -2402,13 +2403,12 @@ def on_open_in_bot(csid, cwd, tmux_socket, tmux_pane):
         # already in place.
         if not existing.follower or not existing.follower.is_alive():
             mirror_mgr.start_follower(existing)
-        # Also refresh the tmux binding — the user may have re-launched
-        # their terminal claude, getting a new pane id.
-        if tmux_pane and (existing.tmux_pane != tmux_pane
-                          or existing.tmux_socket != tmux_socket):
-            mirror_mgr.set_tmux_target(csid, tmux_socket, tmux_pane)
+        # Refresh the dtach binding — the user may have re-launched
+        # their terminal claude, getting a new socket path.
+        if dtach_socket and existing.dtach_socket != dtach_socket:
+            mirror_mgr.set_dtach_socket(csid, dtach_socket)
         return {"status": "ok", "topic_url": url, "existing": True,
-                "input_bridge": bool(existing.tmux_pane)}
+                "input_bridge": bool(existing.dtach_socket)}
     name = os.path.basename(cwd.rstrip("/")) or "terminal"
     ts = time.strftime("%H:%M")
     # Topic icon is the 💻 terminal emoji (icon_custom_emoji_id), so we
@@ -2424,27 +2424,27 @@ def on_open_in_bot(csid, cwd, tmux_socket, tmux_pane):
         return {"error": "create_forum_topic returned no id"}
     with state.lock:
         state.topic_labels[topic_id] = label
-    m = mirror_mgr.register(csid, cwd, topic_id, tmux_socket, tmux_pane)
+    m = mirror_mgr.register(csid, cwd, topic_id, dtach_socket)
     # Welcome so the freshly-created topic isn't visually empty (the
     # slash-command URL echo is filtered out of the JSONL projection,
     # so without this banner the user sees nothing until claude or the
     # owner types something new).
-    if tmux_pane:
+    if dtach_socket:
         send_to_topic(
             topic_id,
             "\U0001fa9e Mirror attached. Type in this topic — keystrokes "
-            "go into the terminal pane.",
+            "go into the terminal claude.",
         )
     else:
         send_to_topic(
             topic_id,
             "\U0001f50c Mirror is output-only — start your terminal "
-            "claude inside tmux to enable typing from here.",
+            "claude inside dtach to enable typing from here.",
         )
     mirror_mgr.start_follower(m)
     url = _topic_url(topic_id)
     return {"status": "ok", "topic_url": url, "existing": False,
-            "input_bridge": bool(tmux_pane)}
+            "input_bridge": bool(dtach_socket)}
 
 
 bridge = HookBridge(
@@ -2511,9 +2511,9 @@ def _topic_healthcheck():
             if not tg.topic_alive(fid, session.topic_id, name=label):
                 _invalidate_and_stop(session, "topic deleted")
 
-        # Mirrors: probe topic existence and tmux pane presence only.
-        # A mirror with a vanished topic is dropped; a vanished tmux
-        # pane flips the mirror to output-only. We deliberately do NOT
+        # Mirrors: probe topic existence and dtach-socket presence only.
+        # A mirror with a vanished topic is dropped; a vanished dtach
+        # socket flips the mirror to output-only. We deliberately do NOT
         # close on JSONL idleness — a long pause between turns is the
         # owner's choice (per [[no-hard-ceiling]]), not a signal to
         # tear down the mirror behind their back.
@@ -2529,12 +2529,12 @@ def _topic_healthcheck():
                       file=sys.stderr, flush=True)
                 mirror_mgr.unregister(mirror.csid)
                 continue
-            if (mirror.tmux_pane and
-                    not tmux_pane_alive(mirror.tmux_socket, mirror.tmux_pane)):
+            if (mirror.dtach_socket and
+                    not dtach_socket_alive(mirror.dtach_socket)):
                 send_to_topic(
                     mirror.topic_id,
                     "\U0001f50c Terminal closed — mirror is now output-only")
-                mirror_mgr.set_tmux_target(mirror.csid, None, None)
+                mirror_mgr.set_dtach_socket(mirror.csid, None)
 
 
 def _cleanup_terminal_pending(csid: str):
@@ -2774,7 +2774,7 @@ def _handle_update(u):
         tg.delete(msg_id, chat_id)
 
     # ── Terminal-mirror topic: forward text into the terminal claude
-    # via tmux send-keys, or politely reject if input isn't bridged.
+    # via the dtach socket, or politely reject if input isn't bridged.
     if mirror:
         photos = msg.get("photo")
         document = msg.get("document")
@@ -2786,23 +2786,23 @@ def _handle_update(u):
             return
         if not text:
             return
-        if not mirror.tmux_pane:
+        if not mirror.dtach_socket:
             _ephemeral(chat_id,
                        "\U0001f501 Output-only mirror — terminal input is not bridged "
-                       "(start your terminal claude inside tmux to enable it)",
+                       "(start your terminal claude inside dtach to enable it)",
                        thread_id=thread_id, seconds=8)
             return
         if msg_id:
             tg.set_message_reaction(chat_id, msg_id, _REACT_RECEIVED)
-        ok = push_to_tmux(mirror.tmux_socket, mirror.tmux_pane, text)
+        ok = push_to_dtach(mirror.dtach_socket, text)
         if not ok:
             if msg_id:
                 tg.set_message_reaction(chat_id, msg_id, _REACT_ERROR)
             _ephemeral(chat_id,
                        "❌ Could not deliver to terminal "
-                       "(tmux pane missing or unresponsive)",
+                       "(dtach socket missing or unresponsive)",
                        thread_id=thread_id, seconds=8)
-            mirror_mgr.set_tmux_target(mirror.csid, None, None)
+            mirror_mgr.set_dtach_socket(mirror.csid, None)
         else:
             # Remember this msg so the JSONL follower can swap 👀 → 👍
             # once claude actually replies (proves end-to-end delivery,

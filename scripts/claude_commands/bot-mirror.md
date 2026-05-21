@@ -4,8 +4,9 @@ allowed-tools: Bash
 ---
 
 Mirror this terminal Claude session to a ClaudeLaude Telegram topic.
-The bot tails the JSONL transcript and (if this Claude is running
-inside tmux) can type into the live pane from Telegram.
+The bot tails the JSONL transcript and (if this Claude was launched
+through the `claude()` wrapper that wraps it in dtach) can type into
+the live session from Telegram.
 
 Use exactly one Bash call. Do not invent or modify the JSON shape.
 
@@ -13,16 +14,16 @@ Use exactly one Bash call. Do not invent or modify the JSON shape.
 PORT="${BOT_HOOK_PORT:-9853}"
 RESP=$(curl -sS --max-time 8 -X POST "http://127.0.0.1:${PORT}/hook/open_in_bot" \
   -H 'Content-Type: application/json' \
-  --data-raw '{"hook_event_name":"open_in_bot","session_id":"'"$CLAUDE_CODE_SESSION_ID"'","cwd":"'"$PWD"'","tmux_socket":"'"${TMUX%%,*}"'","tmux_pane":"'"${TMUX_PANE:-}"'"}') || { echo "bot unreachable on 127.0.0.1:${PORT}"; exit 0; }
+  --data-raw '{"hook_event_name":"open_in_bot","session_id":"'"$CLAUDE_CODE_SESSION_ID"'","cwd":"'"$PWD"'","dtach_socket":"'"${CLAUDELAUDE_DTACH_SOCKET:-}"'"}') || { echo "bot unreachable on 127.0.0.1:${PORT}"; exit 0; }
 URL=$(echo "$RESP" | grep -oE '"topic_url":"[^"]+"' | cut -d'"' -f4)
 BRIDGE=$(echo "$RESP" | grep -oE '"input_bridge":(true|false)' | cut -d: -f2)
 ERR=$(echo "$RESP" | grep -oE '"error":"[^"]+"'    | cut -d'"' -f4)
 if [ -n "$URL" ]; then
   printf 'mirror: %s\n' "$URL"
   if [ "$BRIDGE" = "true" ]; then
-    printf 'input bridge: on (type from the topic; mouse-wheel scrolls tmux scrollback)\n'
+    printf 'input bridge: on (type from the topic — bytes go straight to claude stdin)\n'
   else
-    printf 'output-only (claude is not inside tmux — start `tmux new -s <name> claude` to enable typing back)\n'
+    printf 'output-only (claude was not launched via the dtach wrapper — re-launch through `claude` after `./setup.sh` installs the wrapper to enable typing back)\n'
   fi
 elif [ -n "$ERR" ]; then
   printf 'error: %s\n' "$ERR"

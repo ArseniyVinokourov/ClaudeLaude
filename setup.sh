@@ -197,20 +197,20 @@ bold "\nTerminal-mirror (optional)"
 echo "When enabled, the bot can stream input from a Telegram topic into"
 echo "your running terminal Claude — exactly as if you were typing at"
 echo "the keyboard. The mechanism: a tiny bash function in ~/.bashrc"
-echo "transparently runs 'claude' inside a tmux pane. The bot then uses"
-echo "'tmux send-keys' to type into that pane from Telegram."
+echo "transparently runs 'claude' under 'dtach' (a 30 KB PTY relay), so"
+echo "the bot can write to claude's stdin via 'dtach -p <socket>'."
 echo ""
-echo "Your everyday workflow stays identical — you keep typing 'claude'"
-echo "as before. The tmux pane is created with a status bar disabled, so"
-echo "visually it looks like a plain claude session. To bypass entirely"
-echo "for one shell, set CLAUDELAUDE_NO_TMUX=1 before running 'claude'."
+echo "Your everyday workflow stays identical — you keep typing 'claude'."
+echo "dtach is transparent: claude renders directly into your terminal,"
+echo "no compositing layer. To bypass for one shell, set"
+echo "CLAUDELAUDE_NO_WRAP=1 before running 'claude'."
 echo ""
 
-if ! command -v tmux &>/dev/null; then
-    warn "'tmux' is not installed. Mirror input bridge requires tmux."
-    echo "  Debian/Ubuntu: sudo apt install tmux"
-    echo "  macOS:         brew install tmux"
-    echo "Skipping mirror setup; install tmux and re-run setup.sh."
+if ! command -v dtach &>/dev/null; then
+    warn "'dtach' is not installed. Mirror input bridge requires dtach."
+    echo "  Debian/Ubuntu: sudo apt install dtach"
+    echo "  macOS:         brew install dtach"
+    echo "Skipping mirror setup; install dtach and re-run setup.sh."
 else
     read -rp "Enable terminal mirror (adds a bash function to ~/.bashrc)? [Y/n]: " INSTALL_MIRROR
     INSTALL_MIRROR="${INSTALL_MIRROR:-Y}"
@@ -235,8 +235,6 @@ p.write_text(new)
         elif [ -f "$BASHRC" ] && grep -qE '^[[:space:]]*(alias[[:space:]]+claude=|claude\(\)[[:space:]]*\{|function[[:space:]]+claude[[:space:]]*[\{(])' "$BASHRC"; then
             warn "An existing 'claude' alias/function was found in ~/.bashrc."
             echo "  Refusing to overwrite. Remove or rename it, then re-run setup.sh."
-            echo "  To use the mirror without our wrapper, run 'clmirror' explicitly"
-            echo "  (set CLAUDELAUDE_MIRROR_FALLBACK_CMD=clmirror) — not yet shipped."
             INSTALL_MIRROR=N
         fi
 
@@ -250,34 +248,29 @@ p.write_text(new)
             cat >> "$BASHRC" <<'BASHRC_BLOCK'
 
 # >>> claudelaude mirror >>>
-# Routes plain `claude` invocations through a dedicated tmux pane so the
-# ClaudeLaude bot can mirror the session into Telegram. To bypass for one
-# shell, set CLAUDELAUDE_NO_TMUX=1.
+# Routes plain `claude` invocations through dtach so the ClaudeLaude bot
+# can write to the session's stdin via `dtach -p <socket>`. dtach is a
+# transparent PTY relay (no rendering, no compositing) — claude draws
+# directly into your terminal, so the workflow looks identical to a
+# bare claude. To bypass for one shell, set CLAUDELAUDE_NO_WRAP=1.
 claude() {
-    if [ -n "$TMUX" ] || [ -n "${CLAUDELAUDE_NO_TMUX:-}" ] \
-       || ! command -v tmux >/dev/null 2>&1; then
+    if [ -n "${CLAUDELAUDE_NO_WRAP:-}" ] \
+       || [ -n "${CLAUDELAUDE_DTACH_SOCKET:-}" ] \
+       || ! command -v dtach >/dev/null 2>&1; then
         command claude "$@"
         return $?
     fi
-    local session_name="${CLAUDELAUDE_SESSION:-clmirror-$$}"
-    local cmd="command claude"
-    local a
-    for a in "$@"; do
-        cmd+=" $(printf '%q' "$a")"
-    done
-    if ! tmux has-session -t "$session_name" 2>/dev/null; then
-        # Match initial pane size to the calling terminal so claude
-        # renders at the right size from frame one — no SIGWINCH on
-        # first attach, no garbled alt-screen reflow.
-        local cols rows
-        cols="${COLUMNS:-$(tput cols 2>/dev/null || echo 200)}"
-        rows="${LINES:-$(tput lines 2>/dev/null || echo 50)}"
-        tmux new-session -d -s "$session_name" -x "$cols" -y "$rows" "$cmd"
-        tmux set-option -t "$session_name" status off >/dev/null 2>&1 || true
-        tmux set-option -t "$session_name" mouse on >/dev/null 2>&1 || true
-        tmux set-option -t "$session_name" history-limit 100000 >/dev/null 2>&1 || true
-    fi
-    tmux attach-session -t "$session_name"
+    local sock="${CLAUDELAUDE_SOCKET:-/tmp/clmirror-$$.sock}"
+    [ -e "$sock" ] && rm -f "$sock"
+    # Export the socket path so /bot-mirror (running inside claude) can
+    # read it and tell the bot where to send input.
+    # -E: disable the detach key (so Ctrl-\ never pulls you out).
+    # -z: disable suspend (Ctrl-Z stays usable as a normal char if any
+    #     TUI wants it; in practice claude ignores it).
+    # -r winch: on re-attach, send SIGWINCH so the program redraws at
+    #     the new size.
+    CLAUDELAUDE_DTACH_SOCKET="$sock" \
+        dtach -A "$sock" -E -z -r winch claude "$@"
 }
 # <<< claudelaude mirror <<<
 BASHRC_BLOCK

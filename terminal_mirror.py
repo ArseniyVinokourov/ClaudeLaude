@@ -4,17 +4,18 @@ Two channels:
 - Output: tail the session's JSONL transcript at
   ~/.claude/projects/<encoded-cwd>/<csid>.jsonl, project new events
   (user/assistant/tool_use) into the bot's mirror topic.
-- Input: tmux `send-keys` writes bytes from a TG message directly into
-  the running terminal Claude's pane, exactly as if the owner had typed
-  them at the keyboard.
+- Input: pipe bytes from a TG message into the wrapped claude's stdin
+  via `dtach -p <socket>`, exactly as if the owner had typed them at
+  the keyboard.
 
 The bot does not own the terminal process — it observes via the JSONL
-and (optionally) types into the pane via tmux. Lifecycle stays external;
-healthcheck handles disappearance.
+and (optionally) injects bytes through the dtach socket. Lifecycle
+stays external; healthcheck handles disappearance.
 """
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -28,63 +29,50 @@ _PERSIST_PATH = os.environ.get(
 )
 
 
-_TMUX_BIN = shutil.which("tmux")
+_DTACH_BIN = shutil.which("dtach")
 
 
-def push_to_tmux(socket: str | None, pane: str,
-                 text: str, timeout: float = 3.0) -> bool:
-    """Type `text` into a tmux pane as if at the keyboard, then submit.
+def push_to_dtach(socket: str | None, text: str,
+                  timeout: float = 3.0) -> bool:
+    """Inject `text` followed by a newline into the dtach socket.
 
-    Uses `tmux send-keys -l` (literal) so the text bytes are not
-    interpreted as tmux key bindings, then a follow-up `send-keys Enter`
-    submits the line. Returns False on any failure (missing tmux, no
-    such pane, timeout, non-zero exit).
+    The bytes land on the wrapped program's stdin exactly as if typed
+    at the keyboard. The trailing newline submits the line, matching
+    the previous tmux send-keys + Enter semantics.
+
+    Returns False on missing dtach, missing/stale socket, timeout, or
+    non-zero exit.
     """
-    if not pane or not _TMUX_BIN:
+    if not socket or not _DTACH_BIN:
         return False
-    base = [_TMUX_BIN]
-    if socket:
-        base += ["-S", socket]
+    if not dtach_socket_alive(socket):
+        return False
     try:
-        r1 = subprocess.run(
-            base + ["send-keys", "-t", pane, "-l", text],
+        p = subprocess.run(
+            [_DTACH_BIN, "-p", socket],
+            input=(text + "\n").encode("utf-8", errors="replace"),
             timeout=timeout, capture_output=True,
         )
-        if r1.returncode != 0:
-            return False
-        r2 = subprocess.run(
-            base + ["send-keys", "-t", pane, "Enter"],
-            timeout=timeout, capture_output=True,
-        )
-        return r2.returncode == 0
+        return p.returncode == 0
     except (subprocess.TimeoutExpired, OSError):
         return False
 
 
-def tmux_pane_alive(socket: str | None, pane: str,
-                    timeout: float = 2.0) -> bool:
-    """Probe whether a given tmux pane still exists on the given server.
+def dtach_socket_alive(socket: str | None) -> bool:
+    """Probe whether the dtach socket file exists and is a unix socket.
 
-    `tmux list-panes -a -F '#{pane_id}'` enumerates panes across all
-    sessions on the server; we grep for the target pane id. Missing
-    tmux or unreachable socket returns False.
+    dtach auto-cleans the socket file when its child exits, so the
+    presence of a valid socket inode is a strong signal that the
+    wrapped program is still running. Missing path, wrong file type,
+    or stat error → not alive.
     """
-    if not pane or not _TMUX_BIN:
+    if not socket:
         return False
-    base = [_TMUX_BIN]
-    if socket:
-        base += ["-S", socket]
     try:
-        r = subprocess.run(
-            base + ["list-panes", "-a", "-F", "#{pane_id}"],
-            timeout=timeout, capture_output=True,
-        )
-        if r.returncode != 0:
-            return False
-        ids = r.stdout.decode("utf-8", errors="replace").split()
-        return pane in ids
-    except (subprocess.TimeoutExpired, OSError):
+        st = os.stat(socket)
+    except OSError:
         return False
+    return stat.S_ISSOCK(st.st_mode)
 
 
 def _tail_offset(path: str, max_bytes: int) -> int:
@@ -126,8 +114,7 @@ class TerminalMirror:
     csid: str
     cwd: str
     topic_id: int
-    tmux_socket: str | None
-    tmux_pane: str | None
+    dtach_socket: str | None
     jsonl_path: str
     last_offset: int = 0
     alive: bool = True
@@ -181,8 +168,7 @@ class TerminalMirrorManager:
         self._restore()
 
     def register(self, csid: str, cwd: str, topic_id: int,
-                 tmux_socket: str | None = None,
-                 tmux_pane: str | None = None) -> TerminalMirror:
+                 dtach_socket: str | None = None) -> TerminalMirror:
         """Idempotent — second call for the same csid returns the existing record."""
         with self._lock:
             existing = self._mirrors.get(csid)
@@ -190,8 +176,7 @@ class TerminalMirrorManager:
                 return existing
             m = TerminalMirror(
                 csid=csid, cwd=cwd, topic_id=topic_id,
-                tmux_socket=tmux_socket or None,
-                tmux_pane=tmux_pane or None,
+                dtach_socket=dtach_socket or None,
                 jsonl_path=jsonl_path_for(csid, cwd),
             )
             # Backfill the tail of the transcript so the topic isn't
@@ -233,13 +218,11 @@ class TerminalMirrorManager:
         with self._lock:
             return list(self._mirrors.values())
 
-    def set_tmux_target(self, csid: str,
-                        socket: str | None, pane: str | None):
+    def set_dtach_socket(self, csid: str, socket: str | None):
         with self._lock:
             m = self._mirrors.get(csid)
             if m:
-                m.tmux_socket = socket or None
-                m.tmux_pane = pane or None
+                m.dtach_socket = socket or None
         self._persist()
 
     # ── follower lifecycle ──────────────────────────────────────────
@@ -357,8 +340,7 @@ class TerminalMirrorManager:
                         "csid": m.csid,
                         "cwd": m.cwd,
                         "topic_id": m.topic_id,
-                        "tmux_socket": m.tmux_socket,
-                        "tmux_pane": m.tmux_pane,
+                        "dtach_socket": m.dtach_socket,
                         "jsonl_path": m.jsonl_path,
                         "last_offset": m.last_offset,
                     })
@@ -384,22 +366,24 @@ class TerminalMirrorManager:
             if not csid or not topic_id:
                 dropped += 1
                 continue
-            tmux_pane = r.get("tmux_pane") or None
-            tmux_socket = r.get("tmux_socket") or None
-            # A mirror persisted WITH a tmux pane but whose pane no
-            # longer exists is dead — the terminal exited. Drop the
-            # record on restore so the follower thread and healthcheck
-            # probes don't burn rate budget chasing a corpse. (Mirrors
-            # that were registered output-only — tmux_pane=None from
-            # the start — keep their record; they may still be useful
-            # for owner-side history.)
-            if tmux_pane and not tmux_pane_alive(tmux_socket, tmux_pane):
+            # Legacy tmux-shaped records (tmux_socket / tmux_pane) are
+            # not migratable — the tmux session no longer exists in
+            # the dtach-based world. Drop them.
+            if r.get("tmux_socket") or r.get("tmux_pane"):
+                dropped += 1
+                continue
+            dtach_socket = r.get("dtach_socket") or None
+            # A mirror persisted WITH a dtach socket whose socket file
+            # no longer exists is dead — the terminal exited and dtach
+            # cleaned up. Drop so we don't chase a corpse on the
+            # healthcheck. Mirrors persisted as output-only
+            # (dtach_socket=None from the start) survive.
+            if dtach_socket and not dtach_socket_alive(dtach_socket):
                 dropped += 1
                 continue
             m = TerminalMirror(
                 csid=csid, cwd=cwd, topic_id=topic_id,
-                tmux_socket=tmux_socket,
-                tmux_pane=tmux_pane,
+                dtach_socket=dtach_socket,
                 jsonl_path=r.get("jsonl_path") or jsonl_path_for(csid, cwd),
                 last_offset=int(r.get("last_offset") or 0),
             )

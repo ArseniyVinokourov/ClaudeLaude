@@ -153,17 +153,15 @@ class HookBridge:
             def _handle_open_in_bot(self, body):
                 """Register a terminal Claude session as a mirror.
 
-                Body: {session_id, cwd, tmux_socket?, tmux_pane?}. Returns
-                200 with {topic_url} on success, 503 if the bot isn't ready.
-                When tmux_pane is empty, the mirror is registered as
+                Body: {session_id, cwd, dtach_socket?}. Returns 200 with
+                {topic_url} on success, 503 if the bot isn't ready. When
+                dtach_socket is empty, the mirror is registered as
                 output-only (no input bridge).
                 """
                 csid = body.get("session_id") or body.get("sessionId") or ""
                 cwd = body.get("cwd") or ""
-                tmux_socket = (body.get("tmux_socket")
-                               or body.get("tmuxSocket") or "")
-                tmux_pane = (body.get("tmux_pane")
-                             or body.get("tmuxPane") or "")
+                dtach_socket = (body.get("dtach_socket")
+                                or body.get("dtachSocket") or "")
                 if not csid or not cwd:
                     self.send_response(400)
                     self.end_headers()
@@ -177,7 +175,7 @@ class HookBridge:
                 try:
                     result = bridge.on_open_in_bot(
                         csid, cwd,
-                        tmux_socket or None, tmux_pane or None,
+                        dtach_socket or None,
                     )
                 except Exception as e:
                     _log(f"open_in_bot error: {e}")
