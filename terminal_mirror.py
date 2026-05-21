@@ -34,11 +34,13 @@ _DTACH_BIN = shutil.which("dtach")
 
 def push_to_dtach(socket: str | None, text: str,
                   timeout: float = 3.0) -> bool:
-    """Inject `text` followed by a newline into the dtach socket.
+    """Inject `text` followed by a carriage return into the dtach socket.
 
     The bytes land on the wrapped program's stdin exactly as if typed
-    at the keyboard. The trailing newline submits the line, matching
-    the previous tmux send-keys + Enter semantics.
+    at the keyboard. Claude's TUI runs in raw mode, so the Enter key
+    is `\\r` (0x0D), not `\\n` (0x0A) — sending `\\n` leaves the text
+    in the input box without submitting it. This matches what tmux's
+    `send-keys ... Enter` produced in the previous bridge.
 
     Returns False on missing dtach, missing/stale socket, timeout, or
     non-zero exit.
@@ -50,7 +52,7 @@ def push_to_dtach(socket: str | None, text: str,
     try:
         p = subprocess.run(
             [_DTACH_BIN, "-p", socket],
-            input=(text + "\n").encode("utf-8", errors="replace"),
+            input=(text + "\r").encode("utf-8", errors="replace"),
             timeout=timeout, capture_output=True,
         )
         return p.returncode == 0
@@ -75,26 +77,166 @@ def dtach_socket_alive(socket: str | None) -> bool:
     return stat.S_ISSOCK(st.st_mode)
 
 
-def _tail_offset(path: str, max_bytes: int) -> int:
-    """Return a byte offset N bytes before EOF, snapped to the next
-    newline. Used to start the JSONL follower at the tail of an
+def _tail_offset(path: str, max_events: int = 12) -> int:
+    """Return the byte offset at which the last `max_events` JSONL
+    lines begin. Used to start the JSONL follower at the tail of an
     existing transcript without spamming the topic with the full
-    history. If the file is smaller than max_bytes, returns 0."""
-    try:
-        size = os.path.getsize(path)
-    except OSError:
-        return 0
-    if size <= max_bytes:
-        return 0
-    seek = size - max_bytes
+    history.
+
+    Event-count (not byte-count) tail: when /bot-mirror is invoked
+    Claude has just appended a giant isMeta line containing the
+    markdown body of bot-mirror.md (~3-10 KB). A byte-window tail
+    lands INSIDE that line and the readline() skip discards every
+    real conversation event that came before — leaving the topic
+    blank. Counting lines from EOF backwards guarantees the offset
+    lands at a clean event boundary.
+    """
     try:
         with open(path, "rb") as f:
-            f.seek(seek)
-            # Skip whatever partial line we landed in the middle of.
-            f.readline()
-            return f.tell()
+            data = f.read()
     except OSError:
         return 0
+    if not data:
+        return 0
+    # Split on b"\n" — trailing empty element from final newline is OK
+    # to ignore; what we want is the byte offset of the first non-empty
+    # line within the last max_events lines.
+    parts = data.split(b"\n")
+    # Drop trailing empty (from final newline).
+    if parts and parts[-1] == b"":
+        parts.pop()
+    if len(parts) <= max_events:
+        return 0
+    skip = parts[:-max_events]
+    # Each skipped line is len(line) + 1 (for its newline).
+    return sum(len(line) + 1 for line in skip)
+
+
+def read_logical_events(path: str, limit: int | None = None) -> list[dict]:
+    """Read JSONL and return a list of "logical" events.
+
+    A logical event is what the user would see as one bubble in TG:
+      {"kind": "user", "text": "...", "byte_end": <offset>}
+      {"kind": "assistant", "text": "...", "tools": [str,...], "byte_end": <offset>}
+
+    Filters: isMeta=True events dropped, slash-command wrapper-tag
+    events dropped, events with no visible content dropped.
+
+    Merging: consecutive assistant events (text + tool_use blocks)
+    accumulate into ONE logical event until the next user event flushes
+    them. Claude often emits 2-4 assistant events per turn (text chunk,
+    tool, more text); the user perceives them as one reply.
+
+    `byte_end` is the offset right after the LAST raw event line that
+    contributed to this logical event — used by the caller to set the
+    JSONL follower's resume point.
+
+    If `limit` is given, returns at most the last `limit` logical
+    events (suffix slice).
+    """
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return []
+    if not data:
+        return []
+
+    events: list[dict] = []
+    cur_assistant: dict | None = None
+    pos = 0
+    for raw_line in data.split(b"\n"):
+        line_len = len(raw_line) + 1  # +1 for the newline split removed
+        line_end = pos + line_len
+        pos = line_end
+        if not raw_line.strip():
+            continue
+        try:
+            e = json.loads(raw_line.decode("utf-8", errors="replace"))
+        except json.JSONDecodeError:
+            continue
+        if e.get("isMeta"):
+            continue
+        etype = e.get("type")
+        msg = e.get("message") or {}
+        content = msg.get("content")
+
+        if etype == "user":
+            # Flush any in-progress assistant.
+            if cur_assistant is not None:
+                events.append(cur_assistant)
+                cur_assistant = None
+            text = ""
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                parts = []
+                for b in content:
+                    if isinstance(b, dict) and b.get("type") == "text":
+                        parts.append(b.get("text", ""))
+                text = "".join(parts)
+            text = text.strip()
+            if not text:
+                continue
+            if ("<command-message>" in text
+                    or "<command-name>" in text
+                    or "<command-args>" in text):
+                continue
+            events.append({"kind": "user", "text": text,
+                           "byte_end": line_end})
+            continue
+
+        if etype == "assistant":
+            if not isinstance(content, list):
+                continue
+            text_parts = []
+            tool_lines = []
+            for b in content:
+                if not isinstance(b, dict):
+                    continue
+                btype = b.get("type")
+                if btype == "text":
+                    text_parts.append(b.get("text", ""))
+                elif btype == "tool_use":
+                    tool_lines.append({
+                        "name": b.get("name") or "?",
+                        "input": b.get("input") or {},
+                    })
+            text_chunk = "".join(text_parts)
+            if not text_chunk and not tool_lines:
+                continue
+            if cur_assistant is None:
+                cur_assistant = {"kind": "assistant",
+                                 "text": text_chunk,
+                                 "tools": tool_lines,
+                                 "byte_end": line_end}
+            else:
+                if text_chunk:
+                    # Separate with newline so chunks read as distinct
+                    # paragraphs when merged.
+                    sep = "\n" if cur_assistant["text"] else ""
+                    cur_assistant["text"] += sep + text_chunk
+                cur_assistant["tools"].extend(tool_lines)
+                cur_assistant["byte_end"] = line_end
+            continue
+        # Other event types (tool_use as top-level, tool_result, etc.)
+        # are ignored — they're already represented inside the
+        # assistant block above for modern Claude Code (≥2.1.x).
+    if cur_assistant is not None:
+        events.append(cur_assistant)
+
+    # Drop the leading "mirror: https://t.me/c/..." assistant event
+    # that Claude emits as the slash-command's own reply — it's noise
+    # the owner already saw via the HTTP response.
+    events = [
+        e for e in events
+        if not (e["kind"] == "assistant"
+                and e["text"].startswith("mirror: https://t.me/c/"))
+    ]
+
+    if limit is not None and len(events) > limit:
+        events = events[-limit:]
+    return events
 
 
 def jsonl_path_for(csid: str, cwd: str) -> str:
@@ -107,6 +249,15 @@ def jsonl_path_for(csid: str, cwd: str) -> str:
     """
     encoded = cwd.replace("/", "-")
     return os.path.expanduser(f"~/.claude/projects/{encoded}/{csid}.jsonl")
+
+
+def _backfill_done_event() -> threading.Event:
+    """A pre-set Event so by default the follower projects events live
+    without waiting. on_open_in_bot clears it explicitly when a backfill
+    needs to land first."""
+    ev = threading.Event()
+    ev.set()
+    return ev
 
 
 @dataclass
@@ -122,6 +273,12 @@ class TerminalMirror:
     # claude posts an assistant reply (so the bot can swap 👀 → 👍).
     pending_user_msg_id: int | None = field(default=None, repr=False)
     follower: threading.Thread | None = field(default=None, repr=False)
+    # When clear, the follower thread suspends projection — used so a
+    # backfill batch lands FIRST in the topic (chronological order)
+    # before any concurrently-arriving live events. Default = set
+    # (live-only path doesn't need to wait).
+    backfill_done: threading.Event = field(default_factory=_backfill_done_event,
+                                           repr=False)
     # Texts pushed into the pane via TG within the last few seconds.
     # Used to suppress the JSONL echo that would otherwise duplicate
     # the owner's own message back into the topic they sent it from.
@@ -179,15 +336,15 @@ class TerminalMirrorManager:
                 dtach_socket=dtach_socket or None,
                 jsonl_path=jsonl_path_for(csid, cwd),
             )
-            # Backfill the tail of the transcript so the topic isn't
-            # visually empty when it opens — but only the last ~8 KB
-            # (roughly the last 10-15 events). Combined with
-            # gate_send()'s 1-msg/s throttle this stays under TG's
-            # per-chat rate limit. The full older history stays
-            # accessible in the terminal scrollback.
+            # Default: start the follower at EOF so it only projects
+            # events that ARRIVE after registration. Any backfill of
+            # already-existing history is orchestrated separately by
+            # the bot (see on_open_in_bot — it counts logical events,
+            # then either runs a silent full backfill or asks the user
+            # via inline buttons how much history to project).
             try:
                 if os.path.exists(m.jsonl_path):
-                    m.last_offset = _tail_offset(m.jsonl_path, 8000)
+                    m.last_offset = os.path.getsize(m.jsonl_path)
             except OSError:
                 pass
             self._mirrors[csid] = m
@@ -203,6 +360,9 @@ class TerminalMirrorManager:
             if self._topic_map.get(m.topic_id) == csid:
                 del self._topic_map[m.topic_id]
             m.alive = False
+            # Release the follower in case it was suspended on a backfill
+            # that will now never finish (mirror is dying).
+            m.backfill_done.set()
         self._persist()
 
     def by_topic(self, topic_id: int) -> TerminalMirror | None:
@@ -312,6 +472,11 @@ class TerminalMirrorManager:
                     event = json.loads(line.decode("utf-8", errors="replace"))
                 except json.JSONDecodeError:
                     continue
+                # Wait if a backfill batch is currently posting — keeps
+                # chronological order in the topic (backfill goes first).
+                mirror.backfill_done.wait()
+                if not mirror.alive:
+                    break
                 try:
                     self._on_event(mirror, event)
                 except Exception as e:

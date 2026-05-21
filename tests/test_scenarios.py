@@ -1708,50 +1708,37 @@ def test_mirror_persist_and_restore(bot_env, tmp_path, monkeypatch):
 
 
 def test_mirror_register_backfills_only_tail(bot, tmp_path):
-    """When /bot-mirror is invoked mid-session the JSONL transcript may
-    already hold dozens of past events. The new mirror should backfill
-    only the tail (last few events) so the topic has fresh context but
-    doesn't spam the full older history. Older events past the tail
-    window MUST stay out of the topic."""
+    """≤ _BACKFILL_ASK_THRESHOLD logical events at /bot-mirror time →
+    silent full backfill: every existing logical event projects into
+    the topic, AND any event appended after registration also lands
+    (follower picks up where backfill left off, in chronological
+    order)."""
     import json as _json
     import time as _time
 
-    csid = "mirror-test-backfill-tail"
+    csid = "mirror-test-backfill-silent-full"
     cwd = str(tmp_path / "mirror_project_backfill")
     (tmp_path / "mirror_project_backfill").mkdir()
     jp = _make_fake_jsonl(tmp_path, csid, cwd)
     try:
-        # Pre-populate with >8KB of OLD history so it falls outside the
-        # tail window, then a couple recent events that should land.
-        # Each ancient event is ~3 KB → after 6 events the window has
-        # already rolled past them.
-        big_filler = "x" * 3000
+        # Pre-populate with 20 events — under the 30-event prompt
+        # threshold, so backfill runs silently and projects all.
         with open(jp, "w") as f:
-            for i in range(6):
+            for i in range(20):
                 f.write(_json.dumps({
                     "type": "assistant",
                     "message": {"content": [{
                         "type": "text",
-                        "text": f"ancient-{i:02d}-{big_filler}",
+                        "text": f"evt-{i:02d}",
                     }]},
                 }) + "\n")
-            # Last 2 events — small, inside the 8 KB tail window.
-            f.write(_json.dumps({
-                "type": "assistant",
-                "message": {"content": [{"type": "text",
-                                         "text": "TAIL-recent-A"}]},
-            }) + "\n")
-            f.write(_json.dumps({
-                "type": "assistant",
-                "message": {"content": [{"type": "text",
-                                         "text": "TAIL-recent-B"}]},
-            }) + "\n")
 
         bot.mod.on_open_in_bot(csid, cwd, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
         assert m is not None
 
-        # Append a brand-new event after registration.
+        # Append a brand-new event after registration; follower waits
+        # on backfill_done and then projects it after the backfill batch.
         with open(jp, "a") as f:
             f.write(_json.dumps({
                 "type": "assistant",
@@ -1759,7 +1746,7 @@ def test_mirror_register_backfills_only_tail(bot, tmp_path):
                                          "text": "POST-FRESH"}]},
             }) + "\n")
 
-        deadline = _time.time() + 2.5
+        deadline = _time.time() + 4.0
         seen_fresh = False
         while _time.time() < deadline:
             for params in bot.tg.calls_of("sendMessage"):
@@ -1777,16 +1764,13 @@ def test_mirror_register_backfills_only_tail(bot, tmp_path):
             for p in bot.tg.calls_of("sendMessage")
             if p.get("message_thread_id") == m.topic_id
         ]
-        # The earliest events (ancient-00, ancient-01) sit well outside
-        # the 8 KB tail window — they must NOT be projected.
-        for off_window in ("ancient-00", "ancient-01"):
-            assert not any(off_window in t for t in topic_texts), (
-                f"{off_window} is older than the tail window and must "
-                f"not reach the topic")
-
-        # The tail-recent ones SHOULD be projected (inside the window).
-        assert any("TAIL-recent-A" in t for t in topic_texts), topic_texts[-5:]
-        assert any("TAIL-recent-B" in t for t in topic_texts), topic_texts[-5:]
+        # All 20 pre-registration events should appear (silent full
+        # backfill — no prompt under the threshold). evt-00 marks the
+        # very start of history.
+        for label in ("evt-00", "evt-10", "evt-19"):
+            assert any(label in t for t in topic_texts), (
+                f"{label} should be projected by silent full backfill; "
+                f"got tail: {topic_texts[-5:]}")
     finally:
         bot.mod.mirror_mgr.unregister(csid)
         try:
@@ -2104,3 +2088,209 @@ def test_mirror_open_sends_welcome_message(bot, tmp_path):
     finally:
         bot.mod.mirror_mgr.unregister(csid_on)
         bot.mod.mirror_mgr.unregister(csid_off)
+
+
+def _write_alternating_jsonl(jp, n_pairs: int, prefix: str = "evt") -> None:
+    """Write n_pairs alternating user+assistant events to a JSONL —
+    yielding 2*n_pairs logical events for read_logical_events()."""
+    import json as _json
+    with open(jp, "w") as f:
+        for i in range(n_pairs):
+            f.write(_json.dumps({
+                "type": "user",
+                "message": {"role": "user",
+                            "content": f"{prefix}-q-{i:02d}"},
+            }) + "\n")
+            f.write(_json.dumps({
+                "type": "assistant",
+                "message": {"content": [{
+                    "type": "text",
+                    "text": f"{prefix}-a-{i:02d}",
+                }]},
+            }) + "\n")
+
+
+def test_mirror_prompts_above_threshold(bot, tmp_path):
+    """When pre-registration history has more than _BACKFILL_ASK_THRESHOLD
+    logical events, the bot must NOT silently backfill the whole stream
+    (slow). Instead it sends an inline-button prompt with full / short
+    choices keyed by csid prefix, and suspends the follower's projection
+    via mirror.backfill_done until the click decides."""
+
+    csid = "mirror-test-prompt-above"
+    cwd = str(tmp_path / "prompt_above")
+    (tmp_path / "prompt_above").mkdir()
+    jp = _make_fake_jsonl(tmp_path, csid, cwd)
+    try:
+        # 20 user/assistant pairs = 40 logical events — above the 30
+        # threshold so the bot must prompt instead of silent full.
+        _write_alternating_jsonl(jp, 20, prefix="old")
+
+        bot.mod.on_open_in_bot(csid, cwd, None)
+        m = bot.mod.mirror_mgr.by_csid(csid)
+        assert m is not None
+        # backfill_done is cleared until user clicks → follower suspended.
+        assert not m.backfill_done.is_set(), \
+            "follower must wait until backfill choice is made"
+
+        prompts = [
+            p for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == m.topic_id
+            and "reply_markup" in p
+        ]
+        assert prompts, "expected an inline-button prompt for choice"
+        btn_rows = prompts[-1]["reply_markup"]["inline_keyboard"]
+        flat = [b for row in btn_rows for b in row]
+        cb_data = [b["callback_data"] for b in flat]
+        assert any(cd.startswith(f"mirror_history:full:{csid[:24]}")
+                   for cd in cb_data), cb_data
+        assert any(cd.startswith(f"mirror_history:short:{csid[:24]}")
+                   for cd in cb_data), cb_data
+
+        # No history bubble should be projected before the click.
+        projected = [
+            p.get("text", "")
+            for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == m.topic_id
+        ]
+        assert not any("old-q-" in t or "old-a-" in t for t in projected), (
+            "no history should land in the topic before the user chooses; "
+            f"got: {projected[-3:]}")
+    finally:
+        bot.mod.mirror_mgr.unregister(csid)
+        try:
+            jp.unlink()
+            jp.parent.rmdir()
+        except OSError:
+            pass
+
+
+def test_mirror_history_full_click_runs_backfill(bot, tmp_path):
+    """Clicking the 'Full' button runs the merged backfill for the full
+    pre-registration history."""
+    import time as _time
+
+    csid = "mirror-test-click-full"
+    cwd = str(tmp_path / "click_full")
+    (tmp_path / "click_full").mkdir()
+    jp = _make_fake_jsonl(tmp_path, csid, cwd)
+    try:
+        # 18 user/assistant pairs = 36 logical events, above threshold.
+        _write_alternating_jsonl(jp, 18, prefix="hist")
+
+        bot.mod.on_open_in_bot(csid, cwd, None)
+        m = bot.mod.mirror_mgr.by_csid(csid)
+        assert m is not None
+        # The prompt was sent — find its callback_data for 'full'.
+        prompts = [
+            p for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == m.topic_id
+            and "reply_markup" in p
+        ]
+        btn_rows = prompts[-1]["reply_markup"]["inline_keyboard"]
+        flat = [b for row in btn_rows for b in row]
+        full_btn = next(b for b in flat
+                        if b["callback_data"].startswith("mirror_history:full:"))
+
+        bot.tg.inject_update(callback_update(
+            full_btn["callback_data"],
+            owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
+            thread_id=m.topic_id,
+        ))
+        _drain_updates(bot)
+
+        # Wait for backfill thread to project the LAST event (q-17 or a-17).
+        deadline = _time.time() + 5
+        while _time.time() < deadline:
+            texts = [
+                p.get("text", "")
+                for p in bot.tg.calls_of("sendMessage")
+                if p.get("message_thread_id") == m.topic_id
+            ]
+            if any("hist-a-17" in t for t in texts):
+                break
+            _time.sleep(0.05)
+
+        texts = [
+            p.get("text", "")
+            for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == m.topic_id
+        ]
+        # Full backfill must project the earliest, mid, and last events.
+        for label in ("hist-q-00", "hist-a-08", "hist-a-17"):
+            assert any(label in t for t in texts), (
+                f"{label} should be in full backfill; tail={texts[-5:]}")
+    finally:
+        bot.mod.mirror_mgr.unregister(csid)
+        try:
+            jp.unlink()
+            jp.parent.rmdir()
+        except OSError:
+            pass
+
+
+def test_mirror_history_short_click_emits_summary(bot, tmp_path):
+    """Clicking 'Short' runs the summary backfill — last N events
+    concatenated into one TG message (sent via send_long which may
+    chunk if needed)."""
+    import time as _time
+
+    csid = "mirror-test-click-short"
+    cwd = str(tmp_path / "click_short")
+    (tmp_path / "click_short").mkdir()
+    jp = _make_fake_jsonl(tmp_path, csid, cwd)
+    try:
+        # 20 pairs = 40 logical events; short summary keeps last 12.
+        _write_alternating_jsonl(jp, 20, prefix="S")
+
+        bot.mod.on_open_in_bot(csid, cwd, None)
+        m = bot.mod.mirror_mgr.by_csid(csid)
+        before_count = len(bot.tg.calls_of("sendMessage"))
+        prompts = [
+            p for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == m.topic_id
+            and "reply_markup" in p
+        ]
+        btn_rows = prompts[-1]["reply_markup"]["inline_keyboard"]
+        flat = [b for row in btn_rows for b in row]
+        short_btn = next(b for b in flat
+                         if b["callback_data"].startswith("mirror_history:short:"))
+
+        bot.tg.inject_update(callback_update(
+            short_btn["callback_data"],
+            owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
+            thread_id=m.topic_id,
+        ))
+        _drain_updates(bot)
+
+        # Wait for the summary message containing the very last event.
+        deadline = _time.time() + 3
+        summary_text = None
+        while _time.time() < deadline:
+            for p in bot.tg.calls_of("sendMessage")[before_count:]:
+                if (p.get("message_thread_id") == m.topic_id
+                        and "S-a-19" in p.get("text", "")):
+                    summary_text = p["text"]
+                    break
+            if summary_text:
+                break
+            _time.sleep(0.05)
+
+        assert summary_text, "summary message with last events not sent"
+        # Last 12 logical events out of 40: indices 28..39 of the
+        # logical sequence (alternating q,a). Pairs 14..19 fully fit
+        # in the 12-event tail (= 12 logical events): q-14 a-14 q-15
+        # a-15 ... q-19 a-19. So q-14 / a-19 must be in; q-13 must not.
+        for label in ("S-q-14", "S-a-17", "S-a-19"):
+            assert label in summary_text, (
+                f"{label} missing from short summary")
+        for missing in ("S-q-00", "S-a-05", "S-q-13"):
+            assert missing not in summary_text, (
+                f"{missing} should be excluded from short summary")
+    finally:
+        bot.mod.mirror_mgr.unregister(csid)
+        try:
+            jp.unlink()
+            jp.parent.rmdir()
+        except OSError:
+            pass
