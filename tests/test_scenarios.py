@@ -1513,3 +1513,784 @@ def test_record_topic_msg_trims_buffer(bot):
     # Tail kept, head dropped.
     assert buf[-1] == 1000 + (_FORK_BACKFILL * 3 - 1)
     assert buf[0] == 1000 + (_FORK_BACKFILL * 3 - _FORK_BACKFILL)
+
+
+# ── Terminal mirror (#51 + #56) ─────────────────────────────────────
+
+def _make_fake_jsonl(tmp_path, csid: str, cwd: str):
+    """Create the JSONL path Claude Code would write to for given csid/cwd."""
+    import pathlib
+    encoded = cwd.replace("/", "-")
+    proj_dir = pathlib.Path.home() / ".claude" / "projects" / encoded
+    proj_dir.mkdir(parents=True, exist_ok=True)
+    return proj_dir / f"{csid}.jsonl"
+
+
+def test_mirror_register_creates_topic_and_starts_follower(bot, tmp_path):
+    """POST /hook/open_in_bot via on_open_in_bot creates a forum topic
+    and registers the mirror. JSONL follower picks up appended events."""
+    import json as _json
+    import time as _time
+    csid = "mirror-test-1"
+    cwd = str(tmp_path / "mirror_project_1")
+    (tmp_path / "mirror_project_1").mkdir()
+    jp = _make_fake_jsonl(tmp_path, csid, cwd)
+    try:
+        result = bot.mod.on_open_in_bot(csid, cwd, None)
+        assert "topic_url" in result, result
+        topic_calls = bot.tg.calls_of("createForumTopic")
+        assert len(topic_calls) == 1, topic_calls
+        # Mirror is in registry
+        m = bot.mod.mirror_mgr.by_csid(csid)
+        assert m is not None
+        assert m.cwd == cwd
+
+        # Append an assistant event; follower should pick it up.
+        with open(jp, "w") as f:
+            f.write(_json.dumps({
+                "type": "assistant",
+                "message": {"content": [
+                    {"type": "text", "text": "hello from terminal"},
+                ]},
+            }) + "\n")
+
+        # Give the follower up to 2.5s to read + project.
+        deadline = _time.time() + 2.5
+        found = None
+        while _time.time() < deadline:
+            for params in bot.tg.calls_of("sendMessage"):
+                if (params.get("message_thread_id") == m.topic_id
+                        and "hello from terminal" in params.get("text", "")):
+                    found = params
+                    break
+            if found:
+                break
+            _time.sleep(0.05)
+        assert found, ("expected assistant text projected into topic; "
+                       f"got calls: {bot.tg.calls_of('sendMessage')[-5:]}")
+    finally:
+        bot.mod.mirror_mgr.unregister(csid)
+        try:
+            jp.unlink()
+            jp.parent.rmdir()
+        except OSError:
+            pass
+
+
+def test_mirror_register_idempotent(bot, tmp_path):
+    """Second call for the same csid returns the existing topic_url."""
+    csid = "mirror-test-2"
+    cwd = str(tmp_path / "mirror_project_2")
+    (tmp_path / "mirror_project_2").mkdir()
+    try:
+        r1 = bot.mod.on_open_in_bot(csid, cwd, None)
+        r2 = bot.mod.on_open_in_bot(csid, cwd, None)
+        assert r1.get("topic_url") == r2.get("topic_url")
+        assert r2.get("existing") is True
+        assert len(bot.tg.calls_of("createForumTopic")) == 1
+    finally:
+        bot.mod.mirror_mgr.unregister(csid)
+
+
+def test_mirror_response_input_bridge_flag(bot, tmp_path):
+    """Bot's open_in_bot response carries `input_bridge: bool` so the
+    slash command can branch on what the bot actually saw rather than
+    on its own (sometimes-empty) socket-env check."""
+    csid_a = "mirror-bridge-on"
+    csid_b = "mirror-bridge-off"
+    cwd_a = str(tmp_path / "bridge_on")
+    cwd_b = str(tmp_path / "bridge_off")
+    (tmp_path / "bridge_on").mkdir()
+    (tmp_path / "bridge_off").mkdir()
+    sock = str(tmp_path / "fake.sock")
+    try:
+        on_resp = bot.mod.on_open_in_bot(csid_a, cwd_a, sock)
+        off_resp = bot.mod.on_open_in_bot(csid_b, cwd_b, None)
+        assert on_resp.get("input_bridge") is True, on_resp
+        assert off_resp.get("input_bridge") is False, off_resp
+        # On the existing-mirror return path the flag must still
+        # reflect actual dtach binding state.
+        on_resp_again = bot.mod.on_open_in_bot(csid_a, cwd_a, sock)
+        assert on_resp_again.get("input_bridge") is True, on_resp_again
+    finally:
+        bot.mod.mirror_mgr.unregister(csid_a)
+        bot.mod.mirror_mgr.unregister(csid_b)
+
+
+def test_mirror_input_bridge_pushes_to_dtach(bot, tmp_path, monkeypatch):
+    """Text typed in a mirror topic with a dtach socket set should be
+    pushed via push_to_dtach. Output-only mirrors must refuse with an
+    ephemeral."""
+    csid = "mirror-test-3"
+    cwd = str(tmp_path / "mirror_project_3")
+    (tmp_path / "mirror_project_3").mkdir()
+    sock = str(tmp_path / "dtach.sock")
+
+    # Patch push_to_dtach so we don't shell out to a real dtach.
+    pushes: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        bot.mod, "push_to_dtach",
+        lambda s, text, **kw: (pushes.append((s, text)) or True),
+    )
+
+    try:
+        bot.mod.on_open_in_bot(csid, cwd, sock)
+        m = bot.mod.mirror_mgr.by_csid(csid)
+        assert m and m.dtach_socket == sock
+
+        bot.tg.inject_update(text_update(
+            "ls -la", owner_id=bot.owner_id,
+            forum_chat_id=bot.forum_chat_id,
+            thread_id=m.topic_id,
+        ))
+        _drain_updates(bot)
+        assert pushes == [(sock, "ls -la")], pushes
+    finally:
+        bot.mod.mirror_mgr.unregister(csid)
+
+
+def test_mirror_input_bridge_output_only_rejects(bot, tmp_path, monkeypatch):
+    """Mirror without dtach_socket should not call push_to_dtach; it
+    should surface an output-only notice."""
+    csid = "mirror-test-4"
+    cwd = str(tmp_path / "mirror_project_4")
+    (tmp_path / "mirror_project_4").mkdir()
+
+    pushes: list[tuple] = []
+    monkeypatch.setattr(
+        bot.mod, "push_to_dtach",
+        lambda *a, **kw: (pushes.append(a) or True),
+    )
+
+    try:
+        bot.mod.on_open_in_bot(csid, cwd, None)
+        m = bot.mod.mirror_mgr.by_csid(csid)
+        assert m and m.dtach_socket is None
+
+        bot.tg.inject_update(text_update(
+            "echo hi", owner_id=bot.owner_id,
+            forum_chat_id=bot.forum_chat_id,
+            thread_id=m.topic_id,
+        ))
+        _drain_updates(bot)
+        assert pushes == [], "push_to_dtach should not be called for output-only mirror"
+        # An ephemeral notice should mention "Output-only"
+        notices = [
+            p.get("text", "") for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == m.topic_id
+            and "Output-only" in p.get("text", "")
+        ]
+        assert notices, "expected an Output-only ephemeral"
+    finally:
+        bot.mod.mirror_mgr.unregister(csid)
+
+
+def test_mirror_persist_and_restore(bot_env, tmp_path, monkeypatch):
+    """Mirror records survive a fresh TerminalMirrorManager instance."""
+    import importlib
+    import terminal_mirror as tm
+    importlib.reload(tm)
+    # Restore-time socket liveness check would drop the fake path
+    # (no real dtach process backing it); stub it to always-alive
+    # for this scenario.
+    monkeypatch.setattr(tm, "dtach_socket_alive", lambda *a, **kw: True)
+    csid = "mirror-persist-1"
+    cwd = str(tmp_path / "persist_project")
+    sock = str(tmp_path / "persist.sock")
+    (tmp_path / "persist_project").mkdir()
+    mgr1 = tm.TerminalMirrorManager(lambda *a, **kw: None)
+    mgr1.register(csid, cwd, 555, dtach_socket=sock)
+    mgr2 = tm.TerminalMirrorManager(lambda *a, **kw: None)
+    restored = mgr2.by_csid(csid)
+    assert restored is not None
+    assert restored.topic_id == 555
+    assert restored.dtach_socket == sock
+
+
+def test_mirror_register_backfills_only_tail(bot, tmp_path):
+    """≤ _BACKFILL_ASK_THRESHOLD logical events at /bot-mirror time →
+    silent full backfill: every existing logical event projects into
+    the topic, AND any event appended after registration also lands
+    (follower picks up where backfill left off, in chronological
+    order)."""
+    import json as _json
+    import time as _time
+
+    csid = "mirror-test-backfill-silent-full"
+    cwd = str(tmp_path / "mirror_project_backfill")
+    (tmp_path / "mirror_project_backfill").mkdir()
+    jp = _make_fake_jsonl(tmp_path, csid, cwd)
+    try:
+        # Pre-populate with 20 events — under the 30-event prompt
+        # threshold, so backfill runs silently and projects all.
+        with open(jp, "w") as f:
+            for i in range(20):
+                f.write(_json.dumps({
+                    "type": "assistant",
+                    "message": {"content": [{
+                        "type": "text",
+                        "text": f"evt-{i:02d}",
+                    }]},
+                }) + "\n")
+
+        bot.mod.on_open_in_bot(csid, cwd, None)
+        m = bot.mod.mirror_mgr.by_csid(csid)
+        assert m is not None
+
+        # Append a brand-new event after registration; follower waits
+        # on backfill_done and then projects it after the backfill batch.
+        with open(jp, "a") as f:
+            f.write(_json.dumps({
+                "type": "assistant",
+                "message": {"content": [{"type": "text",
+                                         "text": "POST-FRESH"}]},
+            }) + "\n")
+
+        deadline = _time.time() + 4.0
+        seen_fresh = False
+        while _time.time() < deadline:
+            for params in bot.tg.calls_of("sendMessage"):
+                if (params.get("message_thread_id") == m.topic_id
+                        and "POST-FRESH" in params.get("text", "")):
+                    seen_fresh = True
+                    break
+            if seen_fresh:
+                break
+            _time.sleep(0.05)
+        assert seen_fresh, "fresh post-register event must be projected"
+
+        topic_texts = [
+            p.get("text", "")
+            for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == m.topic_id
+        ]
+        # All 20 pre-registration events should appear (silent full
+        # backfill — no prompt under the threshold). evt-00 marks the
+        # very start of history.
+        for label in ("evt-00", "evt-10", "evt-19"):
+            assert any(label in t for t in topic_texts), (
+                f"{label} should be projected by silent full backfill; "
+                f"got tail: {topic_texts[-5:]}")
+    finally:
+        bot.mod.mirror_mgr.unregister(csid)
+        try:
+            jp.unlink()
+            jp.parent.rmdir()
+        except OSError:
+            pass
+
+
+def test_mirror_suppresses_tg_echo(bot, tmp_path, monkeypatch):
+    """When the owner types into the mirror topic, the text rides
+    push_to_dtach into claude's stdin → claude logs it as a `user`
+    event → the follower must NOT project it back as a blockquote
+    (duplicate)."""
+    import json as _json
+    import time as _time
+    csid = "mirror-test-echo-suppress"
+    cwd = str(tmp_path / "mirror_project_echo")
+    (tmp_path / "mirror_project_echo").mkdir()
+    jp = _make_fake_jsonl(tmp_path, csid, cwd)
+    sock = str(tmp_path / "echo.sock")
+
+    monkeypatch.setattr(
+        bot.mod, "push_to_dtach",
+        lambda s, text, **kw: True,
+    )
+
+    try:
+        bot.mod.on_open_in_bot(csid, cwd, sock)
+        m = bot.mod.mirror_mgr.by_csid(csid)
+        assert m is not None
+
+        # Owner types in the mirror topic — input bridge fires and
+        # notes the injection.
+        bot.tg.inject_update(text_update(
+            "ping from owner", owner_id=bot.owner_id,
+            forum_chat_id=bot.forum_chat_id,
+            thread_id=m.topic_id,
+        ))
+        _drain_updates(bot)
+
+        # Claude logs the same text as a `user` event in JSONL. This
+        # one must be SUPPRESSED (echo).
+        with open(jp, "a") as f:
+            f.write(_json.dumps({
+                "type": "user",
+                "message": {"content": "ping from owner"},
+            }) + "\n")
+            # An unrelated user event from another channel — must
+            # still be projected as a blockquote.
+            f.write(_json.dumps({
+                "type": "user",
+                "message": {"content": "typed-into-claude-directly"},
+            }) + "\n")
+
+        deadline = _time.time() + 2.5
+        direct_hit = False
+        while _time.time() < deadline:
+            for params in bot.tg.calls_of("sendMessage"):
+                if (params.get("message_thread_id") == m.topic_id
+                        and "typed-into-claude-directly"
+                            in params.get("text", "")):
+                    direct_hit = True
+                    break
+            if direct_hit:
+                break
+            _time.sleep(0.05)
+        assert direct_hit, "non-injected user event must be projected"
+
+        echo_hits = [
+            p for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == m.topic_id
+            and "ping from owner" in p.get("text", "")
+            and "blockquote" in p.get("text", "")
+        ]
+        assert not echo_hits, (
+            f"echo of TG-injected text must NOT be projected; "
+            f"got: {echo_hits}")
+    finally:
+        bot.mod.mirror_mgr.unregister(csid)
+        try:
+            jp.unlink()
+            jp.parent.rmdir()
+        except OSError:
+            pass
+
+
+def test_mirror_drops_slash_command_url_echo(bot, tmp_path):
+    """The /bot-mirror slash command instructs Claude to print
+    `mirror: <topic_url>` plus a `tip:` / `output-only` line. That
+    assistant turn must NOT be projected — the owner already saw the
+    URL via the HTTP response."""
+    import json as _json
+    import time as _time
+    csid = "mirror-test-slashcmd-echo"
+    cwd = str(tmp_path / "mirror_project_slashcmd")
+    (tmp_path / "mirror_project_slashcmd").mkdir()
+    jp = _make_fake_jsonl(tmp_path, csid, cwd)
+    try:
+        bot.mod.on_open_in_bot(csid, cwd, None)
+        m = bot.mod.mirror_mgr.by_csid(csid)
+
+        with open(jp, "a") as f:
+            f.write(_json.dumps({
+                "type": "assistant",
+                "message": {"content": [{
+                    "type": "text",
+                    "text": (f"mirror: https://t.me/c/123/{m.topic_id}\n"
+                             f"output-only (claude is not inside dtach)"),
+                }]},
+            }) + "\n")
+            f.write(_json.dumps({
+                "type": "assistant",
+                "message": {"content": [{
+                    "type": "text",
+                    "text": "regular reply please project me",
+                }]},
+            }) + "\n")
+
+        deadline = _time.time() + 2.5
+        regular_hit = False
+        while _time.time() < deadline:
+            for params in bot.tg.calls_of("sendMessage"):
+                if (params.get("message_thread_id") == m.topic_id
+                        and "regular reply please project me"
+                            in params.get("text", "")):
+                    regular_hit = True
+                    break
+            if regular_hit:
+                break
+            _time.sleep(0.05)
+        assert regular_hit, "regular assistant text must be projected"
+
+        slashcmd_hits = [
+            p for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == m.topic_id
+            and "mirror: https://t.me/c/" in p.get("text", "")
+        ]
+        assert not slashcmd_hits, (
+            f"slash-command URL echo must NOT be projected; "
+            f"got: {slashcmd_hits}")
+    finally:
+        bot.mod.mirror_mgr.unregister(csid)
+        try:
+            jp.unlink()
+            jp.parent.rmdir()
+        except OSError:
+            pass
+
+
+def test_mirror_restore_drops_dead_sockets(bot_env, tmp_path, monkeypatch):
+    """At bot restart, persisted mirrors whose dtach socket no longer
+    exists must be dropped — otherwise their followers and the
+    healthcheck loop burn TG rate budget probing topics for a
+    terminal that exited (rate-budget contention starves the active
+    mirror, backfill events get 429'd and never reach the topic).
+
+    Legacy tmux-shaped records (tmux_socket / tmux_pane fields) must
+    also be dropped — the tmux session is no longer addressable in
+    the dtach-based world.
+
+    Regression: verified by reverting the `dtach_socket_alive` guard
+    in `_restore` and watching this test fail."""
+    import importlib
+    import json as _json
+    import terminal_mirror as tm
+    importlib.reload(tm)
+
+    # Pretend dtach is installed but only ONE socket is alive.
+    def _fake_socket_alive(sock):
+        return sock == "/s/alive.sock"
+    monkeypatch.setattr(tm, "dtach_socket_alive", _fake_socket_alive)
+
+    persist = tmp_path / ".mirrors.json"
+    persist.write_text(_json.dumps([
+        {"csid": "mirror-alive", "cwd": "/x", "topic_id": 1,
+         "dtach_socket": "/s/alive.sock",
+         "jsonl_path": "/t/a.jsonl", "last_offset": 0},
+        {"csid": "mirror-dead", "cwd": "/x", "topic_id": 2,
+         "dtach_socket": "/s/dead.sock",
+         "jsonl_path": "/t/d.jsonl", "last_offset": 0},
+        {"csid": "mirror-output-only", "cwd": "/x", "topic_id": 3,
+         "dtach_socket": None,
+         "jsonl_path": "/t/o.jsonl", "last_offset": 0},
+        {"csid": "mirror-legacy-tmux", "cwd": "/x", "topic_id": 4,
+         "tmux_socket": "/s", "tmux_pane": "%legacy",
+         "jsonl_path": "/t/l.jsonl", "last_offset": 0},
+    ]))
+    monkeypatch.setattr(tm, "_PERSIST_PATH", str(persist))
+
+    mgr = tm.TerminalMirrorManager(lambda *a, **kw: None)
+
+    assert mgr.by_csid("mirror-alive") is not None, "alive must stay"
+    assert mgr.by_csid("mirror-dead") is None, (
+        "dead dtach socket must be dropped on restore")
+    assert mgr.by_csid("mirror-output-only") is not None, (
+        "output-only (socket=None from start) must stay — only "
+        "ex-bridged-but-now-dead is dropped")
+    assert mgr.by_csid("mirror-legacy-tmux") is None, (
+        "legacy tmux-shaped records must be dropped on restore")
+
+    # The persist file should reflect the drop.
+    on_disk = _json.loads(persist.read_text())
+    csids = {r["csid"] for r in on_disk}
+    assert csids == {"mirror-alive", "mirror-output-only"}, csids
+
+
+def test_mirror_drops_slash_command_body_via_is_meta(bot, tmp_path):
+    """When a custom slash command has no $ARGUMENTS (e.g. /bot-mirror),
+    Claude Code injects the command body as a USER event with
+    `isMeta: true` at the top level — there is no `ARGUMENTS:` trailer
+    to pattern-match on. Mirror projection must drop these meta events
+    so the topic isn't flooded with the markdown body of bot-mirror.md
+    (description, instructions, the entire bash block, etc).
+
+    Regression: this test was added 2026-05-21 after a screenshot of
+    the topic containing the literal `/bot-mirror` body. Verified by
+    reverting the `isMeta` guard once — this test fails — restoring it
+    — passes."""
+    import json as _json
+    import time as _time
+    csid = "mirror-test-ismeta-body"
+    cwd = str(tmp_path / "mirror_project_ismeta")
+    (tmp_path / "mirror_project_ismeta").mkdir()
+    jp = _make_fake_jsonl(tmp_path, csid, cwd)
+    try:
+        bot.mod.on_open_in_bot(csid, cwd, None)
+        m = bot.mod.mirror_mgr.by_csid(csid)
+
+        # Append the exact event shape Claude Code emits for the body
+        # of a no-args slash command: type=user + isMeta=True +
+        # message.content = markdown body.
+        body = (
+            "Mirror this terminal Claude session to a ClaudeLaude "
+            "Telegram topic.\nThe bot tails the JSONL transcript...\n"
+            "```bash\nPORT=\"${BOT_HOOK_PORT:-9853}\"\n...\n```\n"
+            "After running the Bash call, just print the captured "
+            "output as-is. SLASH_CMD_BODY_MARKER\n"
+        )
+        with open(jp, "a") as f:
+            f.write(_json.dumps({
+                "type": "user",
+                "isMeta": True,
+                "message": {"role": "user", "content": body},
+            }) + "\n")
+            # A real user message after the slash command — must STILL
+            # be projected.
+            f.write(_json.dumps({
+                "type": "user",
+                "message": {"role": "user", "content": "REAL_USER_INPUT"},
+            }) + "\n")
+
+        deadline = _time.time() + 2.5
+        real_hit = False
+        while _time.time() < deadline:
+            for params in bot.tg.calls_of("sendMessage"):
+                if (params.get("message_thread_id") == m.topic_id
+                        and "REAL_USER_INPUT" in params.get("text", "")):
+                    real_hit = True
+                    break
+            if real_hit:
+                break
+            _time.sleep(0.05)
+        assert real_hit, "real user input must be projected"
+
+        body_hits = [
+            p for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == m.topic_id
+            and "SLASH_CMD_BODY_MARKER" in p.get("text", "")
+        ]
+        assert not body_hits, (
+            f"slash-command body (isMeta=true) must NOT be projected; "
+            f"got: {body_hits}")
+    finally:
+        bot.mod.mirror_mgr.unregister(csid)
+        try:
+            jp.unlink()
+            jp.parent.rmdir()
+        except OSError:
+            pass
+
+
+def test_mirror_open_sends_welcome_message(bot, tmp_path):
+    """The freshly-created mirror topic must contain a single welcome
+    message — otherwise the topic looks empty (the slash-command URL
+    echo and the JSONL backfill are both filtered out, by design).
+    Phrasing branches on whether input bridge is available."""
+    csid_on = "mirror-welcome-bridged"
+    csid_off = "mirror-welcome-output-only"
+    cwd_on = str(tmp_path / "welcome_bridged")
+    cwd_off = str(tmp_path / "welcome_output_only")
+    (tmp_path / "welcome_bridged").mkdir()
+    (tmp_path / "welcome_output_only").mkdir()
+    try:
+        bot.mod.on_open_in_bot(
+            csid_on, cwd_on, str(tmp_path / "welcome.sock"))
+        m_on = bot.mod.mirror_mgr.by_csid(csid_on)
+        bridged = [
+            p.get("text", "")
+            for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == m_on.topic_id
+        ]
+        assert any("Mirror attached" in t for t in bridged), bridged
+        assert not any("output-only" in t.lower() for t in bridged), bridged
+
+        bot.mod.on_open_in_bot(csid_off, cwd_off, None)
+        m_off = bot.mod.mirror_mgr.by_csid(csid_off)
+        out_only = [
+            p.get("text", "")
+            for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == m_off.topic_id
+        ]
+        assert any("output-only" in t.lower() for t in out_only), out_only
+        assert not any("Mirror attached" in t for t in out_only), out_only
+    finally:
+        bot.mod.mirror_mgr.unregister(csid_on)
+        bot.mod.mirror_mgr.unregister(csid_off)
+
+
+def _write_alternating_jsonl(jp, n_pairs: int, prefix: str = "evt") -> None:
+    """Write n_pairs alternating user+assistant events to a JSONL —
+    yielding 2*n_pairs logical events for read_logical_events()."""
+    import json as _json
+    with open(jp, "w") as f:
+        for i in range(n_pairs):
+            f.write(_json.dumps({
+                "type": "user",
+                "message": {"role": "user",
+                            "content": f"{prefix}-q-{i:02d}"},
+            }) + "\n")
+            f.write(_json.dumps({
+                "type": "assistant",
+                "message": {"content": [{
+                    "type": "text",
+                    "text": f"{prefix}-a-{i:02d}",
+                }]},
+            }) + "\n")
+
+
+def test_mirror_prompts_above_threshold(bot, tmp_path):
+    """When pre-registration history has more than _BACKFILL_ASK_THRESHOLD
+    logical events, the bot must NOT silently backfill the whole stream
+    (slow). Instead it sends an inline-button prompt with full / short
+    choices keyed by csid prefix, and suspends the follower's projection
+    via mirror.backfill_done until the click decides."""
+
+    csid = "mirror-test-prompt-above"
+    cwd = str(tmp_path / "prompt_above")
+    (tmp_path / "prompt_above").mkdir()
+    jp = _make_fake_jsonl(tmp_path, csid, cwd)
+    try:
+        # 20 user/assistant pairs = 40 logical events — above the 30
+        # threshold so the bot must prompt instead of silent full.
+        _write_alternating_jsonl(jp, 20, prefix="old")
+
+        bot.mod.on_open_in_bot(csid, cwd, None)
+        m = bot.mod.mirror_mgr.by_csid(csid)
+        assert m is not None
+        # backfill_done is cleared until user clicks → follower suspended.
+        assert not m.backfill_done.is_set(), \
+            "follower must wait until backfill choice is made"
+
+        prompts = [
+            p for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == m.topic_id
+            and "reply_markup" in p
+        ]
+        assert prompts, "expected an inline-button prompt for choice"
+        btn_rows = prompts[-1]["reply_markup"]["inline_keyboard"]
+        flat = [b for row in btn_rows for b in row]
+        cb_data = [b["callback_data"] for b in flat]
+        assert any(cd.startswith(f"mirror_history:full:{csid[:24]}")
+                   for cd in cb_data), cb_data
+        assert any(cd.startswith(f"mirror_history:short:{csid[:24]}")
+                   for cd in cb_data), cb_data
+
+        # No history bubble should be projected before the click.
+        projected = [
+            p.get("text", "")
+            for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == m.topic_id
+        ]
+        assert not any("old-q-" in t or "old-a-" in t for t in projected), (
+            "no history should land in the topic before the user chooses; "
+            f"got: {projected[-3:]}")
+    finally:
+        bot.mod.mirror_mgr.unregister(csid)
+        try:
+            jp.unlink()
+            jp.parent.rmdir()
+        except OSError:
+            pass
+
+
+def test_mirror_history_full_click_runs_backfill(bot, tmp_path):
+    """Clicking the 'Full' button runs the merged backfill for the full
+    pre-registration history."""
+    import time as _time
+
+    csid = "mirror-test-click-full"
+    cwd = str(tmp_path / "click_full")
+    (tmp_path / "click_full").mkdir()
+    jp = _make_fake_jsonl(tmp_path, csid, cwd)
+    try:
+        # 18 user/assistant pairs = 36 logical events, above threshold.
+        _write_alternating_jsonl(jp, 18, prefix="hist")
+
+        bot.mod.on_open_in_bot(csid, cwd, None)
+        m = bot.mod.mirror_mgr.by_csid(csid)
+        assert m is not None
+        # The prompt was sent — find its callback_data for 'full'.
+        prompts = [
+            p for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == m.topic_id
+            and "reply_markup" in p
+        ]
+        btn_rows = prompts[-1]["reply_markup"]["inline_keyboard"]
+        flat = [b for row in btn_rows for b in row]
+        full_btn = next(b for b in flat
+                        if b["callback_data"].startswith("mirror_history:full:"))
+
+        bot.tg.inject_update(callback_update(
+            full_btn["callback_data"],
+            owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
+            thread_id=m.topic_id,
+        ))
+        _drain_updates(bot)
+
+        # Wait for backfill thread to project the LAST event (q-17 or a-17).
+        deadline = _time.time() + 5
+        while _time.time() < deadline:
+            texts = [
+                p.get("text", "")
+                for p in bot.tg.calls_of("sendMessage")
+                if p.get("message_thread_id") == m.topic_id
+            ]
+            if any("hist-a-17" in t for t in texts):
+                break
+            _time.sleep(0.05)
+
+        texts = [
+            p.get("text", "")
+            for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == m.topic_id
+        ]
+        # Full backfill must project the earliest, mid, and last events.
+        for label in ("hist-q-00", "hist-a-08", "hist-a-17"):
+            assert any(label in t for t in texts), (
+                f"{label} should be in full backfill; tail={texts[-5:]}")
+    finally:
+        bot.mod.mirror_mgr.unregister(csid)
+        try:
+            jp.unlink()
+            jp.parent.rmdir()
+        except OSError:
+            pass
+
+
+def test_mirror_history_short_click_emits_summary(bot, tmp_path):
+    """Clicking 'Short' runs the summary backfill — last N events
+    concatenated into one TG message (sent via send_long which may
+    chunk if needed)."""
+    import time as _time
+
+    csid = "mirror-test-click-short"
+    cwd = str(tmp_path / "click_short")
+    (tmp_path / "click_short").mkdir()
+    jp = _make_fake_jsonl(tmp_path, csid, cwd)
+    try:
+        # 20 pairs = 40 logical events; short summary keeps last 12.
+        _write_alternating_jsonl(jp, 20, prefix="S")
+
+        bot.mod.on_open_in_bot(csid, cwd, None)
+        m = bot.mod.mirror_mgr.by_csid(csid)
+        before_count = len(bot.tg.calls_of("sendMessage"))
+        prompts = [
+            p for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == m.topic_id
+            and "reply_markup" in p
+        ]
+        btn_rows = prompts[-1]["reply_markup"]["inline_keyboard"]
+        flat = [b for row in btn_rows for b in row]
+        short_btn = next(b for b in flat
+                         if b["callback_data"].startswith("mirror_history:short:"))
+
+        bot.tg.inject_update(callback_update(
+            short_btn["callback_data"],
+            owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
+            thread_id=m.topic_id,
+        ))
+        _drain_updates(bot)
+
+        # Wait for the summary message containing the very last event.
+        deadline = _time.time() + 3
+        summary_text = None
+        while _time.time() < deadline:
+            for p in bot.tg.calls_of("sendMessage")[before_count:]:
+                if (p.get("message_thread_id") == m.topic_id
+                        and "S-a-19" in p.get("text", "")):
+                    summary_text = p["text"]
+                    break
+            if summary_text:
+                break
+            _time.sleep(0.05)
+
+        assert summary_text, "summary message with last events not sent"
+        # Last 12 logical events out of 40: indices 28..39 of the
+        # logical sequence (alternating q,a). Pairs 14..19 fully fit
+        # in the 12-event tail (= 12 logical events): q-14 a-14 q-15
+        # a-15 ... q-19 a-19. So q-14 / a-19 must be in; q-13 must not.
+        for label in ("S-q-14", "S-a-17", "S-a-19"):
+            assert label in summary_text, (
+                f"{label} missing from short summary")
+        for missing in ("S-q-00", "S-a-05", "S-q-13"):
+            assert missing not in summary_text, (
+                f"{missing} should be excluded from short summary")
+    finally:
+        bot.mod.mirror_mgr.unregister(csid)
+        try:
+            jp.unlink()
+            jp.parent.rmdir()
+        except OSError:
+            pass

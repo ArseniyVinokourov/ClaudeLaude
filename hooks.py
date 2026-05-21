@@ -45,9 +45,11 @@ class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
 class HookBridge:
     def __init__(self,
                  on_notification: Callable,
-                 on_permission: Callable):
+                 on_permission: Callable,
+                 on_open_in_bot: Callable | None = None):
         self.on_notification = on_notification
         self.on_permission = on_permission
+        self.on_open_in_bot = on_open_in_bot
         self._pending: dict[str, threading.Event] = {}
         self._decisions: dict[str, str] = {}
         self._abandoned: set[str] = set()
@@ -122,6 +124,8 @@ class HookBridge:
                     self._handle_notification(body)
                 elif path == "/hook/permission":
                     self._handle_permission(body)
+                elif path == "/hook/open_in_bot":
+                    self._handle_open_in_bot(body)
                 else:
                     self.send_response(404)
                     self.end_headers()
@@ -145,6 +149,47 @@ class HookBridge:
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(b'{"status":"ok"}')
+
+            def _handle_open_in_bot(self, body):
+                """Register a terminal Claude session as a mirror.
+
+                Body: {session_id, cwd, dtach_socket?}. Returns 200 with
+                {topic_url} on success, 503 if the bot isn't ready. When
+                dtach_socket is empty, the mirror is registered as
+                output-only (no input bridge).
+                """
+                csid = body.get("session_id") or body.get("sessionId") or ""
+                cwd = body.get("cwd") or ""
+                dtach_socket = (body.get("dtach_socket")
+                                or body.get("dtachSocket") or "")
+                if not csid or not cwd:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b'{"error":"missing session_id or cwd"}')
+                    return
+                if not bridge.on_open_in_bot:
+                    self.send_response(503)
+                    self.end_headers()
+                    self.wfile.write(b'{"error":"open_in_bot not wired"}')
+                    return
+                try:
+                    result = bridge.on_open_in_bot(
+                        csid, cwd,
+                        dtach_socket or None,
+                    )
+                except Exception as e:
+                    _log(f"open_in_bot error: {e}")
+                    self.send_response(500)
+                    self.end_headers()
+                    self.wfile.write(
+                        json.dumps({"error": str(e)}).encode())
+                    return
+                payload = json.dumps(result or {"status": "ok"}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
 
             def _handle_permission(self, body):
                 req_id = f"{time.time_ns()}"

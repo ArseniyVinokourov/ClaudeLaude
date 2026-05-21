@@ -3,6 +3,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 
 import requests
@@ -14,6 +15,17 @@ _session = requests.Session()
 
 MAX_TEXT = 4096
 
+# Per-chat send-rate gate. Telegram throttles writes to a single chat
+# (per the docs, "avoid more than 1 msg/sec to a chat"). Without this
+# gate, bursty senders (healthcheck probing many topics back-to-back,
+# mirror follower projecting a turn) trip 429 with a 15-25 s
+# Retry-After, which then blocks WHICHEVER thread issued the offending
+# call. The gate serializes outbound calls per chat to stay under
+# Telegram's burst threshold.
+_CHAT_SEND_INTERVAL = float(os.environ.get("BOT_CHAT_SEND_INTERVAL", "1.05"))
+_chat_send_ts: dict[int, float] = {}
+_chat_send_lock = threading.Lock()
+
 
 def _log(msg):
     print(f"[tg] {msg}", file=sys.stderr, flush=True)
@@ -23,7 +35,32 @@ def esc(text: str) -> str:
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _gate_chat(chat_id) -> None:
+    """Block until _CHAT_SEND_INTERVAL has passed since the last
+    chat-touching call for the same chat_id. No-op if chat_id is
+    missing (global API calls)."""
+    if not chat_id:
+        return
+    try:
+        cid = int(chat_id)
+    except (TypeError, ValueError):
+        return
+    with _chat_send_lock:
+        now = time.monotonic()
+        last = _chat_send_ts.get(cid, 0.0)
+        wait = last + _CHAT_SEND_INTERVAL - now
+        if wait > 0:
+            time.sleep(wait)
+            now = time.monotonic()
+        _chat_send_ts[cid] = now
+
+
 def _req(method: str, params: dict | None = None) -> dict:
+    # Chat-modifying methods (sendMessage, editMessageText, editForumTopic,
+    # deleteMessage, setMessageReaction, pinChatMessage, …) all carry a
+    # `chat_id` field. Throttle them per chat to dodge 429s.
+    if params:
+        _gate_chat(params.get("chat_id"))
     for attempt in range(3):
         try:
             r = _session.post(f"{API}/{method}", json=params or {}, timeout=60)

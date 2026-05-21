@@ -28,7 +28,7 @@ FORUM_CHAT_ID = 1001
 def _purge_bot_modules():
     for name in [
         "bot", "telegram", "sessions", "hooks", "config", "version",
-        "audit", "device_monitor",
+        "audit", "device_monitor", "terminal_mirror",
     ]:
         sys.modules.pop(name, None)
 
@@ -37,6 +37,7 @@ def _purge_bot_modules():
 def bot_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     state_file = tmp_path / "state.json"
     sessions_file = tmp_path / "sessions.json"
+    mirrors_file = tmp_path / "mirrors.json"
     state_file.write_text(json.dumps({"forum_chat_id": FORUM_CHAT_ID}))
 
     monkeypatch.setenv("BOT_TOKEN", "fake-token")
@@ -46,6 +47,7 @@ def bot_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("UNLOCK_WORD", "")
     monkeypatch.setenv("BOT_STATE_FILE", str(state_file))
     monkeypatch.setenv("BOT_SESSIONS_FILE", str(sessions_file))
+    monkeypatch.setenv("BOT_MIRRORS_FILE", str(mirrors_file))
 
     (tmp_path / "projects").mkdir()
     (tmp_path / "projects" / "demo").mkdir()

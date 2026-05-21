@@ -28,6 +28,10 @@ import audit
 import telegram as tg
 from sessions import MODE_PRESETS, Session, SessionManager
 from hooks import HookBridge
+from terminal_mirror import (
+    TerminalMirrorManager, push_to_dtach, dtach_socket_alive,
+    read_logical_events,
+)
 
 # ── state ────────────────────────────────────────────────────────────
 
@@ -282,6 +286,20 @@ def _enqueue_user_input(session, text: str, chat_id: int,
         _record_topic_msg(session.topic_id, msg_id)
 
 
+_BASH_READONLY_PREFIXES = (
+    "cat ", "ls", "pwd", "echo ", "printf ",
+    "find ", "grep ", "rg ", "ag ",
+    "head ", "tail ", "wc ", "awk ", "sed -n",
+    "git log", "git status", "git diff", "git blame",
+    "git branch", "git show", "git ls-files",
+    "gh pr list", "gh issue list", "gh release list",
+    "gh pr view", "gh issue view",
+    "which ", "type ", "command -v",
+    "stat ", "file ", "du ", "df ",
+    "ps ", "top ", "htop",
+)
+
+
 def _is_noisy_tool(tool, inp):
     if tool in _NOISE_TOOLS:
         return True
@@ -289,6 +307,28 @@ def _is_noisy_tool(tool, inp):
         path = inp.get("file_path", "")
         if any(p in path for p in _NOISE_PATHS):
             return True
+    if tool == "Bash":
+        cmd = inp.get("command", "") or ""
+        # Hide the slash command's own curl to the bot's hook endpoint —
+        # it's plumbing, not user-visible work.
+        if "/hook/open_in_bot" in cmd or f":{HOOK_PORT}/hook/" in cmd:
+            return True
+    return False
+
+
+def _is_mirror_noisy_tool(tool, inp):
+    """Stricter filter for the mirror channel: hide observational Bash
+    too (cat/grep/git log/etc) so the topic stays a clean conversation
+    transcript. Full tool trace is still visible in the terminal.
+    """
+    if _is_noisy_tool(tool, inp):
+        return True
+    if tool == "Bash":
+        cmd = (inp.get("command", "") or "").lstrip()
+        cmd_head = cmd.split(" 2>")[0].split(" |")[0].split(" &&")[0].lstrip()
+        for prefix in _BASH_READONLY_PREFIXES:
+            if cmd_head.startswith(prefix):
+                return True
     return False
 
 
@@ -781,7 +821,9 @@ def on_thinking(session):
 def _compact_tool_msg(tool, inp):
     if tool == "Bash":
         cmd = inp.get("command", "?")
-        return f"$ {cmd[:60]}" if len(cmd) <= 60 else f"$ {cmd[:57]}…"
+        # Collapse multi-line shell snippets into one displayable line.
+        cmd = cmd.replace("\n", " ; ").strip()
+        return f"$ {cmd[:50]}" if len(cmd) <= 50 else f"$ {cmd[:47]}…"
     if tool in ("Write", "Edit"):
         path = inp.get("file_path", "?")
         return f"{tool}: {os.path.basename(path)}"
@@ -2235,9 +2277,327 @@ mgr = SessionManager(
     on_session_stop=_on_session_stop,
     on_session_context=_session_context,
 )
+
+
+def on_mirror_event(mirror, event):
+    """Project a JSONL event from a terminal session into its mirror topic.
+
+    Filters for content the owner cares about: user prompts (plain
+    text only), assistant text blocks, and tool_use one-liners.
+    Everything else (tool_result echoes, attachments, system events,
+    thinking blocks) is dropped.
+    """
+    fid = forum()
+    if not fid or not mirror.topic_id:
+        return
+    etype = event.get("type", "")
+
+    if etype == "user":
+        # System-injected user events (slash-command bodies, hook
+        # outputs, etc.) carry `isMeta: true` at the top level. Real
+        # user input is `isMeta: None/false`. Skip meta events
+        # universally — they are not what the owner typed.
+        if event.get("isMeta"):
+            return
+        msg = event.get("message") or {}
+        content = msg.get("content")
+        text = ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            parts = []
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "text":
+                    parts.append(b.get("text", ""))
+            text = "".join(parts)
+        text = text.strip()
+        if not text:
+            return
+        # Belt-and-braces for older Claude Code builds that don't set
+        # isMeta yet: the wrapper-tags event still has the literal
+        # <command-*> markers.
+        if ("<command-message>" in text
+                or "<command-name>" in text
+                or "<command-args>" in text):
+            return
+        # Echo suppression: if this text was just pushed into the pane
+        # from the same mirror topic, the TG message is already visible
+        # there — projecting another `👤 …` blockquote would duplicate.
+        if mirror.consume_recent_echo(text):
+            return
+        tg.send(f"<blockquote>\U0001f464 {tg.esc(text[:3000])}</blockquote>",
+                fid, thread_id=mirror.topic_id)
+        return
+
+    if etype == "assistant":
+        msg = event.get("message") or {}
+        content = msg.get("content")
+        if not isinstance(content, list):
+            return
+        text_parts = []
+        tool_lines = []
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            btype = b.get("type")
+            if btype == "text":
+                text_parts.append(b.get("text", ""))
+            elif btype == "tool_use":
+                tool = b.get("name") or "?"
+                inp = b.get("input") or {}
+                if not _is_mirror_noisy_tool(tool, inp):
+                    tool_lines.append(_compact_tool_msg(tool, inp))
+        text = "".join(text_parts).strip()
+        # Drop the /bot-mirror echo: its assistant turn just prints
+        # `mirror: <topic_url>` plus a `tip:` / `output-only` line —
+        # info the owner already sees via the HTTP response. Projecting
+        # it back into the topic it created produces visual noise.
+        if text.startswith("mirror: https://t.me/c/"):
+            text = ""
+        if text:
+            tg.send_long(text, fid, thread_id=mirror.topic_id,
+                         markdown=True)
+        for line in tool_lines:
+            tg.send(f"⚙️ {tg.esc(line)}",
+                    fid, thread_id=mirror.topic_id)
+        # Acknowledge any pending TG message: 👀 (received) → 👍 (claude
+        # answered) so the owner sees from Telegram that delivery worked
+        # end-to-end, not just up to the pane.
+        if (text or tool_lines) and mirror.pending_user_msg_id:
+            try:
+                tg.set_message_reaction(
+                    fid, mirror.pending_user_msg_id, _REACT_DONE)
+            except Exception:
+                pass
+            mirror.pending_user_msg_id = None
+        return
+
+    if etype == "tool_use":
+        tool = event.get("name") or "?"
+        inp = event.get("input") or event.get("tool_input") or {}
+        if not _is_mirror_noisy_tool(tool, inp):
+            tg.send(f"⚙️ {tg.esc(_compact_tool_msg(tool, inp))}",
+                    fid, thread_id=mirror.topic_id)
+
+
+mirror_mgr = TerminalMirrorManager(on_event=on_mirror_event)
+
+# When the JSONL already contains more than this many logical events
+# at /bot-mirror time, the bot asks the owner via inline buttons
+# whether to backfill the full history (slow, 1 msg/sec) or a brief
+# summary (single TG message with last few events). Below the
+# threshold, full backfill runs silently.
+_BACKFILL_ASK_THRESHOLD = 30
+_BACKFILL_SHORT_TAIL = 12
+
+# Pending backfill choices keyed by csid: {"snapshot": int,
+# "button_msg_id": int|None}. Populated when on_open_in_bot sends the
+# choice prompt; consumed when the user clicks Full / Short.
+_pending_backfill: dict = {}
+_pending_backfill_lock = threading.Lock()
+
+
+def _send_logical_event(fid: int, topic_id: int, ev: dict) -> None:
+    """Project one logical event (user or assistant) into a topic."""
+    if ev["kind"] == "user":
+        text = ev.get("text", "")[:3000]
+        tg.send(f"<blockquote>\U0001f464 {tg.esc(text)}</blockquote>",
+                fid, thread_id=topic_id)
+        return
+    # assistant
+    text = (ev.get("text") or "").strip()
+    if text:
+        tg.send_long(text, fid, thread_id=topic_id, markdown=True)
+    for tool in ev.get("tools") or []:
+        name = tool.get("name") or "?"
+        inp = tool.get("input") or {}
+        if not _is_mirror_noisy_tool(name, inp):
+            tg.send(f"⚙️ {tg.esc(_compact_tool_msg(name, inp))}",
+                    fid, thread_id=topic_id)
+
+
+def _backfill_full(mirror, fid: int, snapshot_offset: int) -> None:
+    """Project every logical event in JSONL[0..snapshot_offset]."""
+    try:
+        events = read_logical_events(mirror.jsonl_path)
+    except Exception as e:
+        print(f"[mirror backfill] read failed: {e}",
+              file=sys.stderr, flush=True)
+        return
+    events = [e for e in events
+              if int(e.get("byte_end", 0)) <= snapshot_offset]
+    for ev in events:
+        if not mirror.alive:
+            return
+        try:
+            _send_logical_event(fid, mirror.topic_id, ev)
+        except Exception as e:
+            print(f"[mirror backfill] send failed: {e}",
+                  file=sys.stderr, flush=True)
+
+
+def _backfill_short_summary(mirror, fid: int,
+                            snapshot_offset: int, n: int) -> None:
+    """Glue the last N logical events into one (or chunked-by-TG-cap)
+    TG message — quick context preview instead of full history."""
+    try:
+        events = read_logical_events(mirror.jsonl_path)
+    except Exception:
+        events = []
+    events = [e for e in events
+              if int(e.get("byte_end", 0)) <= snapshot_offset]
+    if not events:
+        return
+    if len(events) > n:
+        events = events[-n:]
+    parts = []
+    for ev in events:
+        if ev["kind"] == "user":
+            parts.append(
+                f"<blockquote>\U0001f464 "
+                f"{tg.esc(ev['text'][:1500])}</blockquote>"
+            )
+        else:
+            text = (ev.get("text") or "").strip()
+            if text:
+                parts.append(tg.esc(text[:1500]))
+            for tool in ev.get("tools") or []:
+                if not _is_mirror_noisy_tool(tool["name"], tool["input"]):
+                    parts.append(
+                        f"⚙️ {tg.esc(_compact_tool_msg(tool['name'], tool['input']))}"
+                    )
+    body = "\n\n".join(parts)
+    if body:
+        tg.send_long(body, fid, thread_id=mirror.topic_id)
+
+
+def _start_backfill_thread(mirror, fid: int, mode: str,
+                           snapshot_offset: int) -> None:
+    """Spawn a daemon thread that runs the chosen backfill, then
+    releases mirror.backfill_done so the follower can resume."""
+    def run():
+        try:
+            if mode == "full":
+                _backfill_full(mirror, fid, snapshot_offset)
+            elif mode == "short":
+                _backfill_short_summary(mirror, fid, snapshot_offset,
+                                        _BACKFILL_SHORT_TAIL)
+        finally:
+            mirror.backfill_done.set()
+    threading.Thread(target=run, daemon=True,
+                     name=f"mirror-backfill-{mirror.csid[:8]}").start()
+
+
+def on_open_in_bot(csid, cwd, dtach_socket):
+    """Bot-side handler for POST /hook/open_in_bot.
+
+    Creates a mirror topic if one doesn't exist for this csid, starts
+    the JSONL follower, returns {status, topic_url}. dtach_socket is
+    the path to the unix socket of the wrapped claude (e.g.
+    `/tmp/clmirror-<pid>.sock`) — bot writes input via
+    `dtach -p <socket>`. When empty, the mirror runs output-only.
+    """
+    fid = forum()
+    if not fid:
+        return {"error": "bot has no forum chat configured"}
+    existing = mirror_mgr.by_csid(csid)
+    if existing:
+        url = _topic_url(existing.topic_id)
+        # If the previous follower thread died (e.g. JSONL hadn't been
+        # written yet on first registration), restart it now that the
+        # user is invoking the command again with the file likely
+        # already in place.
+        if not existing.follower or not existing.follower.is_alive():
+            mirror_mgr.start_follower(existing)
+        # Refresh the dtach binding — the user may have re-launched
+        # their terminal claude, getting a new socket path.
+        if dtach_socket and existing.dtach_socket != dtach_socket:
+            mirror_mgr.set_dtach_socket(csid, dtach_socket)
+        return {"status": "ok", "topic_url": url, "existing": True,
+                "input_bridge": bool(existing.dtach_socket)}
+    name = os.path.basename(cwd.rstrip("/")) or "terminal"
+    ts = time.strftime("%H:%M")
+    # Topic icon is the 💻 terminal emoji (icon_custom_emoji_id), so we
+    # don't double up with another decorative prefix here.
+    label = f"{name} mirror — {ts}"[:128]
+    try:
+        topic_id = tg.create_forum_topic(
+            fid, label, icon_color=0x6FB9F0,
+            icon_custom_emoji_id=_ICON_TERMINAL)
+    except Exception as e:
+        return {"error": f"create_forum_topic failed: {e}"}
+    if not topic_id:
+        return {"error": "create_forum_topic returned no id"}
+    with state.lock:
+        state.topic_labels[topic_id] = label
+    m = mirror_mgr.register(csid, cwd, topic_id, dtach_socket)
+    snapshot_offset = m.last_offset  # JSONL size at registration time
+    # Welcome so the freshly-created topic isn't visually empty.
+    if dtach_socket:
+        send_to_topic(
+            topic_id,
+            "\U0001fa9e Mirror attached. Type in this topic — keystrokes "
+            "go into the terminal claude.",
+        )
+    else:
+        send_to_topic(
+            topic_id,
+            "\U0001f50c Mirror is output-only — start your terminal "
+            "claude inside dtach to enable typing from here.",
+        )
+
+    # Count logical (user-visible) events already in the transcript.
+    # ≤ threshold → silent full backfill. > threshold → ask the owner
+    # via inline buttons whether they want the full slow stream or a
+    # short single-message summary.
+    try:
+        existing_events = read_logical_events(m.jsonl_path)
+        n_events = sum(
+            1 for e in existing_events
+            if int(e.get("byte_end", 0)) <= snapshot_offset
+        )
+    except Exception as e:
+        print(f"[mirror] could not count history: {e}",
+              file=sys.stderr, flush=True)
+        n_events = 0
+
+    if n_events > 0:
+        # Suspend the follower until backfill is decided/done — keeps
+        # ordering chronological.
+        m.backfill_done.clear()
+        if n_events <= _BACKFILL_ASK_THRESHOLD:
+            _start_backfill_thread(m, fid, "full", snapshot_offset)
+        else:
+            eta_sec = max(n_events, 1)  # ~1 msg/sec rate-gate
+            buttons = [[
+                {"text": f"Полная история (~{eta_sec}с)",
+                 "callback_data": f"mirror_history:full:{csid[:24]}"},
+                {"text": "Кратко (последние 12)",
+                 "callback_data": f"mirror_history:short:{csid[:24]}"},
+            ]]
+            prompt = (
+                f"В этой сессии уже {n_events} сообщений. "
+                f"Загрузить полностью (медленно, по ~1 сек/сообщение из-за "
+                f"TG rate-limit) или короткую сводку одним сообщением?"
+            )
+            msg_id = tg.send(prompt, fid, thread_id=topic_id,
+                             buttons=buttons)
+            with _pending_backfill_lock:
+                _pending_backfill[csid] = {
+                    "snapshot": snapshot_offset,
+                    "button_msg_id": msg_id,
+                }
+
+    mirror_mgr.start_follower(m)
+    url = _topic_url(topic_id)
+    return {"status": "ok", "topic_url": url, "existing": False,
+            "input_bridge": bool(dtach_socket)}
+
+
 bridge = HookBridge(
     on_notification=on_hook_notification,
     on_permission=on_hook_permission,
+    on_open_in_bot=on_open_in_bot,
 )
 
 
@@ -2297,6 +2657,31 @@ def _topic_healthcheck():
                 label = session.topic_label or session.name
             if not tg.topic_alive(fid, session.topic_id, name=label):
                 _invalidate_and_stop(session, "topic deleted")
+
+        # Mirrors: probe topic existence and dtach-socket presence only.
+        # A mirror with a vanished topic is dropped; a vanished dtach
+        # socket flips the mirror to output-only. We deliberately do NOT
+        # close on JSONL idleness — a long pause between turns is the
+        # owner's choice (per [[no-hard-ceiling]]), not a signal to
+        # tear down the mirror behind their back.
+        for mirror in mirror_mgr.list():
+            if not mirror.alive:
+                continue
+            with state.lock:
+                label = state.topic_labels.get(mirror.topic_id)
+            if not label:
+                label = f"mirror {mirror.csid[:8]}"
+            if not tg.topic_alive(fid, mirror.topic_id, name=label):
+                print(f"[mirror] topic gone for {mirror.csid[:8]} — unregistering",
+                      file=sys.stderr, flush=True)
+                mirror_mgr.unregister(mirror.csid)
+                continue
+            if (mirror.dtach_socket and
+                    not dtach_socket_alive(mirror.dtach_socket)):
+                send_to_topic(
+                    mirror.topic_id,
+                    "\U0001f50c Terminal closed — mirror is now output-only")
+                mirror_mgr.set_dtach_socket(mirror.csid, None)
 
 
 def _cleanup_terminal_pending(csid: str):
@@ -2400,6 +2785,7 @@ def main():
                 state.topic_labels[s.topic_id] = s.topic_label
     bridge.start()
     _cleanup_general()
+    mirror_mgr.start_all_followers()
     threading.Thread(target=_topic_healthcheck, daemon=True).start()
     threading.Thread(target=_dashboard_loop, daemon=True).start()
     threading.Thread(target=_terminal_watcher, daemon=True).start()
@@ -2528,10 +2914,52 @@ def _handle_update(u):
     thread_id = msg.get("message_thread_id")
     msg_id = msg.get("message_id")
     session = mgr.by_topic(thread_id) if thread_id else None
+    mirror = mirror_mgr.by_topic(thread_id) if thread_id and not session else None
 
     fid = forum()
     if not thread_id and fid and chat_id == fid and msg_id:
         tg.delete(msg_id, chat_id)
+
+    # ── Terminal-mirror topic: forward text into the terminal claude
+    # via the dtach socket, or politely reject if input isn't bridged.
+    if mirror:
+        photos = msg.get("photo")
+        document = msg.get("document")
+        sticker = msg.get("sticker")
+        if photos or document or sticker:
+            _ephemeral(chat_id,
+                       "\U0001f501 Mirror does not bridge files/stickers — type text",
+                       thread_id=thread_id, seconds=5)
+            return
+        if not text:
+            return
+        if not mirror.dtach_socket:
+            _ephemeral(chat_id,
+                       "\U0001f501 Output-only mirror — terminal input is not bridged "
+                       "(start your terminal claude inside dtach to enable it)",
+                       thread_id=thread_id, seconds=8)
+            return
+        if msg_id:
+            tg.set_message_reaction(chat_id, msg_id, _REACT_RECEIVED)
+        ok = push_to_dtach(mirror.dtach_socket, text)
+        if not ok:
+            if msg_id:
+                tg.set_message_reaction(chat_id, msg_id, _REACT_ERROR)
+            _ephemeral(chat_id,
+                       "❌ Could not deliver to terminal "
+                       "(dtach socket missing or unresponsive)",
+                       thread_id=thread_id, seconds=8)
+            mirror_mgr.set_dtach_socket(mirror.csid, None)
+        else:
+            # Remember this msg so the JSONL follower can swap 👀 → 👍
+            # once claude actually replies (proves end-to-end delivery,
+            # not just send-keys success).
+            mirror.pending_user_msg_id = msg_id
+            # Mark the text so the follower's user-event projection
+            # suppresses the echo back into this same topic.
+            mirror.note_injection(text)
+        audit.log("mirror_input", text[:200], sid=mirror.csid)
+        return
 
     # Handle photo/document attachments
     photos = msg.get("photo")
@@ -2872,6 +3300,32 @@ def _handle_callback(cb, data):
         _do_kill()
         if cb_msg and cb_chat:
             tg.edit(cb_msg, "\U0001f512 Bot killed", cb_chat)
+
+    elif data.startswith("mirror_history:"):
+        # mirror_history:<mode>:<csid_prefix>
+        parts = data.split(":", 2)
+        if len(parts) == 3:
+            mode, csid_prefix = parts[1], parts[2]
+            with _pending_backfill_lock:
+                hit_csid = None
+                for full_csid in list(_pending_backfill.keys()):
+                    if full_csid.startswith(csid_prefix):
+                        hit_csid = full_csid
+                        break
+                entry = _pending_backfill.pop(hit_csid, None) if hit_csid else None
+            mirror = mirror_mgr.by_csid(hit_csid) if hit_csid else None
+            if entry and mirror and cb_chat and cb_msg:
+                # Drop the prompt; the chosen mode's content takes its place.
+                try:
+                    tg.delete(cb_msg, cb_chat)
+                except Exception:
+                    pass
+                _start_backfill_thread(
+                    mirror, cb_chat, mode, entry["snapshot"])
+            elif cb_msg and cb_chat:
+                tg.edit(cb_msg,
+                        "История больше недоступна (сессия пересоздана).",
+                        cb_chat)
 
     elif data.startswith("m:"):
         action = data[2:]

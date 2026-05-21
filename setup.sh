@@ -169,6 +169,119 @@ print('ok')
     ok "Claude Code hooks configured in $SETTINGS_FILE"
 fi
 
+# ── Claude slash command: /bot-mirror ────────────────────────────────
+bold "\n/bot-mirror slash command"
+echo "Installs ~/.claude/commands/bot-mirror.md so you can run /bot-mirror"
+echo "inside any Claude session to open a Telegram topic for it."
+echo ""
+read -rp "Install /bot-mirror command? [Y/n]: " SETUP_BOT_CMD
+SETUP_BOT_CMD="${SETUP_BOT_CMD:-Y}"
+
+if [[ "$SETUP_BOT_CMD" =~ ^[Yy] ]]; then
+    CMD_SRC="$SCRIPT_DIR/scripts/claude_commands/bot-mirror.md"
+    CMD_DST_DIR="$HOME/.claude/commands"
+    CMD_DST="$CMD_DST_DIR/bot-mirror.md"
+    if [ -f "$CMD_SRC" ]; then
+        mkdir -p "$CMD_DST_DIR"
+        cp "$CMD_SRC" "$CMD_DST"
+        # Drop the old `/bot mirror` name so the rename is clean.
+        rm -f "$CMD_DST_DIR/bot.md"
+        ok "Installed $CMD_DST"
+    else
+        warn "Slash command source missing at $CMD_SRC — skipping"
+    fi
+fi
+
+# ── Mirror (~/.bashrc claude() function) ─────────────────────────────
+bold "\nTerminal-mirror (optional)"
+echo "When enabled, the bot can stream input from a Telegram topic into"
+echo "your running terminal Claude — exactly as if you were typing at"
+echo "the keyboard. The mechanism: a tiny bash function in ~/.bashrc"
+echo "transparently runs 'claude' under 'dtach' (a 30 KB PTY relay), so"
+echo "the bot can write to claude's stdin via 'dtach -p <socket>'."
+echo ""
+echo "Your everyday workflow stays identical — you keep typing 'claude'."
+echo "dtach is transparent: claude renders directly into your terminal,"
+echo "no compositing layer. To bypass for one shell, set"
+echo "CLAUDELAUDE_NO_WRAP=1 before running 'claude'."
+echo ""
+
+if ! command -v dtach &>/dev/null; then
+    warn "'dtach' is not installed. Mirror input bridge requires dtach."
+    echo "  Debian/Ubuntu: sudo apt install dtach"
+    echo "  macOS:         brew install dtach"
+    echo "Skipping mirror setup; install dtach and re-run setup.sh."
+else
+    read -rp "Enable terminal mirror (adds a bash function to ~/.bashrc)? [Y/n]: " INSTALL_MIRROR
+    INSTALL_MIRROR="${INSTALL_MIRROR:-Y}"
+
+    if [[ "$INSTALL_MIRROR" =~ ^[Yy] ]]; then
+        BASHRC="$HOME/.bashrc"
+        MARK_BEGIN="# >>> claudelaude mirror >>>"
+        MARK_END="# <<< claudelaude mirror <<<"
+
+        # Refuse to install if user has their own claude() / alias and
+        # it's not ours. Our marker block is exempt from this check.
+        if [ -f "$BASHRC" ] && grep -q "$MARK_BEGIN" "$BASHRC"; then
+            ok "Mirror block already present in ~/.bashrc — refreshing"
+            # Strip existing block before re-inserting (idempotent).
+            python3 -c "
+import re, pathlib
+p = pathlib.Path('$BASHRC')
+src = p.read_text()
+new = re.sub(r'\n?$MARK_BEGIN.*?$MARK_END\n?', '\n', src, flags=re.S)
+p.write_text(new)
+"
+        elif [ -f "$BASHRC" ] && grep -qE '^[[:space:]]*(alias[[:space:]]+claude=|claude\(\)[[:space:]]*\{|function[[:space:]]+claude[[:space:]]*[\{(])' "$BASHRC"; then
+            warn "An existing 'claude' alias/function was found in ~/.bashrc."
+            echo "  Refusing to overwrite. Remove or rename it, then re-run setup.sh."
+            INSTALL_MIRROR=N
+        fi
+
+        if [[ "$INSTALL_MIRROR" =~ ^[Yy] ]]; then
+            # Backup ~/.bashrc once before our first edit.
+            if [ -f "$BASHRC" ] && [ ! -f "$BASHRC.before-claudelaude" ]; then
+                cp "$BASHRC" "$BASHRC.before-claudelaude"
+                ok "Backed up ~/.bashrc to ~/.bashrc.before-claudelaude"
+            fi
+
+            cat >> "$BASHRC" <<'BASHRC_BLOCK'
+
+# >>> claudelaude mirror >>>
+# Routes plain `claude` invocations through dtach so the ClaudeLaude bot
+# can write to the session's stdin via `dtach -p <socket>`. dtach is a
+# transparent PTY relay (no rendering, no compositing) — claude draws
+# directly into your terminal, so the workflow looks identical to a
+# bare claude. To bypass for one shell, set CLAUDELAUDE_NO_WRAP=1.
+claude() {
+    if [ -n "${CLAUDELAUDE_NO_WRAP:-}" ] \
+       || [ -n "${CLAUDELAUDE_DTACH_SOCKET:-}" ] \
+       || ! command -v dtach >/dev/null 2>&1; then
+        command claude "$@"
+        return $?
+    fi
+    local sock="${CLAUDELAUDE_SOCKET:-/tmp/clmirror-$$.sock}"
+    [ -e "$sock" ] && rm -f "$sock"
+    # Export the socket path so /bot-mirror (running inside claude) can
+    # read it and tell the bot where to send input.
+    # -E: disable the detach key (so Ctrl-\ never pulls you out).
+    # -z: disable suspend (Ctrl-Z stays usable as a normal char if any
+    #     TUI wants it; in practice claude ignores it).
+    # -r winch: on re-attach, send SIGWINCH so the program redraws at
+    #     the new size.
+    CLAUDELAUDE_DTACH_SOCKET="$sock" \
+        dtach -A "$sock" -E -z -r winch claude "$@"
+}
+# <<< claudelaude mirror <<<
+BASHRC_BLOCK
+            ok "Installed mirror block in ~/.bashrc"
+            echo "  Open a new terminal (or 'source ~/.bashrc') for it to take effect."
+        fi
+    else
+        ok "Skipping mirror. /bot-mirror will run output-only when invoked."
+    fi
+fi
+
 # ── bot profile (one-time branding) ──────────────────────────────────
 bold "\nBot profile"
 echo "Set the bot's display name, short description (search preview),"
@@ -213,7 +326,7 @@ fi
 # ── smoke test ───────────────────────────────────────────────────────
 bold "\nSmoke test"
 
-if .venv/bin/python -c "import bot, telegram, sessions, hooks, config, version" 2>/tmp/claudelaude_smoke.log; then
+if .venv/bin/python -c "import bot, telegram, sessions, hooks, config, version, terminal_mirror" 2>/tmp/claudelaude_smoke.log; then
     ok "Python imports OK"
 else
     warn "Python import check failed (see /tmp/claudelaude_smoke.log)"
