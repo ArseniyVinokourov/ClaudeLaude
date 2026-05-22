@@ -1900,6 +1900,513 @@ def test_mirror_suppresses_tg_echo(bot, tmp_path, monkeypatch):
             pass
 
 
+def test_mirror_hides_slash_command_bash_tool_use(bot, tmp_path):
+    """The /bot-mirror slash command's body is `source …/bot-mirror-cmd.sh`.
+    The assistant turn that runs it must NOT leak into the mirror topic
+    as `⚙️ $ source …` — the swap mechanics are internal plumbing, not
+    user-facing work. Also check the legacy curl-based inline body
+    (still seen on older installs that haven't re-run setup.sh)."""
+    import json as _json
+    import time as _time
+    csid = "mirror-test-slashcmd-toolcall"
+    cwd = str(tmp_path / "mirror_project_slashcall")
+    (tmp_path / "mirror_project_slashcall").mkdir()
+    jp = _make_fake_jsonl(tmp_path, csid, cwd)
+    try:
+        bot.mod.on_open_in_bot(csid, cwd, None)
+        m = bot.mod.mirror_mgr.by_csid(csid)
+
+        with open(jp, "a") as f:
+            f.write(_json.dumps({
+                "type": "assistant",
+                "message": {"content": [{
+                    "type": "tool_use", "name": "Bash",
+                    "input": {"command":
+                              'source "$HOME/.claude/commands/bot-mirror-cmd.sh"'},
+                }]},
+            }) + "\n")
+            f.write(_json.dumps({
+                "type": "assistant",
+                "message": {"content": [{
+                    "type": "tool_use", "name": "Bash",
+                    "input": {"command":
+                              'curl -X POST http://127.0.0.1:9853/hook/open_in_bot'},
+                }]},
+            }) + "\n")
+            # Non-readonly Bash so the mirror's stricter filter
+            # (which already hides ls/cat/grep/etc.) doesn't drop it.
+            f.write(_json.dumps({
+                "type": "assistant",
+                "message": {"content": [{
+                    "type": "tool_use", "name": "Bash",
+                    "input": {"command":
+                              "mkdir /tmp/should-not-be-filtered"},
+                }]},
+            }) + "\n")
+
+        deadline = _time.time() + 2.5
+        non_slash_seen = False
+        while _time.time() < deadline:
+            for params in bot.tg.calls_of("sendMessage"):
+                if (params.get("message_thread_id") == m.topic_id
+                        and "should-not-be-filtered"
+                            in params.get("text", "")):
+                    non_slash_seen = True
+                    break
+            if non_slash_seen:
+                break
+            _time.sleep(0.05)
+        assert non_slash_seen, "unrelated Bash tool_use must still be projected"
+
+        bad = [
+            p.get("text", "")
+            for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == m.topic_id
+            and ("bot-mirror-cmd.sh" in p.get("text", "")
+                 or "/hook/open_in_bot" in p.get("text", ""))
+        ]
+        assert not bad, (
+            f"slash-command plumbing must not appear in the topic; "
+            f"got: {bad}"
+        )
+    finally:
+        bot.mod.mirror_mgr.unregister(csid)
+        try:
+            jp.unlink()
+            jp.parent.rmdir()
+        except OSError:
+            pass
+
+
+def test_mirror_filter_level_all_hides_every_tool_use(bot, tmp_path):
+    """At filter_level='all', the mirror projects only user prompts
+    and assistant TEXT — every tool_use is suppressed (chat-only view).
+    Default-level 'lite' must still surface non-noisy tool_uses."""
+    import json as _json
+    import time as _time
+    csid = "mirror-test-filter-all"
+    cwd = str(tmp_path / "mirror_project_filter")
+    (tmp_path / "mirror_project_filter").mkdir()
+    jp = _make_fake_jsonl(tmp_path, csid, cwd)
+    try:
+        bot.mod.on_open_in_bot(csid, cwd, None)
+        m = bot.mod.mirror_mgr.by_csid(csid)
+        bot.mod.mirror_mgr.set_filter_level(csid, "all")
+
+        with open(jp, "a") as f:
+            f.write(_json.dumps({
+                "type": "assistant",
+                "message": {"content": [
+                    {"type": "text", "text": "running a real task"},
+                    {"type": "tool_use", "name": "Bash",
+                     "input": {"command": "make test"}},
+                ]},
+            }) + "\n")
+
+        deadline = _time.time() + 2.5
+        text_hit = False
+        while _time.time() < deadline:
+            for params in bot.tg.calls_of("sendMessage"):
+                if (params.get("message_thread_id") == m.topic_id
+                        and "running a real task" in params.get("text", "")):
+                    text_hit = True
+                    break
+            if text_hit:
+                break
+            _time.sleep(0.05)
+        assert text_hit, "assistant text must still be projected"
+
+        tool_hits = [
+            p.get("text", "")
+            for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == m.topic_id
+            and p.get("text", "").startswith("⚙️")
+        ]
+        assert not tool_hits, (
+            f"filter_level=all must hide ALL tool_use; got: {tool_hits}"
+        )
+    finally:
+        bot.mod.mirror_mgr.unregister(csid)
+        try:
+            jp.unlink()
+            jp.parent.rmdir()
+        except OSError:
+            pass
+
+
+def test_mirror_filter_lite_hides_write_and_heredoc(bot, tmp_path):
+    """At filter_level='lite' (default), the mirror should hide
+    Write/Edit (already shown via permission prompt) and python-heredoc
+    Bash (implementation plumbing). A plain Bash should still surface.
+    """
+    import json as _json
+    import time as _time
+    csid = "mirror-test-filter-lite"
+    cwd = str(tmp_path / "mirror_project_lite")
+    (tmp_path / "mirror_project_lite").mkdir()
+    jp = _make_fake_jsonl(tmp_path, csid, cwd)
+    try:
+        bot.mod.on_open_in_bot(csid, cwd, None)
+        m = bot.mod.mirror_mgr.by_csid(csid)
+        assert m.filter_level == "lite"
+
+        with open(jp, "a") as f:
+            f.write(_json.dumps({
+                "type": "assistant",
+                "message": {"content": [{
+                    "type": "tool_use", "name": "Write",
+                    "input": {"file_path": "/tmp/x.txt", "content": "hi"},
+                }]},
+            }) + "\n")
+            f.write(_json.dumps({
+                "type": "assistant",
+                "message": {"content": [{
+                    "type": "tool_use", "name": "Bash",
+                    "input": {"command":
+                              "python3 <<'PYEOF'\nimport os\nPYEOF"},
+                }]},
+            }) + "\n")
+            f.write(_json.dumps({
+                "type": "assistant",
+                "message": {"content": [{
+                    "type": "tool_use", "name": "Bash",
+                    "input": {"command": "make test"},
+                }]},
+            }) + "\n")
+
+        deadline = _time.time() + 2.5
+        plain_seen = False
+        while _time.time() < deadline:
+            for params in bot.tg.calls_of("sendMessage"):
+                if (params.get("message_thread_id") == m.topic_id
+                        and "make test" in params.get("text", "")):
+                    plain_seen = True
+                    break
+            if plain_seen:
+                break
+            _time.sleep(0.05)
+        assert plain_seen, "non-noisy Bash must surface on filter=lite"
+
+        bad = [
+            p.get("text", "")
+            for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == m.topic_id
+            and ("Write" in p.get("text", "")
+                 or "PYEOF" in p.get("text", ""))
+        ]
+        assert not bad, (
+            f"Write + heredoc bash must be hidden on filter=lite; got: {bad}"
+        )
+    finally:
+        bot.mod.mirror_mgr.unregister(csid)
+        try:
+            jp.unlink()
+            jp.parent.rmdir()
+        except OSError:
+            pass
+
+
+def test_mirror_permission_paired_tool_use_skipped(bot, tmp_path):
+    """When the bot just showed a permission prompt for tool X with
+    input I in the mirror topic, the assistant tool_use that lands
+    immediately after in the JSONL (same X+I) must NOT be projected —
+    it would duplicate the signal already conveyed by the Allow/Deny
+    prompt."""
+    import json as _json
+    import time as _time
+    csid = "mirror-test-perm-paired"
+    cwd = str(tmp_path / "mirror_project_perm_paired")
+    (tmp_path / "mirror_project_perm_paired").mkdir()
+    jp = _make_fake_jsonl(tmp_path, csid, cwd)
+    try:
+        bot.mod.on_open_in_bot(csid, cwd, None)
+        m = bot.mod.mirror_mgr.by_csid(csid)
+        # Simulate the permission prompt having set pending_perm_tool.
+        m.pending_perm_tool = ("Bash", "make test")
+
+        with open(jp, "a") as f:
+            f.write(_json.dumps({
+                "type": "assistant",
+                "message": {"content": [{
+                    "type": "tool_use", "name": "Bash",
+                    "input": {"command": "make test"},
+                }]},
+            }) + "\n")
+            f.write(_json.dumps({
+                "type": "assistant",
+                "message": {"content": [{
+                    "type": "tool_use", "name": "Bash",
+                    "input": {"command": "mkdir /tmp/done-marker"},
+                }]},
+            }) + "\n")
+
+        deadline = _time.time() + 2.5
+        next_seen = False
+        while _time.time() < deadline:
+            for params in bot.tg.calls_of("sendMessage"):
+                if (params.get("message_thread_id") == m.topic_id
+                        and "mkdir /tmp/done-marker" in params.get("text", "")):
+                    next_seen = True
+                    break
+            if next_seen:
+                break
+            _time.sleep(0.05)
+        assert next_seen, "subsequent unrelated Bash must still surface"
+
+        bad = [
+            p.get("text", "")
+            for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == m.topic_id
+            and "make test" in p.get("text", "")
+        ]
+        assert not bad, (
+            f"permission-paired tool_use must be hidden; got: {bad}"
+        )
+        assert m.pending_perm_tool is None, (
+            "pending_perm_tool should be cleared after pairing"
+        )
+    finally:
+        bot.mod.mirror_mgr.unregister(csid)
+        try:
+            jp.unlink()
+            jp.parent.rmdir()
+        except OSError:
+            pass
+
+
+def test_permission_routes_to_mirror_topic_when_present(bot, tmp_path):
+    """When the terminal claude that triggered the permission has a
+    live mirror, the Allow/Deny TG message must land in the mirror's
+    topic, NOT a brand-new 'terminal — HH:MM' topic. Also records the
+    pending tool so the mirror projection filter can pair it later."""
+    csid = "mirror-test-perm-routing"
+    cwd = str(tmp_path / "mirror_project_perm_routing")
+    (tmp_path / "mirror_project_perm_routing").mkdir()
+    _make_fake_jsonl(tmp_path, csid, cwd)
+    try:
+        bot.mod.on_open_in_bot(csid, cwd, None)
+        m = bot.mod.mirror_mgr.by_csid(csid)
+        topic_before = m.topic_id
+
+        # Count topics created up to this point.
+        n_create_before = len(bot.tg.calls_of("createForumTopic"))
+
+        bot.mod.on_hook_permission("req-XXX", {
+            "session_id": csid,
+            "cwd": cwd,
+            "tool_name": "Bash",
+            "tool_input": {"command": "rm -rf /tmp/x"},
+        })
+
+        # No new topic was created — the permission landed in the
+        # mirror's existing topic.
+        n_create_after = len(bot.tg.calls_of("createForumTopic"))
+        assert n_create_after == n_create_before, (
+            "permission must not spawn a new topic when a mirror exists "
+            "for the same csid"
+        )
+
+        perm_hits = [
+            p for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == topic_before
+            and "Bash" in p.get("text", "")
+            and "rm -rf" in p.get("text", "")
+        ]
+        assert perm_hits, (
+            "Allow/Deny message must be sent to the mirror's topic"
+        )
+
+        # Pairing recorded so the subsequent tool_use is filtered.
+        assert m.pending_perm_tool == ("Bash", "rm -rf /tmp/x")
+    finally:
+        bot.mod.mirror_mgr.unregister(csid)
+
+
+def test_mirror_filter_toggle_callback_changes_level(bot, tmp_path):
+    """Clicking the inline 'Filter' button toggles between lite/all
+    and edits the welcome message in place."""
+    csid = "mirror-test-toggle"
+    cwd = str(tmp_path / "mirror_project_toggle")
+    (tmp_path / "mirror_project_toggle").mkdir()
+    _make_fake_jsonl(tmp_path, csid, cwd)
+    try:
+        bot.mod.on_open_in_bot(csid, cwd, None)
+        m = bot.mod.mirror_mgr.by_csid(csid)
+        assert m.filter_level == "lite"
+        assert m.welcome_msg_id is not None
+
+        prefix = csid[:12]
+        bot.tg.inject_update(callback_update(
+            f"mf:{prefix}:all", owner_id=bot.owner_id,
+            forum_chat_id=bot.forum_chat_id,
+        ))
+        _drain_updates(bot)
+
+        m_after = bot.mod.mirror_mgr.by_csid(csid)
+        assert m_after.filter_level == "all"
+
+        # Welcome edit attempted; button label reflects the new level.
+        edits = []
+        for p in bot.tg.calls_of("editMessageText"):
+            if p.get("message_id") != m.welcome_msg_id:
+                continue
+            markup = p.get("reply_markup") or {}
+            for row in markup.get("inline_keyboard", []):
+                for btn in row:
+                    if "chat only" in btn.get("text", ""):
+                        edits.append(p)
+        assert edits, (
+            "welcome should have been re-rendered with 'chat only' "
+            "in a button label"
+        )
+    finally:
+        bot.mod.mirror_mgr.unregister(csid)
+
+
+def test_mirror_mode_cycle_callback_pushes_shift_tab(bot, tmp_path, monkeypatch):
+    """Clicking the '⇄ Mode' button pushes ESC[Z (Shift+Tab) to the
+    dtach socket without appending Enter — Enter would submit a blank
+    line into Claude's input box."""
+    csid = "mirror-test-mode-cycle"
+    cwd = str(tmp_path / "mirror_project_mode_cycle")
+    (tmp_path / "mirror_project_mode_cycle").mkdir()
+    sock = str(tmp_path / "dtach.sock")
+    _make_fake_jsonl(tmp_path, csid, cwd)
+
+    pushes: list[tuple[str, str, bool]] = []
+    def _fake_push(s, text, with_enter=True, **kw):
+        pushes.append((s, text, with_enter))
+        return True
+    monkeypatch.setattr(bot.mod, "push_to_dtach", _fake_push)
+
+    try:
+        bot.mod.on_open_in_bot(csid, cwd, sock)
+        m = bot.mod.mirror_mgr.by_csid(csid)
+        assert m.dtach_socket == sock
+
+        prefix = csid[:12]
+        bot.tg.inject_update(callback_update(
+            f"mm:{prefix}", owner_id=bot.owner_id,
+            forum_chat_id=bot.forum_chat_id,
+        ))
+        _drain_updates(bot)
+
+        assert any(
+            text == "\x1b[Z" and with_enter is False
+            for (_, text, with_enter) in pushes
+        ), f"expected ESC[Z with_enter=False; got: {pushes}"
+
+        # Mode index advanced by one and the welcome was re-rendered
+        # with the new label ("acceptEdits").
+        m_after = bot.mod.mirror_mgr.by_csid(csid)
+        assert m_after.mode_index == 1
+        edits = []
+        for p in bot.tg.calls_of("editMessageText"):
+            if p.get("message_id") != m_after.welcome_msg_id:
+                continue
+            markup = p.get("reply_markup") or {}
+            for row in markup.get("inline_keyboard", []):
+                for btn in row:
+                    if "acceptEdits" in btn.get("text", ""):
+                        edits.append(p)
+        assert edits, (
+            "welcome edit with the new mode label is expected after a "
+            "successful Shift+Tab push"
+        )
+    finally:
+        bot.mod.mirror_mgr.unregister(csid)
+
+
+def test_mirror_drops_resume_recovery_pair(bot, tmp_path):
+    """After /bot-mirror swap (SIGTERM during the slash-command tool
+    call), the new claude --resume injects a synthetic isMeta user
+    message ('Continue from where you left off.') and the model replies
+    with a short stub ('No response requested.', 'OK.', …). Both must
+    be filtered from the mirror topic — the user did not type the
+    prompt and the reply is recovery noise.
+    """
+    import json as _json
+    import time as _time
+    csid = "mirror-test-resume-recovery"
+    cwd = str(tmp_path / "mirror_project_resume")
+    (tmp_path / "mirror_project_resume").mkdir()
+    jp = _make_fake_jsonl(tmp_path, csid, cwd)
+    try:
+        bot.mod.on_open_in_bot(csid, cwd, None)
+        m = bot.mod.mirror_mgr.by_csid(csid)
+
+        with open(jp, "a") as f:
+            f.write(_json.dumps({
+                "type": "user",
+                "isMeta": True,
+                "message": {
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "Continue from where you left off.",
+                    }],
+                },
+            }) + "\n")
+            f.write(_json.dumps({
+                "type": "assistant",
+                "message": {"content": [{
+                    "type": "text",
+                    "text": "No response requested.",
+                }]},
+            }) + "\n")
+            f.write(_json.dumps({
+                "type": "user",
+                "message": {"role": "user", "content": "real prompt"},
+            }) + "\n")
+            f.write(_json.dumps({
+                "type": "assistant",
+                "message": {"content": [{
+                    "type": "text",
+                    "text": "real reply that must be projected",
+                }]},
+            }) + "\n")
+
+        deadline = _time.time() + 2.5
+        real_reply_hit = False
+        while _time.time() < deadline:
+            for params in bot.tg.calls_of("sendMessage"):
+                if (params.get("message_thread_id") == m.topic_id
+                        and "real reply that must be projected"
+                            in params.get("text", "")):
+                    real_reply_hit = True
+                    break
+            if real_reply_hit:
+                break
+            _time.sleep(0.05)
+        assert real_reply_hit, "real reply after recovery pair must be projected"
+
+        stub_hits = [
+            p for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == m.topic_id
+            and "No response requested" in p.get("text", "")
+        ]
+        assert not stub_hits, (
+            f"synthetic stub reply after isMeta recovery prompt "
+            f"must NOT be projected; got: {stub_hits}"
+        )
+        continue_hits = [
+            p for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == m.topic_id
+            and "Continue from where you left off" in p.get("text", "")
+        ]
+        assert not continue_hits, (
+            f"synthetic isMeta recovery prompt must NOT be projected; "
+            f"got: {continue_hits}"
+        )
+    finally:
+        bot.mod.mirror_mgr.unregister(csid)
+        try:
+            jp.unlink()
+            jp.parent.rmdir()
+        except OSError:
+            pass
+
+
 def test_mirror_drops_slash_command_url_echo(bot, tmp_path):
     """The /bot-mirror slash command instructs Claude to print
     `mirror: <topic_url>` plus a `tip:` / `output-only` line. That

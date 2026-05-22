@@ -33,14 +33,20 @@ _DTACH_BIN = shutil.which("dtach")
 
 
 def push_to_dtach(socket: str | None, text: str,
-                  timeout: float = 3.0) -> bool:
-    """Inject `text` followed by a carriage return into the dtach socket.
+                  timeout: float = 3.0,
+                  with_enter: bool = True) -> bool:
+    """Inject `text` (optionally followed by a carriage return) into the
+    dtach socket.
 
     The bytes land on the wrapped program's stdin exactly as if typed
     at the keyboard. Claude's TUI runs in raw mode, so the Enter key
     is `\\r` (0x0D), not `\\n` (0x0A) — sending `\\n` leaves the text
     in the input box without submitting it. This matches what tmux's
     `send-keys ... Enter` produced in the previous bridge.
+
+    `with_enter=False` is for control keys like Shift+Tab (`\\e[Z`)
+    where the trailing `\\r` would also be sent and submit a blank
+    line into Claude's input.
 
     Returns False on missing dtach, missing/stale socket, timeout, or
     non-zero exit.
@@ -49,10 +55,11 @@ def push_to_dtach(socket: str | None, text: str,
         return False
     if not dtach_socket_alive(socket):
         return False
+    payload = text + ("\r" if with_enter else "")
     try:
         p = subprocess.run(
             [_DTACH_BIN, "-p", socket],
-            input=(text + "\r").encode("utf-8", errors="replace"),
+            input=payload.encode("utf-8", errors="replace"),
             timeout=timeout, capture_output=True,
         )
         return p.returncode == 0
@@ -145,6 +152,15 @@ def read_logical_events(path: str, limit: int | None = None) -> list[dict]:
     events: list[dict] = []
     cur_assistant: dict | None = None
     pos = 0
+    # When Claude Code resumes a session that was interrupted mid-turn
+    # (e.g. our /bot-mirror swap SIGTERMs claude after writing the
+    # sentinel), the new claude injects a synthetic isMeta user prompt
+    # like "Continue from where you left off." and the model usually
+    # replies with a one-line stub ("No response requested.", "OK." …).
+    # The user has no business seeing either in the mirror topic. We
+    # already drop the isMeta user via the filter below; this flag
+    # also drops the synthetic assistant reply that follows.
+    drop_next_assistant = False
     for raw_line in data.split(b"\n"):
         line_len = len(raw_line) + 1  # +1 for the newline split removed
         line_end = pos + line_len
@@ -156,6 +172,20 @@ def read_logical_events(path: str, limit: int | None = None) -> list[dict]:
         except json.JSONDecodeError:
             continue
         if e.get("isMeta"):
+            # Flag a recovery-style isMeta — the next assistant message
+            # is the synthetic stub reply and should be dropped too.
+            msg = e.get("message") or {}
+            content = msg.get("content")
+            text = ""
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                text = "".join(
+                    b.get("text", "") for b in content
+                    if isinstance(b, dict) and b.get("type") == "text"
+                )
+            if "Continue from where you left off" in text:
+                drop_next_assistant = True
             continue
         etype = e.get("type")
         msg = e.get("message") or {}
@@ -187,6 +217,11 @@ def read_logical_events(path: str, limit: int | None = None) -> list[dict]:
             continue
 
         if etype == "assistant":
+            if drop_next_assistant:
+                # Synthetic recovery reply after an interrupted-turn
+                # resume — invisible in the mirror.
+                drop_next_assistant = False
+                continue
             if not isinstance(content, list):
                 continue
             text_parts = []
@@ -285,6 +320,37 @@ class TerminalMirror:
     _recent_injected: list = field(default_factory=list, repr=False)
     _recent_lock: threading.Lock = field(default_factory=threading.Lock,
                                          repr=False)
+    # Set when we just saw an isMeta "Continue from where you left
+    # off." synthetic user — Claude Code injects it on --resume after
+    # an interrupted turn (our /bot-mirror swap is one such case).
+    # The next assistant event is the synthetic stub reply ("No
+    # response requested.", "OK." …); we drop it from the topic.
+    _drop_next_assistant: bool = field(default=False, repr=False)
+    # Mirror filter level:
+    #   "all"  — hide every tool_use (chat-only view, owner reads
+    #            only their prompts and claude's text replies).
+    #   "lite" — hide Write/Edit/python-heredoc Bash and tool_use
+    #            that was just permission-paired; show normal Bash,
+    #            other tools as-is. Default.
+    filter_level: str = field(default="lite")
+    # (tool_name, normalized_input) of the most recent permission
+    # request the bot showed for this mirror. When the projection
+    # sees a tool_use matching this pair, it skips it — Allow/Deny
+    # prompt already conveyed the action; projecting the tool again
+    # would duplicate the signal.
+    pending_perm_tool: tuple | None = field(default=None, repr=False)
+    # ID of the welcome message in the topic — bot edits this when
+    # the filter level toggles so the inline button labels reflect
+    # current state. None for legacy mirrors restored from
+    # .mirrors.json that pre-date this field.
+    welcome_msg_id: int | None = field(default=None)
+    # Bot's best guess at Claude's current Shift+Tab permission mode.
+    # Cycle: default → acceptEdits → plan → default. Starts at 0
+    # (default — what `claude` launches with absent
+    # `--permission-mode`). Drifts if the user presses Shift+Tab in
+    # the terminal directly; the bot has no read-back from the TUI
+    # so we trust our own count.
+    mode_index: int = field(default=0)
 
     def note_injection(self, text: str) -> None:
         """Record that `text` was just pushed into the pane from TG."""
@@ -385,6 +451,40 @@ class TerminalMirrorManager:
                 m.dtach_socket = socket or None
         self._persist()
 
+    def set_welcome_msg_id(self, csid: str, msg_id: int):
+        with self._lock:
+            m = self._mirrors.get(csid)
+            if m:
+                m.welcome_msg_id = msg_id
+        self._persist()
+
+    def set_filter_level(self, csid: str, level: str):
+        if level not in ("all", "lite"):
+            return
+        with self._lock:
+            m = self._mirrors.get(csid)
+            if m:
+                m.filter_level = level
+        self._persist()
+
+    def advance_mode(self, csid: str, cycle_len: int = 4) -> int | None:
+        """Increment mode_index by 1 mod cycle_len and return the new
+        value. Used by the Shift+Tab callback to keep label in sync
+        with our best-guess view of Claude's current permission mode.
+
+        cycle_len defaults to 4 (default → acceptEdits → plan → auto)
+        — matches the cycle when the optional `auto` mode is enabled,
+        which is the documented default for current Claude Code.
+        """
+        with self._lock:
+            m = self._mirrors.get(csid)
+            if not m:
+                return None
+            m.mode_index = (m.mode_index + 1) % cycle_len
+            new_index = m.mode_index
+        self._persist()
+        return new_index
+
     # ── follower lifecycle ──────────────────────────────────────────
 
     def start_follower(self, mirror: TerminalMirror):
@@ -477,6 +577,27 @@ class TerminalMirrorManager:
                 mirror.backfill_done.wait()
                 if not mirror.alive:
                     break
+                # Filter the synthetic "resume after interrupted turn"
+                # pair (isMeta user prompt + the model's stub reply
+                # that follows). Mirrors read_logical_events.
+                if event.get("isMeta"):
+                    msg = event.get("message") or {}
+                    content = msg.get("content")
+                    text = ""
+                    if isinstance(content, str):
+                        text = content
+                    elif isinstance(content, list):
+                        text = "".join(
+                            b.get("text", "") for b in content
+                            if isinstance(b, dict) and b.get("type") == "text"
+                        )
+                    if "Continue from where you left off" in text:
+                        mirror._drop_next_assistant = True
+                    continue
+                if (event.get("type") == "assistant"
+                        and mirror._drop_next_assistant):
+                    mirror._drop_next_assistant = False
+                    continue
                 try:
                     self._on_event(mirror, event)
                 except Exception as e:
@@ -508,6 +629,9 @@ class TerminalMirrorManager:
                         "dtach_socket": m.dtach_socket,
                         "jsonl_path": m.jsonl_path,
                         "last_offset": m.last_offset,
+                        "filter_level": m.filter_level,
+                        "welcome_msg_id": m.welcome_msg_id,
+                        "mode_index": m.mode_index,
                     })
             try:
                 with open(_PERSIST_PATH, "w") as f:
@@ -546,11 +670,21 @@ class TerminalMirrorManager:
             if dtach_socket and not dtach_socket_alive(dtach_socket):
                 dropped += 1
                 continue
+            level = r.get("filter_level") or "lite"
+            if level not in ("all", "lite"):
+                level = "lite"
+            try:
+                mode_index = int(r.get("mode_index") or 0) % 4
+            except (TypeError, ValueError):
+                mode_index = 0
             m = TerminalMirror(
                 csid=csid, cwd=cwd, topic_id=topic_id,
                 dtach_socket=dtach_socket,
                 jsonl_path=r.get("jsonl_path") or jsonl_path_for(csid, cwd),
                 last_offset=int(r.get("last_offset") or 0),
+                filter_level=level,
+                welcome_msg_id=r.get("welcome_msg_id"),
+                mode_index=mode_index,
             )
             self._mirrors[csid] = m
             self._topic_map[topic_id] = csid
