@@ -324,6 +324,9 @@ def _is_mirror_noisy_tool(tool, inp):
     """Stricter filter for the mirror channel: hide observational Bash
     too (cat/grep/git log/etc) so the topic stays a clean conversation
     transcript. Full tool trace is still visible in the terminal.
+
+    Used by the "lite" filter level (default). The "all" level hides
+    every tool_use upstream of this check.
     """
     if _is_noisy_tool(tool, inp):
         return True
@@ -333,7 +336,80 @@ def _is_mirror_noisy_tool(tool, inp):
         for prefix in _BASH_READONLY_PREFIXES:
             if cmd_head.startswith(prefix):
                 return True
+        # python3 <<'PYEOF' … PYEOF style: implementation-detail
+        # work the owner doesn't need to see in the mirror.
+        if "<<'PYEOF'" in cmd or '<<"PYEOF"' in cmd or "<< PYEOF" in cmd:
+            return True
+    # Write/Edit/MultiEdit projections double up with the permission
+    # prompt the owner already approved — hide them on the lite level.
+    if tool in ("Write", "Edit", "MultiEdit"):
+        return True
     return False
+
+
+def _mirror_welcome_text(mirror) -> str:
+    if mirror.dtach_socket:
+        return ("\U0001fa9e Mirror attached. Type in this topic — keystrokes "
+                "go into the terminal claude.")
+    return ("\U0001f50c Mirror is output-only — start your terminal "
+            "claude inside dtach to enable typing from here.")
+
+
+_MIRROR_MODE_CYCLE = ("default", "acceptEdits", "plan", "auto")
+
+
+def _mirror_mode_name(mirror) -> str:
+    try:
+        return _MIRROR_MODE_CYCLE[mirror.mode_index % len(_MIRROR_MODE_CYCLE)]
+    except Exception:
+        return _MIRROR_MODE_CYCLE[0]
+
+
+def _mirror_welcome_buttons(mirror) -> list:
+    """Build the inline-keyboard rows for a mirror's welcome message.
+
+    Row 1: filter toggle. Label shows CURRENT level; clicking switches
+           to the other one. Callback `mf:<csid12>:<next>`.
+    Row 2 (only if dtach is wired): mode cycle. Label shows the bot's
+           best-guess CURRENT mode; clicking pushes Shift+Tab into the
+           dtach socket and advances our index. Cycle:
+           default → acceptEdits → plan → default. Drifts only if the
+           owner presses Shift+Tab directly in the terminal, since the
+           bot can't read Claude's TUI back. Callback `mm:<csid12>`.
+    """
+    short = mirror.csid[:12]
+    cur = "lite" if mirror.filter_level == "lite" else "all"
+    nxt = "all" if cur == "lite" else "lite"
+    cur_label = "lite (hide noise)" if cur == "lite" else "all (chat only)"
+    rows = [[
+        {"text": f"\U0001f9f0 Filter: {cur_label}",
+         "callback_data": f"mf:{short}:{nxt}"},
+    ]]
+    if mirror.dtach_socket:
+        rows.append([
+            {"text": f"⇄ Mode: {_mirror_mode_name(mirror)}",
+             "callback_data": f"mm:{short}"},
+        ])
+    return rows
+
+
+def _normalize_tool_input(tool, ti) -> str:
+    """Return a stable signature for a tool_use's "what it does" so
+    a pending permission can be matched against the eventual tool_use
+    in the JSONL. Tool-specific to ignore spurious metadata like
+    `description` or buffer offsets.
+    """
+    if not isinstance(ti, dict):
+        return ""
+    if tool == "Bash":
+        return (ti.get("command", "") or "").strip()
+    if tool in ("Write", "Edit", "MultiEdit", "Read"):
+        return ti.get("file_path", "") or ""
+    # Fallback: full JSON of sorted keys.
+    try:
+        return json.dumps(ti, sort_keys=True, ensure_ascii=False)
+    except Exception:
+        return str(ti)
 
 
 def _react_user_msg(msg_id: int, chat_id: int, emoji: str | None):
@@ -1035,7 +1111,13 @@ def on_hook_permission(req_id, data):
     try:
         claude_session_id = (data.get("session_id")
                              or data.get("sessionId") or "")
-        session = _resolve_hook_session(claude_session_id, data)
+        # If the terminal claude that fired this hook is already
+        # mirrored, route the permission Allow/Deny into the SAME
+        # mirror topic instead of spawning a separate "terminal — HH:MM"
+        # topic. Keeps the conversation + tool prompts in one place.
+        mirror = mirror_mgr.by_csid(claude_session_id) if claude_session_id else None
+        session = None if mirror else _resolve_hook_session(
+            claude_session_id, data)
 
         tool = data.get("tool_name", "?")
         ti = data.get("tool_input", {})
@@ -1060,24 +1142,34 @@ def on_hook_permission(req_id, data):
             {"text": "❌ Deny", "callback_data": f"p:{short_id}:d"},
         ]]
 
-        topic_id = _valid_topic_id(session)
-        msg_id = None
-        chat_id = None
-        if topic_id:
+        if mirror:
+            topic_id = mirror.topic_id
             chat_id = forum()
             msg_id = tg.send(body, chat_id, thread_id=topic_id,
-                             buttons=buttons)
-
-        if msg_id is None and session and topic_id:
-            print(f"[resolve] stale topic {topic_id}, recreating",
-                  file=sys.stderr, flush=True)
-            _invalidate_and_stop(session, "topic gone")
-            session = _resolve_hook_session(claude_session_id, data)
+                             buttons=buttons) if chat_id else None
+            # Track the in-flight permission so its tool_use can be
+            # filtered from mirror projection (avoids duplicate signal
+            # of "permission asked + tool ran" both projected).
+            mirror.pending_perm_tool = (tool, _normalize_tool_input(tool, ti))
+        else:
             topic_id = _valid_topic_id(session)
+            msg_id = None
+            chat_id = None
             if topic_id:
                 chat_id = forum()
                 msg_id = tg.send(body, chat_id, thread_id=topic_id,
                                  buttons=buttons)
+
+            if msg_id is None and session and topic_id:
+                print(f"[resolve] stale topic {topic_id}, recreating",
+                      file=sys.stderr, flush=True)
+                _invalidate_and_stop(session, "topic gone")
+                session = _resolve_hook_session(claude_session_id, data)
+                topic_id = _valid_topic_id(session)
+                if topic_id:
+                    chat_id = forum()
+                    msg_id = tg.send(body, chat_id, thread_id=topic_id,
+                                     buttons=buttons)
 
         if msg_id is None:
             # No valid topic anywhere — fall back to OWNER DM so the user
@@ -2349,6 +2441,18 @@ def on_mirror_event(mirror, event):
             elif btype == "tool_use":
                 tool = b.get("name") or "?"
                 inp = b.get("input") or {}
+                # Level "all": no tool_use shown at all.
+                if mirror.filter_level == "all":
+                    continue
+                # Permission-paired: tool_use matches the most-recent
+                # permission prompt we showed in this mirror's topic.
+                # Skip so the Allow/Deny notice isn't shadowed by a
+                # duplicate "⚙️ …" line. Consume the pairing.
+                if mirror.pending_perm_tool is not None:
+                    pair = (tool, _normalize_tool_input(tool, inp))
+                    if pair == mirror.pending_perm_tool:
+                        mirror.pending_perm_tool = None
+                        continue
                 if not _is_mirror_noisy_tool(tool, inp):
                     tool_lines.append(_compact_tool_msg(tool, inp))
         text = "".join(text_parts).strip()
@@ -2536,19 +2640,15 @@ def on_open_in_bot(csid, cwd, dtach_socket):
         state.topic_labels[topic_id] = label
     m = mirror_mgr.register(csid, cwd, topic_id, dtach_socket)
     snapshot_offset = m.last_offset  # JSONL size at registration time
-    # Welcome so the freshly-created topic isn't visually empty.
-    if dtach_socket:
-        send_to_topic(
-            topic_id,
-            "\U0001fa9e Mirror attached. Type in this topic — keystrokes "
-            "go into the terminal claude.",
-        )
-    else:
-        send_to_topic(
-            topic_id,
-            "\U0001f50c Mirror is output-only — start your terminal "
-            "claude inside dtach to enable typing from here.",
-        )
+    # Welcome with inline controls (filter toggle + mode cycle). Stays
+    # at the top of the topic; we edit its buttons in place when state
+    # changes (filter toggled), so the labels always reflect reality.
+    welcome_text = _mirror_welcome_text(m)
+    welcome_buttons = _mirror_welcome_buttons(m)
+    welcome_id = tg.send(welcome_text, fid, thread_id=topic_id,
+                         buttons=welcome_buttons)
+    if welcome_id:
+        mirror_mgr.set_welcome_msg_id(csid, welcome_id)
 
     # Count logical (user-visible) events already in the transcript.
     # ≤ threshold → silent full backfill. > threshold → ask the owner
@@ -3304,6 +3404,57 @@ def _handle_callback(cb, data):
         _do_kill()
         if cb_msg and cb_chat:
             tg.edit(cb_msg, "\U0001f512 Bot killed", cb_chat)
+
+    elif data.startswith("mf:"):
+        # mf:<csid_prefix>:<level>  — toggle filter level on a mirror.
+        parts = data.split(":", 2)
+        if len(parts) == 3:
+            prefix, level = parts[1], parts[2]
+            if level in ("all", "lite"):
+                hit = None
+                for full in [m.csid for m in mirror_mgr.list()]:
+                    if full.startswith(prefix):
+                        hit = full
+                        break
+                if hit:
+                    mirror_mgr.set_filter_level(hit, level)
+                    m = mirror_mgr.by_csid(hit)
+                    if m and m.welcome_msg_id and cb_chat:
+                        try:
+                            tg.edit(m.welcome_msg_id,
+                                    _mirror_welcome_text(m), cb_chat,
+                                    buttons=_mirror_welcome_buttons(m))
+                        except Exception as e:
+                            print(f"[mirror] welcome edit failed: {e}",
+                                  file=sys.stderr, flush=True)
+
+    elif data.startswith("mm:"):
+        # mm:<csid_prefix>  — push Shift+Tab into the dtach socket and
+        # advance our local "current mode" index so the button label
+        # reflects what Claude's TUI shows after the keystroke.
+        prefix = data.split(":", 1)[1]
+        hit = None
+        for full in [m.csid for m in mirror_mgr.list()]:
+            if full.startswith(prefix):
+                hit = full
+                break
+        m = mirror_mgr.by_csid(hit) if hit else None
+        if m and m.dtach_socket:
+            ok = push_to_dtach(m.dtach_socket, "\x1b[Z", with_enter=False)
+            if ok:
+                mirror_mgr.advance_mode(hit)
+                m_now = mirror_mgr.by_csid(hit)
+                if m_now and m_now.welcome_msg_id and cb_chat:
+                    try:
+                        tg.edit(m_now.welcome_msg_id,
+                                _mirror_welcome_text(m_now), cb_chat,
+                                buttons=_mirror_welcome_buttons(m_now))
+                    except Exception as e:
+                        print(f"[mirror] welcome edit failed: {e}",
+                              file=sys.stderr, flush=True)
+            elif cb_chat:
+                tg.send("⚠️ couldn't push Shift+Tab — dtach socket gone?",
+                        cb_chat, thread_id=cb_thread)
 
     elif data.startswith("mirror_history:"):
         # mirror_history:<mode>:<csid_prefix>
