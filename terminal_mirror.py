@@ -145,6 +145,15 @@ def read_logical_events(path: str, limit: int | None = None) -> list[dict]:
     events: list[dict] = []
     cur_assistant: dict | None = None
     pos = 0
+    # When Claude Code resumes a session that was interrupted mid-turn
+    # (e.g. our /bot-mirror swap SIGTERMs claude after writing the
+    # sentinel), the new claude injects a synthetic isMeta user prompt
+    # like "Continue from where you left off." and the model usually
+    # replies with a one-line stub ("No response requested.", "OK." …).
+    # The user has no business seeing either in the mirror topic. We
+    # already drop the isMeta user via the filter below; this flag
+    # also drops the synthetic assistant reply that follows.
+    drop_next_assistant = False
     for raw_line in data.split(b"\n"):
         line_len = len(raw_line) + 1  # +1 for the newline split removed
         line_end = pos + line_len
@@ -156,6 +165,20 @@ def read_logical_events(path: str, limit: int | None = None) -> list[dict]:
         except json.JSONDecodeError:
             continue
         if e.get("isMeta"):
+            # Flag a recovery-style isMeta — the next assistant message
+            # is the synthetic stub reply and should be dropped too.
+            msg = e.get("message") or {}
+            content = msg.get("content")
+            text = ""
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                text = "".join(
+                    b.get("text", "") for b in content
+                    if isinstance(b, dict) and b.get("type") == "text"
+                )
+            if "Continue from where you left off" in text:
+                drop_next_assistant = True
             continue
         etype = e.get("type")
         msg = e.get("message") or {}
@@ -187,6 +210,11 @@ def read_logical_events(path: str, limit: int | None = None) -> list[dict]:
             continue
 
         if etype == "assistant":
+            if drop_next_assistant:
+                # Synthetic recovery reply after an interrupted-turn
+                # resume — invisible in the mirror.
+                drop_next_assistant = False
+                continue
             if not isinstance(content, list):
                 continue
             text_parts = []
@@ -285,6 +313,12 @@ class TerminalMirror:
     _recent_injected: list = field(default_factory=list, repr=False)
     _recent_lock: threading.Lock = field(default_factory=threading.Lock,
                                          repr=False)
+    # Set when we just saw an isMeta "Continue from where you left
+    # off." synthetic user — Claude Code injects it on --resume after
+    # an interrupted turn (our /bot-mirror swap is one such case).
+    # The next assistant event is the synthetic stub reply ("No
+    # response requested.", "OK." …); we drop it from the topic.
+    _drop_next_assistant: bool = field(default=False, repr=False)
 
     def note_injection(self, text: str) -> None:
         """Record that `text` was just pushed into the pane from TG."""
@@ -477,6 +511,27 @@ class TerminalMirrorManager:
                 mirror.backfill_done.wait()
                 if not mirror.alive:
                     break
+                # Filter the synthetic "resume after interrupted turn"
+                # pair (isMeta user prompt + the model's stub reply
+                # that follows). Mirrors read_logical_events.
+                if event.get("isMeta"):
+                    msg = event.get("message") or {}
+                    content = msg.get("content")
+                    text = ""
+                    if isinstance(content, str):
+                        text = content
+                    elif isinstance(content, list):
+                        text = "".join(
+                            b.get("text", "") for b in content
+                            if isinstance(b, dict) and b.get("type") == "text"
+                        )
+                    if "Continue from where you left off" in text:
+                        mirror._drop_next_assistant = True
+                    continue
+                if (event.get("type") == "assistant"
+                        and mirror._drop_next_assistant):
+                    mirror._drop_next_assistant = False
+                    continue
                 try:
                     self._on_event(mirror, event)
                 except Exception as e:

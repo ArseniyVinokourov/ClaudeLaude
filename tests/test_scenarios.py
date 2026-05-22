@@ -1858,6 +1858,172 @@ def test_mirror_suppresses_tg_echo(bot, tmp_path, monkeypatch):
             pass
 
 
+def test_mirror_hides_slash_command_bash_tool_use(bot, tmp_path):
+    """The /bot-mirror slash command's body is `source …/bot-mirror-cmd.sh`.
+    The assistant turn that runs it must NOT leak into the mirror topic
+    as `⚙️ $ source …` — the swap mechanics are internal plumbing, not
+    user-facing work. Also check the legacy curl-based inline body
+    (still seen on older installs that haven't re-run setup.sh)."""
+    import json as _json
+    import time as _time
+    csid = "mirror-test-slashcmd-toolcall"
+    cwd = str(tmp_path / "mirror_project_slashcall")
+    (tmp_path / "mirror_project_slashcall").mkdir()
+    jp = _make_fake_jsonl(tmp_path, csid, cwd)
+    try:
+        bot.mod.on_open_in_bot(csid, cwd, None)
+        m = bot.mod.mirror_mgr.by_csid(csid)
+
+        with open(jp, "a") as f:
+            f.write(_json.dumps({
+                "type": "assistant",
+                "message": {"content": [{
+                    "type": "tool_use", "name": "Bash",
+                    "input": {"command":
+                              'source "$HOME/.claude/commands/bot-mirror-cmd.sh"'},
+                }]},
+            }) + "\n")
+            f.write(_json.dumps({
+                "type": "assistant",
+                "message": {"content": [{
+                    "type": "tool_use", "name": "Bash",
+                    "input": {"command":
+                              'curl -X POST http://127.0.0.1:9853/hook/open_in_bot'},
+                }]},
+            }) + "\n")
+            f.write(_json.dumps({
+                "type": "assistant",
+                "message": {"content": [{
+                    "type": "tool_use", "name": "Bash",
+                    "input": {"command":
+                              "mkdir /tmp/should-not-be-filtered"},
+                }]},
+            }) + "\n")
+
+        deadline = _time.time() + 2.5
+        non_slash_seen = False
+        while _time.time() < deadline:
+            for params in bot.tg.calls_of("sendMessage"):
+                if (params.get("message_thread_id") == m.topic_id
+                        and "should-not-be-filtered"
+                            in params.get("text", "")):
+                    non_slash_seen = True
+                    break
+            if non_slash_seen:
+                break
+            _time.sleep(0.05)
+        assert non_slash_seen, "unrelated Bash tool_use must still be projected"
+
+        bad = [
+            p.get("text", "")
+            for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == m.topic_id
+            and ("bot-mirror-cmd.sh" in p.get("text", "")
+                 or "/hook/open_in_bot" in p.get("text", ""))
+        ]
+        assert not bad, (
+            f"slash-command plumbing must not appear in the topic; "
+            f"got: {bad}"
+        )
+    finally:
+        bot.mod.mirror_mgr.unregister(csid)
+        try:
+            jp.unlink()
+            jp.parent.rmdir()
+        except OSError:
+            pass
+
+
+def test_mirror_drops_resume_recovery_pair(bot, tmp_path):
+    """After /bot-mirror swap (SIGTERM during the slash-command tool
+    call), the new claude --resume injects a synthetic isMeta user
+    message ('Continue from where you left off.') and the model replies
+    with a short stub ('No response requested.', 'OK.', …). Both must
+    be filtered from the mirror topic — the user did not type the
+    prompt and the reply is recovery noise.
+    """
+    import json as _json
+    import time as _time
+    csid = "mirror-test-resume-recovery"
+    cwd = str(tmp_path / "mirror_project_resume")
+    (tmp_path / "mirror_project_resume").mkdir()
+    jp = _make_fake_jsonl(tmp_path, csid, cwd)
+    try:
+        bot.mod.on_open_in_bot(csid, cwd, None)
+        m = bot.mod.mirror_mgr.by_csid(csid)
+
+        with open(jp, "a") as f:
+            f.write(_json.dumps({
+                "type": "user",
+                "isMeta": True,
+                "message": {
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "Continue from where you left off.",
+                    }],
+                },
+            }) + "\n")
+            f.write(_json.dumps({
+                "type": "assistant",
+                "message": {"content": [{
+                    "type": "text",
+                    "text": "No response requested.",
+                }]},
+            }) + "\n")
+            f.write(_json.dumps({
+                "type": "user",
+                "message": {"role": "user", "content": "real prompt"},
+            }) + "\n")
+            f.write(_json.dumps({
+                "type": "assistant",
+                "message": {"content": [{
+                    "type": "text",
+                    "text": "real reply that must be projected",
+                }]},
+            }) + "\n")
+
+        deadline = _time.time() + 2.5
+        real_reply_hit = False
+        while _time.time() < deadline:
+            for params in bot.tg.calls_of("sendMessage"):
+                if (params.get("message_thread_id") == m.topic_id
+                        and "real reply that must be projected"
+                            in params.get("text", "")):
+                    real_reply_hit = True
+                    break
+            if real_reply_hit:
+                break
+            _time.sleep(0.05)
+        assert real_reply_hit, "real reply after recovery pair must be projected"
+
+        stub_hits = [
+            p for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == m.topic_id
+            and "No response requested" in p.get("text", "")
+        ]
+        assert not stub_hits, (
+            f"synthetic stub reply after isMeta recovery prompt "
+            f"must NOT be projected; got: {stub_hits}"
+        )
+        continue_hits = [
+            p for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == m.topic_id
+            and "Continue from where you left off" in p.get("text", "")
+        ]
+        assert not continue_hits, (
+            f"synthetic isMeta recovery prompt must NOT be projected; "
+            f"got: {continue_hits}"
+        )
+    finally:
+        bot.mod.mirror_mgr.unregister(csid)
+        try:
+            jp.unlink()
+            jp.parent.rmdir()
+        except OSError:
+            pass
+
+
 def test_mirror_drops_slash_command_url_echo(bot, tmp_path):
     """The /bot-mirror slash command instructs Claude to print
     `mirror: <topic_url>` plus a `tip:` / `output-only` line. That

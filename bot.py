@@ -309,9 +309,13 @@ def _is_noisy_tool(tool, inp):
             return True
     if tool == "Bash":
         cmd = inp.get("command", "") or ""
-        # Hide the slash command's own curl to the bot's hook endpoint —
-        # it's plumbing, not user-visible work.
+        # Hide the slash command's own plumbing:
+        #  - direct hook curls (legacy inlined slash-command body),
+        #  - the `source …/bot-mirror-cmd.sh` form (current body that
+        #    delegates to the external script).
         if "/hook/open_in_bot" in cmd or f":{HOOK_PORT}/hook/" in cmd:
+            return True
+        if "bot-mirror-cmd.sh" in cmd:
             return True
     return False
 
