@@ -30,9 +30,15 @@ MODE_PRESETS: dict[str, dict] = {
     },
     "terse": {
         "style": (
-            "Response style: terse. Reply in 1-3 short sentences of plain "
-            "prose. No preambles, no recap of what the user just said, no "
-            "trailing summaries. Lists only when they carry distinct items."
+            "Response style: terse. Answer ONLY the literal question — "
+            "nothing more. Do NOT add sections the user did not ask for "
+            "(no 'Implementation:', no 'Applications:', no 'How it "
+            "works:' unless the question explicitly requests them). Do "
+            "NOT use `## ` or `### ` markdown headers anywhere in your "
+            "reply. Stay in one prose block. If the question is 'what "
+            "is X', answer in 1-3 sentences without expanding. No "
+            "preambles, no recap of the question, no trailing summary. "
+            "Lists only when items are genuinely distinct entities."
         ),
         "permission_mode": "auto",
         "label": "1-3 sentence answers",
@@ -48,18 +54,48 @@ MODE_PRESETS: dict[str, dict] = {
     },
     "beginner": {
         "style": (
-            "Response style: beginner-friendly. Define jargon the first "
-            "time it appears. Show small concrete examples. Prefer plain "
-            "language over idiomatic shorthand."
+            "Response style: beginner-friendly. Write as if explaining "
+            "to a curious 8th-grader with no programming background.\n\n"
+            "DEFINITION RULE: define every technical term in plain "
+            "words on its FIRST appearance within this reply (em-dash, "
+            "parenthesis, or 'means...'). After that first definition, "
+            "you may use the bare term elsewhere in the SAME reply.\n\n"
+            "On every NEW user message where the term appears again, "
+            "define it again on first use in that new reply — even if "
+            "you defined it in a previous reply. Each user message is "
+            "a fresh teaching moment.\n\n"
+            "The only exception: if the user has explicitly told you "
+            "in this conversation that they already understand a "
+            "specific term ('я понял что такое X', 'I get O(1) now', "
+            "etc.), you may use that term without re-defining it from "
+            "that point onward.\n\n"
+            "When a plain-word alternative exists, prefer it over the "
+            "technical term. Always include at least one concrete "
+            "example (numbers, code, or everyday analogy) for "
+            "'what is X' / 'how does X work' questions."
         ),
         "permission_mode": "auto",
         "label": "explains as it goes",
     },
     "plan": {
         "style": (
-            "Permission mode: plan (read-only). You cannot edit files or "
-            "run mutating commands. Investigate and propose a plan; the "
-            "user will switch modes to execute."
+            "Permission mode: plan (read-only). You cannot edit files "
+            "or run mutating commands.\n\n"
+            "PLAN-FILE RULE: when the user asks for actionable work "
+            "(refactor, fix, implement, create, etc.), produce a "
+            "numbered plan AND write/update a plan file at "
+            "`~/.claude/plans/<slug>.md`. For pure informational "
+            "questions ('what is X', 'how does Y work'), answer "
+            "directly — no plan file required.\n\n"
+            "APPROVAL RULE: never start implementation work without "
+            "the user's explicit go-ahead. After presenting a plan, "
+            "end your reply with a clear approval request — 'Approve "
+            "this plan?', 'Хочешь чтобы я это выполнил?', or similar. "
+            "Do not assume that the user wants execution just because "
+            "you presented a plan. Switching to a different mode by "
+            "the user is approval; presenting a plan in plan mode is "
+            "not.\n\n"
+            "Investigate, propose, and wait for the user."
         ),
         "permission_mode": "plan",
         "label": "read-only research mode",
@@ -455,8 +491,13 @@ class SessionManager:
         if is_killed():
             return
         preset = MODE_PRESETS.get(session.mode, MODE_PRESETS["default"])
-        cmd = [_CLAUDE_BIN, "-p", text, "--output-format", "stream-json",
-               "--verbose", "--permission-mode", preset["permission_mode"]]
+        if session.mode != "default":
+            text_for_claude = f"[mode: {session.mode}] {text}"
+        else:
+            text_for_claude = text
+        cmd = [_CLAUDE_BIN, "-p", text_for_claude, "--output-format",
+               "stream-json", "--verbose", "--permission-mode",
+               preset["permission_mode"]]
         if preset.get("model"):
             cmd.extend(["--model", preset["model"]])
         if preset.get("effort"):
