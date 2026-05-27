@@ -1788,24 +1788,30 @@ def test_mirror_register_backfills_only_tail(bot, tmp_path):
                                          "text": "POST-FRESH"}]},
             }) + "\n")
 
-        deadline = _time.time() + 4.0
-        seen_fresh = False
+        # Wait until the FULL expected set is projected, not just POST-FRESH.
+        # The pre-registration backfill (20 events) and the post-register
+        # POST-FRESH event race in the follower thread; breaking as soon as
+        # POST-FRESH appears can capture topic_texts mid-backfill (evt-* not
+        # yet flushed) → flaky on slow CI runners. Poll for all markers.
+        wanted = ("evt-00", "evt-10", "evt-19", "POST-FRESH")
+        deadline = _time.time() + 15.0
         while _time.time() < deadline:
-            for params in bot.tg.calls_of("sendMessage"):
-                if (params.get("message_thread_id") == m.topic_id
-                        and "POST-FRESH" in params.get("text", "")):
-                    seen_fresh = True
-                    break
-            if seen_fresh:
+            topic_texts = [
+                p.get("text", "")
+                for p in bot.tg.calls_of("sendMessage")
+                if p.get("message_thread_id") == m.topic_id
+            ]
+            if all(any(w in t for t in topic_texts) for w in wanted):
                 break
             _time.sleep(0.05)
-        assert seen_fresh, "fresh post-register event must be projected"
 
         topic_texts = [
             p.get("text", "")
             for p in bot.tg.calls_of("sendMessage")
             if p.get("message_thread_id") == m.topic_id
         ]
+        assert any("POST-FRESH" in t for t in topic_texts), (
+            "fresh post-register event must be projected")
         # All 20 pre-registration events should appear (silent full
         # backfill — no prompt under the threshold). evt-00 marks the
         # very start of history.
