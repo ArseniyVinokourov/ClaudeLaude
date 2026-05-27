@@ -667,6 +667,32 @@ def test_dashboard_build(bot, tmp_path):
     assert "1 active" in text
 
 
+def test_dashboard_counts_all_alive_and_shows_zero(bot, tmp_path):
+    """Dashboard 'active' counts every alive session (bot + terminal) and
+    always shows the line — '0 active' when there are none.
+    """
+    # No sessions yet -> explicit zero.
+    assert "0 active" in bot.mod._build_dashboard()
+
+    cwd = tmp_path / "demo"
+    cwd.mkdir(exist_ok=True)
+    bot.tg.inject_update(text_update(
+        f"/new {cwd}",
+        owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
+    ))
+    _drain_updates(bot)
+
+    # A terminal session lands via hook with a distinct cwd.
+    term = bot.mod._resolve_hook_session(
+        "terminal-claude-id", {"cwd": str(tmp_path / "term")},
+    )
+    assert term is not None and term.is_bot_spawned is False and term.alive
+
+    # Both the bot session and the terminal session are counted.
+    text = bot.mod._build_dashboard()
+    assert "2 active" in text, text
+
+
 # ── security: callback OWNER_ID check ─────────────────────────────
 
 def test_callback_from_stranger_is_ignored(bot):

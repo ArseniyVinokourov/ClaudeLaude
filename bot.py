@@ -2016,8 +2016,7 @@ def _build_dashboard() -> str:
     ver = get_version().split("+")[0]
     active = sum(1 for s in mgr._sessions.values() if s.alive)
     parts = [f"<b>ClaudeLaude</b> v{tg.esc(ver)}"]
-    if active:
-        parts.append(f"▶ {active} active")
+    parts.append(f"▶ {active} active")
     if _usage_cache:
         parts.append(_usage_cache)
     if is_killed():
