@@ -34,12 +34,11 @@ API:
 """
 from __future__ import annotations
 
-import sys
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from concurrent.futures import Future
-from typing import Callable
 
 # Priority lanes — lower = more urgent.
 P0 = 0
@@ -205,7 +204,7 @@ class GroupBudget:
                 # Pacing: avoid bursting too hard even with budget.
                 pace = self._pace_wait_locked()
                 if pace > 0:
-                    woken = self._cv.wait(timeout=pace)
+                    self._cv.wait(timeout=pace)
                     # Re-check after pacing in case state changed.
                     if not self._queues[pick]:
                         continue
