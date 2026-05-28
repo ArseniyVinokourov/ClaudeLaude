@@ -280,7 +280,9 @@ def _enqueue_user_input(session, text: str, chat_id: int,
         tg.send("⚠️ Session died", chat_id, thread_id=thread_id)
         return
     if msg_id and chat_id:
-        _react_user_msg(msg_id, chat_id, _REACT_RECEIVED)
+        # Auto-reaction 👀 removed — each reaction costs a budget unit
+        # and the "⏳ Думаю…" status + typing indicator already signal
+        # "got it, working on it" for free.
         turn = _get_turn(session)
         turn.user_msg_ids.append(msg_id)
         _record_topic_msg(session.topic_id, msg_id)
@@ -456,63 +458,39 @@ def _chat_action_for_tool(name: str | None) -> str:
 
 
 def _react_progress(turn: TurnState, emoji: str):
-    """Refresh in-flight reaction on every user message awaiting a reply.
+    """Auto-reactions disabled — every reaction costs 1 budget unit and
+    a turn-lifecycle 👀→🔥/⚡→👍 burned 2-3 units per user message. The
+    `typing…` indicator carries the same "I'm working" signal for free.
 
-    Used during the turn to swap 👀 → 🔥 (text streaming) or 👀 → ⚡
-    (tool use). Idempotent; safe if user_msg_ids is empty.
-    """
-    if not turn.user_msg_ids:
-        return
-    fid = forum()
-    if not fid:
-        return
-    for mid in turn.user_msg_ids:
-        _react_user_msg(mid, fid, emoji)
+    Kept as a no-op so call sites don't all need to be deleted; manual
+    reactions still go through tg.set_message_reaction directly."""
+    return
 
 
 def _react_for_turn(turn: TurnState, kind: str = "completed"):
-    """Upgrade per-user-message reactions to a final-state emoji.
-
-    Called from _end_turn. kind ∈ {"completed", "error"}; if the turn was
-    interrupted, that takes precedence.
-    """
-    if not turn.user_msg_ids:
-        return
-    fid = forum()
-    if not fid:
-        return
-    if turn.interrupted:
-        emoji = _REACT_INTERRUPTED
-    elif kind == "error":
-        emoji = _REACT_ERROR
-    else:
-        emoji = _REACT_DONE
-    for mid in turn.user_msg_ids:
-        _react_user_msg(mid, fid, emoji)
+    """Auto-reactions disabled (see _react_progress). This still clears
+    the per-turn tracking state so the next turn starts clean."""
     turn.user_msg_ids.clear()
-    # Progress flags are per-turn; the turn object is reused across turns
-    # in the same session, so reset them now or the next turn would skip
-    # 🔥/⚡ entirely. last_tool_name resets too so the indicator falls back
-    # to "typing" at the next turn's start.
     turn.streamed = False
     turn.tooled = False
     turn.last_tool_name = None
 
 
 def _format_status(turn: TurnState) -> str:
-    elapsed = int(time.time() - turn.started_at)
-    mins, secs = divmod(elapsed, 60)
-    ts = f"{mins}:{secs:02d}"
+    """Status text shown while Claude works on a turn.
+
+    Deliberately time-free: every tick that produced a different number
+    used one budget unit. Now the text only changes on tool transitions
+    (≤ a few per turn), and Telegram's free "typing…" indicator carries
+    the liveness signal.
+    """
     n = len(turn.tool_ops)
-    # Hourglass rotates each 3s tick so the timer feels alive even
-    # when no tool ops have happened yet.
-    glass = "⌛" if (elapsed // 3) % 2 else "⏳"
     if n == 0:
-        return f"{glass} {ts}"
+        return "⏳ Думаю…"
     last = turn.tool_ops[-1]
     if n > 1:
-        return f"⚙️ <code>{tg.esc(last)}</code> ({n}) — {ts}"
-    return f"⚙️ <code>{tg.esc(last)}</code> — {ts}"
+        return f"⚙️ <code>{tg.esc(last)}</code> ({n})"
+    return f"⚙️ <code>{tg.esc(last)}</code>"
 
 
 def _interrupt_button(session):
@@ -692,7 +670,6 @@ def on_assistant(session, text):
     if not turn.streamed and not turn.tooled:
         _react_progress(turn, _REACT_STREAMING)
         turn.streamed = True
-    _finish_status(session, turn)
     with state.lock:
         mode = state.topic_display_mode.get(session.topic_id, DEFAULT_DISPLAY)
     if mode == "mobile":
@@ -704,9 +681,11 @@ def on_assistant(session, text):
         turn.msg_texts.append(text)
         for mid in ids:
             _record_topic_msg(session.topic_id, mid)
-        mid = tg.send(_format_status(turn), fid, thread_id=session.topic_id,
-                      buttons=_interrupt_button(session))
-        turn.status_msg_id = mid
+        # The status message keeps its position in the chronology — we
+        # used to delete-and-resend on every assistant text (2 budget
+        # units per chunk) just to keep it visually at the bottom. With
+        # the budget tight, the status stays put; users glance at it
+        # in place. End-of-turn cleanup is handled by _end_turn.
 
 
 def on_result(session, result_text, summary):
@@ -888,7 +867,7 @@ def on_thinking(session):
         return
     turn = _get_turn(session)
     if turn._timer_thread is None:
-        mid = tg.send("⏳ 0:00", fid, thread_id=session.topic_id,
+        mid = tg.send("⏳ Думаю…", fid, thread_id=session.topic_id,
                       buttons=_interrupt_button(session))
         turn.status_msg_id = mid
         tg.send_chat_action(fid, thread_id=session.topic_id)
@@ -2012,11 +1991,26 @@ _USAGE_CACHE_TTL = 300
 
 
 def _build_dashboard() -> str:
+    """Pinned status in General. Designed to need ZERO Telegram-side
+    healthchecks: every line is computed from local state.
+
+    Layout:
+      <b>ClaudeLaude</b> vX.Y.Z
+      🔔 N waiting     (only when N>0 — permissions pending Allow/Deny)
+      🔗 N mirror      (only when N>0 — active terminal mirrors)
+      <usage cache>    (free, refreshed in-process)
+      🔒 KILLED        (only when locked)
+    """
     from version import get_version
     ver = get_version().split("+")[0]
-    active = sum(1 for s in mgr._sessions.values() if s.alive)
     parts = [f"<b>ClaudeLaude</b> v{tg.esc(ver)}"]
-    parts.append(f"▶ {active} active")
+    with state.lock:
+        n_waiting = len(state.pending_permissions)
+    n_mirror = sum(1 for m in mirror_mgr.list() if m.alive)
+    if n_waiting > 0:
+        parts.append(f"\U0001f514 {n_waiting} waiting")
+    if n_mirror > 0:
+        parts.append(f"\U0001f517 {n_mirror} mirror")
     if _usage_cache:
         parts.append(_usage_cache)
     if is_killed():
@@ -2467,15 +2461,10 @@ def on_mirror_event(mirror, event):
         for line in tool_lines:
             tg.send(f"⚙️ {tg.esc(line)}",
                     fid, thread_id=mirror.topic_id)
-        # Acknowledge any pending TG message: 👀 (received) → 👍 (claude
-        # answered) so the owner sees from Telegram that delivery worked
-        # end-to-end, not just up to the pane.
+        # Auto-reaction 👍 on mirror echo removed for budget reasons
+        # (each reaction = 1 unit). The projected assistant text itself
+        # is the end-to-end delivery confirmation.
         if (text or tool_lines) and mirror.pending_user_msg_id:
-            try:
-                tg.set_message_reaction(
-                    fid, mirror.pending_user_msg_id, _REACT_DONE)
-            except Exception:
-                pass
             mirror.pending_user_msg_id = None
         return
 
@@ -2739,45 +2728,104 @@ def _dashboard_loop():
         time.sleep(60)
 
 
-def _topic_healthcheck():
-    """Periodically check that session topics still exist; stop orphans.
+def _on_topic_dead(chat_id: int, thread_id: int) -> None:
+    """Callback fired by telegram.py when a write returned TOPIC_ID_INVALID.
 
-    Uses editForumTopic with the stored label as a silent probe — no
-    messages sent, no notifications.  Falls back to send-and-delete when
-    no label is tracked.
+    This replaces the old per-30s active probe: the only way the bot
+    learns a topic is gone is by actually trying to send there. The send
+    fails, telegram.py calls us here, we stop the session/mirror behind
+    the dead topic.
     """
+    # Bot session?
+    sess = None
+    for s in mgr.list_sessions():
+        if s.topic_id == thread_id:
+            sess = s
+            break
+    if sess and sess.alive:
+        print(f"[topic_dead] session {sess.sid[:8]} — invalidating",
+              file=sys.stderr, flush=True)
+        try:
+            _invalidate_and_stop(sess, "topic deleted")
+        except Exception as e:
+            print(f"[topic_dead] stop error: {e}",
+                  file=sys.stderr, flush=True)
+        return
+    # Mirror?
+    for mirror in mirror_mgr.list():
+        if mirror.topic_id == thread_id and mirror.alive:
+            print(f"[topic_dead] mirror {mirror.csid[:8]} — unregistering",
+                  file=sys.stderr, flush=True)
+            try:
+                mirror_mgr.unregister(mirror.csid)
+            except Exception as e:
+                print(f"[topic_dead] unregister error: {e}",
+                      file=sys.stderr, flush=True)
+            return
+
+
+# ── 429 user-facing notice (owner DM) ───────────────────────────────
+
+_RATE_NOTICE_LOCK = threading.Lock()
+_rate_notice_msg_id: int | None = None
+_rate_notice_until: float = 0.0
+
+
+def _on_429_notify(retry_after_s: int) -> None:
+    """Callback fired by telegram.py when a group send hit 429.
+
+    Sends a soft "hold on" message to the owner DM (separate budget),
+    but only when the wait is meaningful (>=15s) and we don't already
+    have a fresh notice up. The notice is auto-deleted by a background
+    cleaner once the pause window passes.
+    """
+    if retry_after_s < 15:
+        return
+    global _rate_notice_msg_id, _rate_notice_until
+    with _RATE_NOTICE_LOCK:
+        now = time.monotonic()
+        if now < _rate_notice_until and _rate_notice_msg_id:
+            # Already have an active notice — extend its life.
+            _rate_notice_until = max(_rate_notice_until,
+                                     now + retry_after_s + 2)
+            return
+        # Send fresh notice.
+        try:
+            mid = tg.send("⏳ Перегружено, секунду", OWNER_ID)
+        except Exception:
+            mid = None
+        _rate_notice_msg_id = mid
+        _rate_notice_until = now + retry_after_s + 2
+
+    if mid:
+        def _delete_when_stale():
+            while True:
+                with _RATE_NOTICE_LOCK:
+                    if time.monotonic() >= _rate_notice_until:
+                        target = _rate_notice_msg_id
+                        break
+                time.sleep(1.0)
+            if target:
+                try:
+                    tg.delete(target, OWNER_ID)
+                except Exception:
+                    pass
+            with _RATE_NOTICE_LOCK:
+                globals()["_rate_notice_msg_id"] = None
+
+        threading.Thread(target=_delete_when_stale, daemon=True).start()
+
+
+# ── mirror dtach-socket watcher ─────────────────────────────────────
+
+
+def _mirror_socket_watcher():
+    """Local-only watcher: flip mirrors to output-only when their dtach
+    socket vanishes. Uses no Telegram budget — only a filesystem stat."""
     while bot_running:
         time.sleep(30)
-        fid = forum()
-        if not fid:
-            continue
-        for session in mgr.list_sessions():
-            if not session.topic_id:
-                continue
-            with state.lock:
-                label = state.topic_labels.get(session.topic_id)
-            if not label:
-                label = session.topic_label or session.name
-            if not tg.topic_alive(fid, session.topic_id, name=label):
-                _invalidate_and_stop(session, "topic deleted")
-
-        # Mirrors: probe topic existence and dtach-socket presence only.
-        # A mirror with a vanished topic is dropped; a vanished dtach
-        # socket flips the mirror to output-only. We deliberately do NOT
-        # close on JSONL idleness — a long pause between turns is the
-        # owner's choice (per [[no-hard-ceiling]]), not a signal to
-        # tear down the mirror behind their back.
         for mirror in mirror_mgr.list():
             if not mirror.alive:
-                continue
-            with state.lock:
-                label = state.topic_labels.get(mirror.topic_id)
-            if not label:
-                label = f"mirror {mirror.csid[:8]}"
-            if not tg.topic_alive(fid, mirror.topic_id, name=label):
-                print(f"[mirror] topic gone for {mirror.csid[:8]} — unregistering",
-                      file=sys.stderr, flush=True)
-                mirror_mgr.unregister(mirror.csid)
                 continue
             if (mirror.dtach_socket and
                     not dtach_socket_alive(mirror.dtach_socket)):
@@ -2882,6 +2930,14 @@ def _device_monitor_loop():
 def main():
     global bot_running
 
+    # Wire telegram.py to know our group chat id (so it can route paid
+    # writes through the budget) and to call us back on 429 / dead topic.
+    fid = forum()
+    if fid:
+        tg.set_forum_chat_id(fid)
+    tg.set_on_429(_on_429_notify)
+    tg.set_on_topic_dead(_on_topic_dead)
+
     for s in mgr.list_sessions():
         if s.topic_id and s.topic_label:
             with state.lock:
@@ -2889,7 +2945,10 @@ def main():
     bridge.start()
     _cleanup_general()
     mirror_mgr.start_all_followers()
-    threading.Thread(target=_topic_healthcheck, daemon=True).start()
+    # No active topic healthcheck — dead topics are detected lazily via
+    # TOPIC_ID_INVALID on the next send (set_on_topic_dead callback).
+    # The dtach-socket watcher only does local filesystem checks.
+    threading.Thread(target=_mirror_socket_watcher, daemon=True).start()
     threading.Thread(target=_dashboard_loop, daemon=True).start()
     threading.Thread(target=_terminal_watcher, daemon=True).start()
     threading.Thread(target=_device_monitor_loop, daemon=True).start()
@@ -3042,21 +3101,19 @@ def _handle_update(u):
                        "(start your terminal claude inside dtach to enable it)",
                        thread_id=thread_id, seconds=8)
             return
-        if msg_id:
-            tg.set_message_reaction(chat_id, msg_id, _REACT_RECEIVED)
+        # Auto-reaction 👀 on mirror input removed for budget reasons.
         ok = push_to_dtach(mirror.dtach_socket, text)
         if not ok:
-            if msg_id:
-                tg.set_message_reaction(chat_id, msg_id, _REACT_ERROR)
+            # On delivery failure surface an ephemeral notice — that
+            # is more visible than a small reaction and self-cleans.
             _ephemeral(chat_id,
                        "❌ Could not deliver to terminal "
                        "(dtach socket missing or unresponsive)",
                        thread_id=thread_id, seconds=8)
             mirror_mgr.set_dtach_socket(mirror.csid, None)
         else:
-            # Remember this msg so the JSONL follower can swap 👀 → 👍
-            # once claude actually replies (proves end-to-end delivery,
-            # not just send-keys success).
+            # Track so the follower can clear pending state when claude
+            # actually replies (end-to-end delivery confirmation).
             mirror.pending_user_msg_id = msg_id
             # Mark the text so the follower's user-event projection
             # suppresses the echo back into this same topic.

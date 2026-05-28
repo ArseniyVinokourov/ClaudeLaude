@@ -476,13 +476,13 @@ def test_invalidate_session_cleans_maps(bot, tmp_path):
 
 # ── 10b. topic_alive probe (production path) → invalidate ──────────
 
-def test_topic_alive_probe_invalidates_dead(bot, tmp_path):
-    """Regression: when a topic is gone, the production silent probe
-    (telegram.topic_alive via editForumTopic) must return False so the
-    healthcheck can invalidate the session. Without this, the bot keeps
-    orphaned sessions whose topic the user has already deleted.
+def test_invalidate_stop_drops_routing_maps(bot, tmp_path):
+    """When `_invalidate_and_stop` is called (the new lazy-detection
+    path triggers it from `_on_topic_dead`), every routing map for that
+    session must be cleared so further hooks don't re-target a dead
+    topic. The old per-30s healthcheck is gone — this primitive is
+    still the cleanup; only the trigger changed.
     """
-    import telegram as tg_mod
     cwd = tmp_path / "demo"
     cwd.mkdir(exist_ok=True)
     bot.tg.inject_update(text_update(
@@ -493,16 +493,6 @@ def test_topic_alive_probe_invalidates_dead(bot, tmp_path):
     sess = next(iter(bot.mod.mgr._sessions.values()))
     bot.mod.mgr.link_claude_id("claude-probed", sess)
 
-    # Sanity: live topic probes True.
-    assert tg_mod.topic_alive(bot.forum_chat_id, sess.topic_id,
-                              name="anything") is True
-
-    # Mark topic as dead → editForumTopic probe must surface as False.
-    bot.tg.dead_topics.add(sess.topic_id)
-    assert tg_mod.topic_alive(bot.forum_chat_id, sess.topic_id,
-                              name="anything") is False
-
-    # And the bot's invalidate path drops every routing map.
     bot.mod._invalidate_and_stop(sess, "topic deleted")
     assert sess.alive is False
     assert bot.mod.mgr.by_topic(sess.topic_id) is None
@@ -652,8 +642,10 @@ def test_close_button_deletes_message(bot, tmp_path):
 
 # ── 16. dashboard build ───────────────────────────────────────────
 
-def test_dashboard_build(bot, tmp_path):
-    """Dashboard text includes version and session count."""
+def test_dashboard_has_version_no_active_count(bot, tmp_path):
+    """Dashboard shows the version; no per-session healthcheck-derived
+    counter (the old '▶ N active' line was dropped along with the
+    healthcheck — verified via _build_dashboard contents)."""
     cwd = tmp_path / "demo"
     cwd.mkdir(exist_ok=True)
     bot.tg.inject_update(text_update(
@@ -664,33 +656,22 @@ def test_dashboard_build(bot, tmp_path):
 
     text = bot.mod._build_dashboard()
     assert "ClaudeLaude" in text
-    assert "1 active" in text
+    assert "active" not in text  # the old healthcheck-driven line is gone
+    assert "waiting" not in text  # no pending permissions in this test
+    assert "mirror" not in text  # no mirrors registered
 
 
-def test_dashboard_counts_all_alive_and_shows_zero(bot, tmp_path):
-    """Dashboard 'active' counts every alive session (bot + terminal) and
-    always shows the line — '0 active' when there are none.
-    """
-    # No sessions yet -> explicit zero.
-    assert "0 active" in bot.mod._build_dashboard()
-
-    cwd = tmp_path / "demo"
-    cwd.mkdir(exist_ok=True)
-    bot.tg.inject_update(text_update(
-        f"/new {cwd}",
-        owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
-    ))
-    _drain_updates(bot)
-
-    # A terminal session lands via hook with a distinct cwd.
-    term = bot.mod._resolve_hook_session(
-        "terminal-claude-id", {"cwd": str(tmp_path / "term")},
-    )
-    assert term is not None and term.is_bot_spawned is False and term.alive
-
-    # Both the bot session and the terminal session are counted.
+def test_dashboard_shows_waiting_when_permissions_pending(bot, tmp_path):
+    """When permission requests are queued, dashboard surfaces the count."""
+    with bot.mod.state.lock:
+        bot.mod.state.pending_permissions["xyz12345"] = (1234, 5678, "sid")
     text = bot.mod._build_dashboard()
-    assert "2 active" in text, text
+    assert "1 waiting" in text
+
+
+def test_dashboard_no_waiting_line_when_empty(bot):
+    """The 🔔 line is omitted entirely when nothing is pending."""
+    assert "waiting" not in bot.mod._build_dashboard()
 
 
 # ── security: callback OWNER_ID check ─────────────────────────────
@@ -1142,9 +1123,11 @@ def test_sticker_routed_to_claude_as_text(bot, tmp_path):
 
 # ── reactions on user messages ──────────────────────────────────────
 
-def test_user_text_gets_eyes_reaction(bot, tmp_path):
-    """Sending plain text in an active bot session triggers setMessageReaction
-    with 👀 on the user's message."""
+def test_user_text_no_auto_reaction(bot, tmp_path):
+    """Sending plain text no longer triggers an auto-reaction on the
+    user's message. Each reaction = 1 budget unit; the typing indicator
+    + ⏳ status carry the "got it" signal for free instead.
+    """
     _start_bot_session(bot, tmp_path)
     bot.tg.reset()
     bot.tg.inject_update(text_update(
@@ -1153,37 +1136,32 @@ def test_user_text_gets_eyes_reaction(bot, tmp_path):
     ))
     _drain_updates(bot)
     reactions = bot.tg.calls_of("setMessageReaction")
-    assert reactions, f"no setMessageReaction call: {bot.tg.calls}"
-    last = reactions[-1]
-    import json
-    payload = json.loads(last.get("reaction", "[]"))
-    assert any(r.get("emoji") == "👀" for r in payload), \
-        f"expected 👀 reaction, got {payload}"
+    assert not reactions, \
+        f"expected no auto reactions, got {reactions}"
 
 
-# ── status timer hourglass rotates per tick (Batch A #2) ──────────────
+# ── status text is time-free (no seconds, no hourglass rotation) ──────
 
-def test_status_hourglass_rotates(bot):
-    """⏳ and ⌛ alternate each 3-second tick when no tool ops have run."""
+def test_status_text_is_time_free(bot):
+    """`_format_status` no longer encodes elapsed time. The text changes
+    only on tool transitions, so the timer edit fires a few times per
+    turn instead of ~20/min just for the seconds counter.
+    """
     from bot import _format_status, TurnState
     now = time.time()
     turn = TurnState()
-    # Elapsed 0s → ⏳
+    # No tool ops yet: a stable "Думаю…" line, regardless of elapsed time.
     turn.started_at = now
-    assert _format_status(turn).startswith("⏳"), _format_status(turn)
-    # Elapsed 3s → ⌛
-    turn.started_at = now - 3
-    assert _format_status(turn).startswith("⌛"), _format_status(turn)
-    # Elapsed 6s → ⏳
-    turn.started_at = now - 6
-    assert _format_status(turn).startswith("⏳"), _format_status(turn)
-    # Elapsed 9s → ⌛
-    turn.started_at = now - 9
-    assert _format_status(turn).startswith("⌛"), _format_status(turn)
-    # When a tool op is recorded, the ⚙️ status replaces the hourglass.
-    turn.started_at = now
+    a = _format_status(turn)
+    turn.started_at = now - 30
+    b = _format_status(turn)
+    assert a == b == "⏳ Думаю…", (a, b)
+    # Once a tool op lands the indicator switches; still time-free.
     turn.tool_ops.append("$ ls")
-    assert _format_status(turn).startswith("⚙"), _format_status(turn)
+    text = _format_status(turn)
+    assert "⚙" in text and "ls" in text
+    assert ":" not in text  # no "0:05"-style timer
+    assert "—" not in text  # no separator that used to precede seconds
 
 
 # ── tool_use parsing: Claude Code 2.1.143 nested-content format ──────
@@ -1239,8 +1217,10 @@ def _reaction_emojis(bot) -> list[str]:
     return out
 
 
-def test_reaction_lifecycle_text_only(bot, tmp_path):
-    """Text-only turn: 👀 (receive) → 🔥 (streaming) → 👍 (done)."""
+def test_no_auto_reactions_text_only(bot, tmp_path):
+    """A regular text-only turn produces ZERO auto-reactions. The 👀→🔥→👍
+    lifecycle was costing 3 budget units per turn for no functional
+    benefit — removed."""
     _start_bot_session(bot, tmp_path)
     bot.tg.reset()
     bot.claude.script([
@@ -1257,18 +1237,15 @@ def test_reaction_lifecycle_text_only(bot, tmp_path):
     ))
     _drain_updates(bot)
     bot.tg.wait_for_call("sendMessage", message_thread_id=100, timeout=3)
-    bot.tg.wait_for_call("setMessageReaction", count=3, timeout=3)
-
-    emojis = _reaction_emojis(bot)
-    assert "👀" in emojis, emojis
-    assert "🔥" in emojis, emojis
-    assert "👍" in emojis, emojis
-    assert emojis.index("👀") < emojis.index("🔥") < emojis.index("👍"), emojis
+    # Drain any trailing tool work.
+    import time as _time
+    _time.sleep(0.2)
+    assert not bot.tg.calls_of("setMessageReaction"), \
+        f"expected no auto reactions, got {bot.tg.calls_of('setMessageReaction')}"
 
 
-def test_reaction_lifecycle_with_tool_use(bot, tmp_path):
-    """Tool-using turn: 👀 → ⚡ (tool) → 👍 (done). 🔥 is skipped because
-    ⚡ takes precedence over the streaming flag."""
+def test_no_auto_reactions_with_tool_use(bot, tmp_path):
+    """Tool-using turns also produce no auto-reactions."""
     _start_bot_session(bot, tmp_path)
     bot.tg.reset()
     bot.claude.script([
@@ -1286,15 +1263,10 @@ def test_reaction_lifecycle_with_tool_use(bot, tmp_path):
     ))
     _drain_updates(bot)
     bot.tg.wait_for_call("sendMessage", message_thread_id=100, timeout=3)
-    bot.tg.wait_for_call("setMessageReaction", count=3, timeout=3)
-
-    emojis = _reaction_emojis(bot)
-    assert "👀" in emojis, emojis
-    assert "⚡" in emojis, emojis
-    assert "👍" in emojis, emojis
-    # 🔥 must NOT appear once ⚡ has taken over.
-    assert "🔥" not in emojis, emojis
-    assert emojis.index("👀") < emojis.index("⚡") < emojis.index("👍"), emojis
+    import time as _time
+    _time.sleep(0.2)
+    assert not bot.tg.calls_of("setMessageReaction"), \
+        f"expected no auto reactions, got {bot.tg.calls_of('setMessageReaction')}"
 
 
 # ── contextual sendChatAction (Batch A #4) ────────────────────────────
