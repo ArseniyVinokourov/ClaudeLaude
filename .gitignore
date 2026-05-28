@@ -26,6 +26,7 @@ hook_fallback.py
 test_hook_probe*.txt
 temp/
 docs/internal/
+docs/telegram-throughput/
 
 # Distribution artifacts
 *.tar.gz

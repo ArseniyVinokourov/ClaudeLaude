@@ -8,6 +8,7 @@ import time
 
 import requests
 
+import budget as _budget_mod
 from config import BOT_TOKEN
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
@@ -15,16 +16,80 @@ _session = requests.Session()
 
 MAX_TEXT = 4096
 
-# Per-chat send-rate gate. Telegram throttles writes to a single chat
-# (per the docs, "avoid more than 1 msg/sec to a chat"). Without this
-# gate, bursty senders (healthcheck probing many topics back-to-back,
-# mirror follower projecting a turn) trip 429 with a 15-25 s
-# Retry-After, which then blocks WHICHEVER thread issued the offending
-# call. The gate serializes outbound calls per chat to stay under
-# Telegram's burst threshold.
+# Per-chat send-rate gate — used ONLY for chats outside the group budget
+# (e.g. owner DM). Inside the forum group, all paid writes flow through
+# the budget worker (one serialized lane), so this gate is bypassed.
 _CHAT_SEND_INTERVAL = float(os.environ.get("BOT_CHAT_SEND_INTERVAL", "1.05"))
 _chat_send_ts: dict[int, float] = {}
 _chat_send_lock = threading.Lock()
+
+# Forum-group identity is set by bot.py at startup. When `chat_id` matches,
+# paid writes are routed through the budget worker. Other chats run direct.
+_forum_chat_id: int | None = None
+_on_429_callback = None
+
+
+def set_forum_chat_id(cid: int | None) -> None:
+    global _forum_chat_id
+    _forum_chat_id = cid
+
+
+def set_on_429(callback) -> None:
+    """Install a hook called whenever we hit 429 on the group.
+
+    Signature: callback(retry_after_s: int) -> None. Used by bot.py to
+    send a smoothed "rate limited, hold on" notice to the owner DM.
+    """
+    global _on_429_callback
+    _on_429_callback = callback
+
+
+_on_topic_dead_callback = None
+
+
+def set_on_topic_dead(callback) -> None:
+    """Install a hook called when a write fails with TOPIC_ID_INVALID.
+
+    Signature: callback(chat_id: int, thread_id: int) -> None. Used by
+    bot.py to invalidate the session attached to a deleted topic — the
+    only detection path now that active healthchecks are gone.
+    """
+    global _on_topic_dead_callback
+    _on_topic_dead_callback = callback
+
+
+def _check_topic_dead(chat_id, thread_id, exc_body: str) -> None:
+    """If the failure body contains TOPIC_ID_INVALID and we have a
+    forum-group write, notify bot.py so it can stop the session."""
+    if not thread_id or not _on_topic_dead_callback:
+        return
+    if chat_id != _forum_chat_id:
+        return
+    if "topic_id_invalid" in exc_body.lower() or "thread not found" in exc_body.lower():
+        try:
+            _on_topic_dead_callback(chat_id, thread_id)
+        except Exception as e:
+            _log(f"on_topic_dead error: {e}")
+
+
+# Re-export priority constants so callers can do `tg.P0` etc.
+P0 = _budget_mod.P0
+P1 = _budget_mod.P1
+P2 = _budget_mod.P2
+P3 = _budget_mod.P3
+
+
+def _via_budget(chat_id, prio: int, fn, *args, **kwargs):
+    """Route a paid write through the group budget when chat is the
+    forum group; otherwise run direct."""
+    if (_forum_chat_id is not None and chat_id == _forum_chat_id
+            and prio is not None):
+        fut = _budget_mod.instance().submit(prio, fn, *args, **kwargs)
+        try:
+            return fut.result(timeout=180)
+        except Exception:
+            raise
+    return fn(*args, **kwargs)
 
 
 def _log(msg):
@@ -37,13 +102,16 @@ def esc(text: str) -> str:
 
 def _gate_chat(chat_id) -> None:
     """Block until _CHAT_SEND_INTERVAL has passed since the last
-    chat-touching call for the same chat_id. No-op if chat_id is
-    missing (global API calls)."""
+    chat-touching call for the same chat_id. No-op for the forum group
+    (the budget worker handles its own serialization) and for missing
+    chat_id (global API calls)."""
     if not chat_id:
         return
     try:
         cid = int(chat_id)
     except (TypeError, ValueError):
+        return
+    if cid == _forum_chat_id:
         return
     with _chat_send_lock:
         now = time.monotonic()
@@ -56,11 +124,14 @@ def _gate_chat(chat_id) -> None:
 
 
 def _req(method: str, params: dict | None = None) -> dict:
-    # Chat-modifying methods (sendMessage, editMessageText, editForumTopic,
-    # deleteMessage, setMessageReaction, pinChatMessage, …) all carry a
-    # `chat_id` field. Throttle them per chat to dodge 429s.
+    # Chat-modifying methods carry a `chat_id` field. For chats outside
+    # the forum group, throttle per chat. Inside the group, the budget
+    # worker already serializes paid writes.
     if params:
         _gate_chat(params.get("chat_id"))
+    chat_id = (params or {}).get("chat_id")
+    is_group_chat = (chat_id == _forum_chat_id
+                     and _forum_chat_id is not None)
     for attempt in range(3):
         try:
             r = _session.post(f"{API}/{method}", json=params or {}, timeout=60)
@@ -72,7 +143,19 @@ def _req(method: str, params: dict | None = None) -> dict:
             raise
         if r.status_code == 429:
             retry_after = int(r.headers.get("Retry-After", 1))
-            _log(f"rate limited, retry after {retry_after}s")
+            _log(f"rate limited ({method}), retry after {retry_after}s")
+            if is_group_chat:
+                # Tell the budget so paused_until is set + headroom() is
+                # accurate; also notify any external 429 hook (DM notice).
+                try:
+                    _budget_mod.instance().report_429(retry_after)
+                except Exception:
+                    pass
+                if _on_429_callback:
+                    try:
+                        _on_429_callback(retry_after)
+                    except Exception:
+                        pass
             time.sleep(retry_after)
             continue
         if 400 <= r.status_code < 500:
@@ -155,7 +238,13 @@ def md_to_html(text: str) -> str:
 # ── send / edit / delete ────────────────────────────────────────────
 
 def send(text: str, chat_id: int, thread_id: int | None = None,
-         buttons: list | None = None, markdown: bool = False) -> int | None:
+         buttons: list | None = None, markdown: bool = False,
+         prio: int = P1) -> int | None:
+    return _via_budget(chat_id, prio, _send_impl,
+                       text, chat_id, thread_id, buttons, markdown)
+
+
+def _send_impl(text, chat_id, thread_id, buttons, markdown) -> int | None:
     if markdown:
         text = md_to_html(text)
     params: dict = {
@@ -178,6 +267,7 @@ def send(text: str, chat_id: int, thread_id: int | None = None,
             except Exception:
                 pass
             _log(f"send 400: {body}")
+            _check_topic_dead(chat_id, thread_id, body)
             params.pop("parse_mode", None)
             params["text"] = re.sub(r'<[^>]+>', '', text)[:MAX_TEXT]
             try:
@@ -194,7 +284,7 @@ def send(text: str, chat_id: int, thread_id: int | None = None,
 
 
 def send_long(text: str, chat_id: int, thread_id: int | None = None,
-              markdown: bool = False) -> list[int]:
+              markdown: bool = False, prio: int = P1) -> list[int]:
     if markdown:
         text = md_to_html(text)
     ids: list[int] = []
@@ -204,21 +294,29 @@ def send_long(text: str, chat_id: int, thread_id: int | None = None,
             cut = chunk.rfind("\n")
             if cut > MAX_TEXT // 2:
                 chunk = chunk[:cut]
-        mid = send(chunk, chat_id, thread_id=thread_id)
+        mid = send(chunk, chat_id, thread_id=thread_id, prio=prio)
         if mid:
             ids.append(mid)
         text = text[len(chunk):]
     return ids
 
 
-def delete(msg_id: int, chat_id: int):
+def delete(msg_id: int, chat_id: int, prio: int = P3):
+    _via_budget(chat_id, prio, _delete_impl, msg_id, chat_id)
+
+
+def _delete_impl(msg_id, chat_id):
     try:
         _req("deleteMessage", {"chat_id": chat_id, "message_id": msg_id})
     except Exception as e:
         _log(f"delete error: {e}")
 
 
-def pin(msg_id: int, chat_id: int, silent: bool = True):
+def pin(msg_id: int, chat_id: int, silent: bool = True, prio: int = P2):
+    _via_budget(chat_id, prio, _pin_impl, msg_id, chat_id, silent)
+
+
+def _pin_impl(msg_id, chat_id, silent):
     try:
         _req("pinChatMessage", {
             "chat_id": chat_id,
@@ -229,7 +327,11 @@ def pin(msg_id: int, chat_id: int, silent: bool = True):
         _log(f"pin error: {e}")
 
 
-def unpin(msg_id: int, chat_id: int):
+def unpin(msg_id: int, chat_id: int, prio: int = P2):
+    _via_budget(chat_id, prio, _unpin_impl, msg_id, chat_id)
+
+
+def _unpin_impl(msg_id, chat_id):
     try:
         _req("unpinChatMessage", {
             "chat_id": chat_id,
@@ -239,7 +341,12 @@ def unpin(msg_id: int, chat_id: int):
         _log(f"unpin error: {e}")
 
 
-def edit(msg_id: int, text: str, chat_id: int, buttons: list | None = None):
+def edit(msg_id: int, text: str, chat_id: int, buttons: list | None = None,
+         prio: int = P1):
+    _via_budget(chat_id, prio, _edit_impl, msg_id, text, chat_id, buttons)
+
+
+def _edit_impl(msg_id, text, chat_id, buttons):
     params: dict = {
         "chat_id": chat_id,
         "message_id": msg_id,
@@ -250,6 +357,15 @@ def edit(msg_id: int, text: str, chat_id: int, buttons: list | None = None):
         params["reply_markup"] = {"inline_keyboard": buttons}
     try:
         _req("editMessageText", params)
+    except requests.HTTPError as e:
+        body = ""
+        if e.response is not None:
+            try:
+                body = e.response.text
+            except Exception:
+                pass
+        _check_topic_dead(chat_id, None, body)
+        _log(f"edit error: {e}")
     except Exception as e:
         _log(f"edit error: {e}")
 
@@ -257,7 +373,13 @@ def edit(msg_id: int, text: str, chat_id: int, buttons: list | None = None):
 # ── media ───────────────────────────────────────────────────────────
 
 def send_photo(chat_id: int, photo_path: str, caption: str = "",
-               thread_id: int | None = None) -> int | None:
+               thread_id: int | None = None,
+               prio: int = P1) -> int | None:
+    return _via_budget(chat_id, prio, _send_photo_impl,
+                       chat_id, photo_path, caption, thread_id)
+
+
+def _send_photo_impl(chat_id, photo_path, caption, thread_id) -> int | None:
     params: dict = {"chat_id": chat_id}
     if thread_id:
         params["message_thread_id"] = thread_id
@@ -277,13 +399,21 @@ def send_photo(chat_id: int, photo_path: str, caption: str = "",
 
 def copy_messages(chat_id: int, from_chat_id: int, message_ids: list[int],
                   thread_id: int | None = None,
-                  remove_caption: bool = False) -> list[int]:
+                  remove_caption: bool = False,
+                  prio: int = P3) -> list[int]:
     """Silently duplicate up to 100 messages into another chat/topic.
 
     Unlike forwardMessage, copyMessage produces fresh messages without a
     "Forwarded from" header. Used here to backfill context into a fork
     topic. Returns the new message ids; empty on failure.
     """
+    return _via_budget(chat_id, prio, _copy_messages_impl,
+                       chat_id, from_chat_id, message_ids, thread_id,
+                       remove_caption)
+
+
+def _copy_messages_impl(chat_id, from_chat_id, message_ids, thread_id,
+                        remove_caption) -> list[int]:
     if not message_ids:
         return []
     params: dict = {
@@ -305,13 +435,22 @@ def copy_messages(chat_id: int, from_chat_id: int, message_ids: list[int],
 
 
 def send_media_group(chat_id: int, photo_paths: list[str],
-                     thread_id: int | None = None) -> list[int]:
+                     thread_id: int | None = None,
+                     prio: int = P1) -> list[int]:
     """Send 2–10 photos as a single album. Returns list of message_ids.
 
     Telegram caps an album at 10 items. Callers should split if more.
     Mixed media types (photo+video) are also supported by sendMediaGroup
     but this helper handles photos only.
+
+    Note: an album costs ~20 budget units server-side, near-flat in photo
+    count (probe #3). For typical usage prefer N×send_photo (cost N).
     """
+    return _via_budget(chat_id, prio, _send_media_group_impl,
+                       chat_id, photo_paths, thread_id)
+
+
+def _send_media_group_impl(chat_id, photo_paths, thread_id) -> list[int]:
     if not photo_paths:
         return []
     if len(photo_paths) > 10:
@@ -349,7 +488,13 @@ def send_media_group(chat_id: int, photo_paths: list[str],
 
 
 def send_document(chat_id: int, doc_path: str, caption: str = "",
-                  thread_id: int | None = None) -> int | None:
+                  thread_id: int | None = None,
+                  prio: int = P1) -> int | None:
+    return _via_budget(chat_id, prio, _send_document_impl,
+                       chat_id, doc_path, caption, thread_id)
+
+
+def _send_document_impl(chat_id, doc_path, caption, thread_id) -> int | None:
     params: dict = {"chat_id": chat_id}
     if thread_id:
         params["message_thread_id"] = thread_id
@@ -468,7 +613,8 @@ def answer_callback(callback_id: str):
         _log(f"answer_callback error: {e}")
 
 
-def set_message_reaction(chat_id: int, msg_id: int, emoji: str | None):
+def set_message_reaction(chat_id: int, msg_id: int, emoji: str | None,
+                         prio: int = P2):
     """Set or clear a reaction on a message.
 
     `emoji=None` (or empty) clears any reaction the bot set previously.
@@ -477,6 +623,10 @@ def set_message_reaction(chat_id: int, msg_id: int, emoji: str | None):
     🤣 ⚡ 🍌 🏆 💔 🤨 😐 🤡 🤓 👻 👨‍💻 👀 🙈 😇 😨 🤝 ✍ 🤗 🫡 💅 🗿 🆒 💘
     🙉 😘 🙊 😎 👾 🤷‍♂ 🤷 🤷‍♀ 😡 — anything else returns 400.
     """
+    _via_budget(chat_id, prio, _set_reaction_impl, chat_id, msg_id, emoji)
+
+
+def _set_reaction_impl(chat_id, msg_id, emoji):
     params: dict = {"chat_id": chat_id, "message_id": msg_id}
     if emoji:
         params["reaction"] = json.dumps(
@@ -495,10 +645,20 @@ _TOPIC_ICON_EMOJI_ID = "5417915203100613993"  # 💬 — default (bot session)
 def create_forum_topic(chat_id: int, label: str,
                        icon_color: int = 0x6FB9F0,
                        icon_custom_emoji_id: str | None = None,
+                       prio: int = P0,
                        ) -> int | None:
     """Create a forum topic. Caller chooses the leading emoji — defaults
     to 💬 (bot session). Pass an explicit ID (e.g. terminal 💻) to
-    differentiate session types in the topic list."""
+    differentiate session types in the topic list.
+
+    Submitted at P0: a session that can't get its topic created is broken
+    end-to-end, so this must succeed even when budget is tight."""
+    return _via_budget(chat_id, prio, _create_forum_topic_impl,
+                       chat_id, label, icon_color, icon_custom_emoji_id)
+
+
+def _create_forum_topic_impl(chat_id, label, icon_color,
+                             icon_custom_emoji_id) -> int | None:
     params: dict = {
         "chat_id": chat_id,
         "name": label[:128],
@@ -512,7 +672,13 @@ def create_forum_topic(chat_id: int, label: str,
 
 
 def edit_forum_topic(chat_id: int, topic_id: int, label: str,
-                     icon_custom_emoji_id: str | None = None):
+                     icon_custom_emoji_id: str | None = None,
+                     prio: int = P3):
+    _via_budget(chat_id, prio, _edit_forum_topic_impl,
+                chat_id, topic_id, label, icon_custom_emoji_id)
+
+
+def _edit_forum_topic_impl(chat_id, topic_id, label, icon_custom_emoji_id):
     params: dict = {
         "chat_id": chat_id,
         "message_thread_id": topic_id,
@@ -526,7 +692,11 @@ def edit_forum_topic(chat_id: int, topic_id: int, label: str,
         _log(f"edit_forum_topic error: {e}")
 
 
-def close_forum_topic(chat_id: int, topic_id: int):
+def close_forum_topic(chat_id: int, topic_id: int, prio: int = P3):
+    _via_budget(chat_id, prio, _close_forum_topic_impl, chat_id, topic_id)
+
+
+def _close_forum_topic_impl(chat_id, topic_id):
     try:
         _req("closeForumTopic", {
             "chat_id": chat_id,
@@ -536,7 +706,11 @@ def close_forum_topic(chat_id: int, topic_id: int):
         _log(f"close_forum_topic error: {e}")
 
 
-def reopen_forum_topic(chat_id: int, topic_id: int):
+def reopen_forum_topic(chat_id: int, topic_id: int, prio: int = P3):
+    _via_budget(chat_id, prio, _reopen_forum_topic_impl, chat_id, topic_id)
+
+
+def _reopen_forum_topic_impl(chat_id, topic_id):
     try:
         _req("reopenForumTopic", {
             "chat_id": chat_id,
