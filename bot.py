@@ -21,11 +21,10 @@ from config import (OWNER_ID, HOOK_PORT,
                     AUTO_UPDATE, AUTO_UPDATE_POLICY,
                     UNLOCK_WORD,
                     get_forum_chat_id, set_forum_chat_id,
-                    get_pinned_help_id, set_pinned_help_id,
-                    get_dashboard_id, set_dashboard_id,
                     is_killed, activate_kill, deactivate_kill)
 import audit
 import telegram as tg
+from dashboard import Dashboard
 from formatting import (
     _chat_action_for_tool, _compact_tool_msg, _format_age, _is_mirror_noisy_tool,
     _is_noisy_tool, _md_table_to_list, _normalize_tool_input, _short_cwd,
@@ -169,7 +168,7 @@ def _try_unkill(text: str, chat_id: int, msg_id: int | None,
     if msg_id:
         tg.delete(msg_id, chat_id)
     _ephemeral(chat_id, "\U0001f513 Bot unlocked.", seconds=5)
-    _sync_dashboard()
+    dashboard.sync()
     return True
 
 
@@ -181,7 +180,7 @@ def _do_kill():
             mgr.stop(s.sid, reason="kill switch")
     fid = forum()
     if fid:
-        _sync_dashboard()
+        dashboard.sync()
         if UNLOCK_WORD:
             _ephemeral(fid, "\U0001f512 Bot killed. All sessions stopped.\n"
                        "Send unlock word in General to restore.",
@@ -1554,75 +1553,6 @@ def cmd_restart(chat_id, thread_id):
         tg.send("❌ Failed to restart", chat_id, thread_id=thread_id)
 
 
-def _fetch_account_usage() -> str | None:
-    """Run interactive claude /usage via PTY, parse account limits."""
-    import pty as _pty
-    import fcntl
-    import struct
-    import termios
-
-    master, slave = _pty.openpty()
-    winsize = struct.pack('HHHH', 50, 120, 0, 0)
-    fcntl.ioctl(slave, termios.TIOCSWINSZ, winsize)
-    try:
-        proc = subprocess.Popen(
-            [_CLAUDE_BIN],
-            stdin=slave, stdout=slave, stderr=slave,
-            close_fds=True, preexec_fn=os.setsid,
-        )
-    except Exception:
-        os.close(master)
-        os.close(slave)
-        return None
-    os.close(slave)
-
-    def read_until_idle(timeout=2):
-        import select as _sel
-        out = b''
-        while _sel.select([master], [], [], timeout)[0]:
-            try:
-                out += os.read(master, 8192)
-            except OSError:
-                break
-        return out
-
-    try:
-        read_until_idle(8)
-        os.write(master, b'/usage\r')
-        time.sleep(2)
-        raw = read_until_idle(3)
-        os.write(master, b'/exit\r')
-        time.sleep(0.5)
-    finally:
-        proc.kill()
-        proc.wait()
-        os.close(master)
-
-    text = raw.decode('utf-8', errors='replace')
-    text = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', ' ', text)
-    text = re.sub(r'\x1b\][^\x07]*\x07', ' ', text)
-    text = re.sub(r'\x1b[()][A-Za-z0-9]', ' ', text)
-    text = re.sub(r'[\x00-\x08\x0e-\x1f\x7f]', ' ', text)
-    text = re.sub(r' {2,}', ' ', text)
-
-    blocks = []
-    heading = None
-    for line in text.split('\n'):
-        s = line.strip()
-        if not s:
-            continue
-        s = re.sub(r'[█▌▐░▏▎▍▋▊▉]+\s*', '', s).strip()
-        if re.match(r'(?i)current (session|week)', s):
-            heading = s
-        elif re.search(r'\d+%\s*used', s) and heading:
-            pct = re.search(r'(\d+)%\s*used', s).group(1)
-            blocks.append(f"{heading}: {pct}%")
-            heading = None
-        elif re.match(r'(?i)resets?\s', s) and blocks:
-            blocks[-1] += f"\n  {s}"
-    return '\n'.join(blocks) if blocks else None
-
-
 def cmd_usage(session, chat_id, thread_id):
     if session and (session.total_input_tokens or session.total_output_tokens):
         lines = ["<b>Session</b>"]
@@ -1644,7 +1574,7 @@ def cmd_usage(session, chat_id, thread_id):
 
     def _do_fetch():
         try:
-            result = _fetch_account_usage()
+            result = dashboard.fetch_account_usage()
             if result:
                 text = f"<b>Account</b>\n{tg.esc(result)}"
                 if in_general:
@@ -1731,39 +1661,6 @@ def cmd_test_perm(chat_id, thread_id=None):
     else:
         _ephemeral(chat_id, "Test permission sent — click Allow/Deny.",
                    seconds=10)
-
-
-_usage_cache: str | None = None
-_usage_cache_ts: float = 0
-_USAGE_CACHE_TTL = 300
-
-
-def _build_dashboard() -> str:
-    """Pinned status in General. Designed to need ZERO Telegram-side
-    healthchecks: every line is computed from local state.
-
-    Layout:
-      <b>ClaudeLaude</b> vX.Y.Z
-      🔔 N waiting     (only when N>0 — permissions pending Allow/Deny)
-      🔗 N mirror      (only when N>0 — active terminal mirrors)
-      <usage cache>    (free, refreshed in-process)
-      🔒 KILLED        (only when locked)
-    """
-    from version import get_version
-    ver = get_version().split("+")[0]
-    parts = [f"<b>ClaudeLaude</b> v{tg.esc(ver)}"]
-    with state.lock:
-        n_waiting = len(state.pending_permissions)
-    n_mirror = sum(1 for m in mirror_mgr.list() if m.alive)
-    if n_waiting > 0:
-        parts.append(f"\U0001f514 {n_waiting} waiting")
-    if n_mirror > 0:
-        parts.append(f"\U0001f517 {n_mirror} mirror")
-    if _usage_cache:
-        parts.append(_usage_cache)
-    if is_killed():
-        parts.append("\U0001f512 <b>KILLED</b>")
-    return "\n".join(parts)
 
 
 def cmd_update(chat_id, thread_id=None):
@@ -1888,14 +1785,6 @@ _HELP_DOCUMENTED_COMMANDS = {
     "/menu", "/help", "/stop_bot",
 }
 
-_MENU_ROWS = [
-    [{"text": "\U0001f195 New session", "callback_data": "m:new"},
-     {"text": "\U0001f4cb Sessions", "callback_data": "m:sessions"}],
-    [{"text": "▶️ Resume", "callback_data": "m:resume"},
-     {"text": "❓ Help", "callback_data": "m:help"}],
-]
-
-
 def cmd_help(chat_id, thread_id=None):
     if not thread_id:
         _ephemeral(chat_id, _HELP_TEXT, seconds=_PICKER_TTL)
@@ -1917,71 +1806,6 @@ def _validate_help():
     if extra:
         print(f"[WARN] help references unknown commands: {extra}",
               file=sys.stderr, flush=True)
-
-
-def _cleanup_general():
-    """Delete stale messages in General (before the pinned help)."""
-    fid = forum()
-    pinned = get_pinned_help_id()
-    if not fid or not pinned:
-        return
-    count = 0
-    for msg_id in range(pinned - 1, max(pinned - 50, 0), -1):
-        try:
-            tg._req("deleteMessage", {"chat_id": fid, "message_id": msg_id})
-            count += 1
-        except Exception:
-            pass
-    if count:
-        print(f"[cleanup] deleted {count} stale General messages",
-              file=sys.stderr, flush=True)
-
-
-def _sync_dashboard():
-    """Send or update the pinned dashboard message in General."""
-    _validate_help()
-    fid = forum()
-    if not fid:
-        return
-    text = _build_dashboard()
-    old_id = get_dashboard_id()
-    if not old_id:
-        old_id = get_pinned_help_id()
-    if old_id:
-        try:
-            tg._req("editMessageText", {
-                "chat_id": fid,
-                "message_id": old_id,
-                "text": text,
-                "parse_mode": "HTML",
-                "reply_markup": {"inline_keyboard": _MENU_ROWS},
-            })
-            if not get_dashboard_id():
-                set_dashboard_id(old_id)
-            return
-        except Exception as e:
-            body = ""
-            if hasattr(e, "response") and e.response is not None:
-                try:
-                    body = e.response.text
-                except Exception:
-                    pass
-            if "not modified" in body.lower():
-                return
-            print(f"[dashboard] edit failed: {e} {body}",
-                  file=sys.stderr, flush=True)
-            set_dashboard_id(None)
-            set_pinned_help_id(None)
-    if old_id:
-        tg.delete(old_id, fid)
-    try:
-        tg._req("unpinAllChatMessages", {"chat_id": fid})
-    except Exception:
-        pass
-    msg_id = tg.send(text, fid, buttons=_MENU_ROWS)
-    if msg_id:
-        tg.pin(msg_id, fid)
-        set_dashboard_id(msg_id)
 
 
 def cmd_menu(chat_id, thread_id=None, session=None):
@@ -2147,6 +1971,7 @@ def on_mirror_event(mirror, event):
 
 
 mirror_mgr = TerminalMirrorManager(on_event=on_mirror_event)
+dashboard = Dashboard(state, mirror_mgr, _validate_help, _CLAUDE_BIN)
 
 # When the JSONL already contains more than this many logical events
 # at /bot-mirror time, the bot asks the owner via inline buttons
@@ -2363,38 +2188,11 @@ bridge = HookBridge(
 )
 
 
-def _refresh_usage_cache():
-    global _usage_cache, _usage_cache_ts
-    try:
-        raw = _fetch_account_usage()
-        if raw:
-            lines = raw.strip().splitlines()
-            short = []
-            for line in lines:
-                m = re.search(r'(\d+)%', line)
-                label = "Week" if "week" in line.lower() else "Session"
-                if m:
-                    short.append(f"{label}: {m.group(1)}%")
-            _usage_cache = " · ".join(short) if short else None
-        else:
-            _usage_cache = None
-        _usage_cache_ts = time.time()
-    except Exception as e:
-        print(f"[dashboard] usage fetch error: {e}",
-              file=sys.stderr, flush=True)
-
-
 def _dashboard_loop():
     """Background: update dashboard pin every 60s, refresh usage every 5m."""
     time.sleep(5)
     while bot_running:
-        if time.time() - _usage_cache_ts > _USAGE_CACHE_TTL:
-            _refresh_usage_cache()
-        try:
-            _sync_dashboard()
-        except Exception as e:
-            print(f"[dashboard] update error: {e}",
-                  file=sys.stderr, flush=True)
+        dashboard.tick()
         time.sleep(60)
 
 
@@ -2613,7 +2411,7 @@ def main():
             with state.lock:
                 state.topic_labels[s.topic_id] = s.topic_label
     bridge.start()
-    _cleanup_general()
+    dashboard.cleanup_general()
     mirror_mgr.start_all_followers()
     # No active topic healthcheck — dead topics are detected lazily via
     # TOPIC_ID_INVALID on the next send (set_on_topic_dead callback).
@@ -2635,8 +2433,8 @@ def main():
         {"command": "help", "description": "Show help"},
     ])
     threading.Thread(target=_auto_update_loop, daemon=True).start()
-    _refresh_usage_cache()
-    _sync_dashboard()
+    dashboard.refresh_usage()
+    dashboard.sync()
     _admin_sanity_check()
 
     offset = None

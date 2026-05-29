@@ -654,7 +654,7 @@ def test_dashboard_has_version_no_active_count(bot, tmp_path):
     ))
     _drain_updates(bot)
 
-    text = bot.mod._build_dashboard()
+    text = bot.mod.dashboard.build()
     assert "ClaudeLaude" in text
     assert "active" not in text  # the old healthcheck-driven line is gone
     assert "waiting" not in text  # no pending permissions in this test
@@ -665,13 +665,13 @@ def test_dashboard_shows_waiting_when_permissions_pending(bot, tmp_path):
     """When permission requests are queued, dashboard surfaces the count."""
     with bot.mod.state.lock:
         bot.mod.state.pending_permissions["xyz12345"] = (1234, 5678, "sid")
-    text = bot.mod._build_dashboard()
+    text = bot.mod.dashboard.build()
     assert "1 waiting" in text
 
 
 def test_dashboard_no_waiting_line_when_empty(bot):
     """The 🔔 line is omitted entirely when nothing is pending."""
-    assert "waiting" not in bot.mod._build_dashboard()
+    assert "waiting" not in bot.mod.dashboard.build()
 
 
 # ── security: callback OWNER_ID check ─────────────────────────────
