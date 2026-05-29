@@ -781,7 +781,7 @@ def test_terminal_watcher_cleans_notification(bot, tmp_path, monkeypatch):
 
     projects_dir = tmp_path / "claude_projects" / "proj"
     projects_dir.mkdir(parents=True)
-    monkeypatch.setattr(bot.mod, "CLAUDE_PROJECTS_DIR",
+    monkeypatch.setattr(bot.mod.session_discovery, "CLAUDE_PROJECTS_DIR",
                         str(projects_dir.parent))
 
     csid = "term-session-001"
@@ -809,7 +809,7 @@ def test_terminal_watcher_cleans_permission(bot, tmp_path, monkeypatch):
 
     projects_dir = tmp_path / "claude_projects" / "proj"
     projects_dir.mkdir(parents=True)
-    monkeypatch.setattr(bot.mod, "CLAUDE_PROJECTS_DIR",
+    monkeypatch.setattr(bot.mod.session_discovery, "CLAUDE_PROJECTS_DIR",
                         str(projects_dir.parent))
 
     csid = "term-session-002"
@@ -849,7 +849,7 @@ def test_terminal_watcher_offset_init(bot, tmp_path, monkeypatch):
 
     projects_dir = tmp_path / "claude_projects" / "proj"
     projects_dir.mkdir(parents=True)
-    monkeypatch.setattr(bot.mod, "CLAUDE_PROJECTS_DIR",
+    monkeypatch.setattr(bot.mod.session_discovery, "CLAUDE_PROJECTS_DIR",
                         str(projects_dir.parent))
 
     csid = "term-session-003"
