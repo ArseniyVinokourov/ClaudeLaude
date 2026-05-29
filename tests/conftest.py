@@ -33,7 +33,7 @@ def _purge_bot_modules():
         # purge them too so a fresh bot import rebinds their `tg` to the
         # freshly-patched telegram module (else they hold a stale one).
         "turncontroller", "dashboard", "formatting", "session_discovery",
-        "updater",
+        "updater", "mirrorbridge",
     ]:
         sys.modules.pop(name, None)
 

@@ -1580,7 +1580,7 @@ def test_mirror_register_creates_topic_and_starts_follower(bot, tmp_path):
     (tmp_path / "mirror_project_1").mkdir()
     jp = _make_fake_jsonl(tmp_path, csid, cwd)
     try:
-        result = bot.mod.on_open_in_bot(csid, cwd, None)
+        result = bot.mod.mirror.on_open_in_bot(csid, cwd, None)
         assert "topic_url" in result, result
         topic_calls = bot.tg.calls_of("createForumTopic")
         assert len(topic_calls) == 1, topic_calls
@@ -1627,8 +1627,8 @@ def test_mirror_register_idempotent(bot, tmp_path):
     cwd = str(tmp_path / "mirror_project_2")
     (tmp_path / "mirror_project_2").mkdir()
     try:
-        r1 = bot.mod.on_open_in_bot(csid, cwd, None)
-        r2 = bot.mod.on_open_in_bot(csid, cwd, None)
+        r1 = bot.mod.mirror.on_open_in_bot(csid, cwd, None)
+        r2 = bot.mod.mirror.on_open_in_bot(csid, cwd, None)
         assert r1.get("topic_url") == r2.get("topic_url")
         assert r2.get("existing") is True
         assert len(bot.tg.calls_of("createForumTopic")) == 1
@@ -1648,13 +1648,13 @@ def test_mirror_response_input_bridge_flag(bot, tmp_path):
     (tmp_path / "bridge_off").mkdir()
     sock = str(tmp_path / "fake.sock")
     try:
-        on_resp = bot.mod.on_open_in_bot(csid_a, cwd_a, sock)
-        off_resp = bot.mod.on_open_in_bot(csid_b, cwd_b, None)
+        on_resp = bot.mod.mirror.on_open_in_bot(csid_a, cwd_a, sock)
+        off_resp = bot.mod.mirror.on_open_in_bot(csid_b, cwd_b, None)
         assert on_resp.get("input_bridge") is True, on_resp
         assert off_resp.get("input_bridge") is False, off_resp
         # On the existing-mirror return path the flag must still
         # reflect actual dtach binding state.
-        on_resp_again = bot.mod.on_open_in_bot(csid_a, cwd_a, sock)
+        on_resp_again = bot.mod.mirror.on_open_in_bot(csid_a, cwd_a, sock)
         assert on_resp_again.get("input_bridge") is True, on_resp_again
     finally:
         bot.mod.mirror_mgr.unregister(csid_a)
@@ -1678,7 +1678,7 @@ def test_mirror_input_bridge_pushes_to_dtach(bot, tmp_path, monkeypatch):
     )
 
     try:
-        bot.mod.on_open_in_bot(csid, cwd, sock)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, sock)
         m = bot.mod.mirror_mgr.by_csid(csid)
         assert m and m.dtach_socket == sock
 
@@ -1707,7 +1707,7 @@ def test_mirror_input_bridge_output_only_rejects(bot, tmp_path, monkeypatch):
     )
 
     try:
-        bot.mod.on_open_in_bot(csid, cwd, None)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
         assert m and m.dtach_socket is None
 
@@ -1777,7 +1777,7 @@ def test_mirror_register_backfills_only_tail(bot, tmp_path):
                     }]},
                 }) + "\n")
 
-        bot.mod.on_open_in_bot(csid, cwd, None)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
         assert m is not None
 
@@ -1849,7 +1849,7 @@ def test_mirror_suppresses_tg_echo(bot, tmp_path, monkeypatch):
     )
 
     try:
-        bot.mod.on_open_in_bot(csid, cwd, sock)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, sock)
         m = bot.mod.mirror_mgr.by_csid(csid)
         assert m is not None
 
@@ -1921,7 +1921,7 @@ def test_mirror_hides_slash_command_bash_tool_use(bot, tmp_path):
     (tmp_path / "mirror_project_slashcall").mkdir()
     jp = _make_fake_jsonl(tmp_path, csid, cwd)
     try:
-        bot.mod.on_open_in_bot(csid, cwd, None)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
 
         with open(jp, "a") as f:
@@ -1997,7 +1997,7 @@ def test_mirror_filter_level_all_hides_every_tool_use(bot, tmp_path):
     (tmp_path / "mirror_project_filter").mkdir()
     jp = _make_fake_jsonl(tmp_path, csid, cwd)
     try:
-        bot.mod.on_open_in_bot(csid, cwd, None)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
         bot.mod.mirror_mgr.set_filter_level(csid, "all")
 
@@ -2054,7 +2054,7 @@ def test_mirror_filter_lite_hides_write_and_heredoc(bot, tmp_path):
     (tmp_path / "mirror_project_lite").mkdir()
     jp = _make_fake_jsonl(tmp_path, csid, cwd)
     try:
-        bot.mod.on_open_in_bot(csid, cwd, None)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
         assert m.filter_level == "lite"
 
@@ -2127,7 +2127,7 @@ def test_mirror_permission_paired_tool_use_skipped(bot, tmp_path):
     (tmp_path / "mirror_project_perm_paired").mkdir()
     jp = _make_fake_jsonl(tmp_path, csid, cwd)
     try:
-        bot.mod.on_open_in_bot(csid, cwd, None)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
         # Simulate the permission prompt having set pending_perm_tool.
         m.pending_perm_tool = ("Bash", "make test")
@@ -2192,7 +2192,7 @@ def test_permission_routes_to_mirror_topic_when_present(bot, tmp_path):
     (tmp_path / "mirror_project_perm_routing").mkdir()
     _make_fake_jsonl(tmp_path, csid, cwd)
     try:
-        bot.mod.on_open_in_bot(csid, cwd, None)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
         topic_before = m.topic_id
 
@@ -2238,7 +2238,7 @@ def test_mirror_filter_toggle_callback_changes_level(bot, tmp_path):
     (tmp_path / "mirror_project_toggle").mkdir()
     _make_fake_jsonl(tmp_path, csid, cwd)
     try:
-        bot.mod.on_open_in_bot(csid, cwd, None)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
         assert m.filter_level == "lite"
         assert m.welcome_msg_id is not None
@@ -2288,7 +2288,7 @@ def test_mirror_mode_cycle_callback_pushes_shift_tab(bot, tmp_path, monkeypatch)
     monkeypatch.setattr(bot.mod, "push_to_dtach", _fake_push)
 
     try:
-        bot.mod.on_open_in_bot(csid, cwd, sock)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, sock)
         m = bot.mod.mirror_mgr.by_csid(csid)
         assert m.dtach_socket == sock
 
@@ -2340,7 +2340,7 @@ def test_mirror_drops_resume_recovery_pair(bot, tmp_path):
     (tmp_path / "mirror_project_resume").mkdir()
     jp = _make_fake_jsonl(tmp_path, csid, cwd)
     try:
-        bot.mod.on_open_in_bot(csid, cwd, None)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
 
         with open(jp, "a") as f:
@@ -2427,7 +2427,7 @@ def test_mirror_drops_slash_command_url_echo(bot, tmp_path):
     (tmp_path / "mirror_project_slashcmd").mkdir()
     jp = _make_fake_jsonl(tmp_path, csid, cwd)
     try:
-        bot.mod.on_open_in_bot(csid, cwd, None)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
 
         with open(jp, "a") as f:
@@ -2554,7 +2554,7 @@ def test_mirror_drops_slash_command_body_via_is_meta(bot, tmp_path):
     (tmp_path / "mirror_project_ismeta").mkdir()
     jp = _make_fake_jsonl(tmp_path, csid, cwd)
     try:
-        bot.mod.on_open_in_bot(csid, cwd, None)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
 
         # Append the exact event shape Claude Code emits for the body
@@ -2622,7 +2622,7 @@ def test_mirror_open_sends_welcome_message(bot, tmp_path):
     (tmp_path / "welcome_bridged").mkdir()
     (tmp_path / "welcome_output_only").mkdir()
     try:
-        bot.mod.on_open_in_bot(
+        bot.mod.mirror.on_open_in_bot(
             csid_on, cwd_on, str(tmp_path / "welcome.sock"))
         m_on = bot.mod.mirror_mgr.by_csid(csid_on)
         bridged = [
@@ -2633,7 +2633,7 @@ def test_mirror_open_sends_welcome_message(bot, tmp_path):
         assert any("Mirror attached" in t for t in bridged), bridged
         assert not any("output-only" in t.lower() for t in bridged), bridged
 
-        bot.mod.on_open_in_bot(csid_off, cwd_off, None)
+        bot.mod.mirror.on_open_in_bot(csid_off, cwd_off, None)
         m_off = bot.mod.mirror_mgr.by_csid(csid_off)
         out_only = [
             p.get("text", "")
@@ -2683,7 +2683,7 @@ def test_mirror_prompts_above_threshold(bot, tmp_path):
         # threshold so the bot must prompt instead of silent full.
         _write_alternating_jsonl(jp, 20, prefix="old")
 
-        bot.mod.on_open_in_bot(csid, cwd, None)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
         assert m is not None
         # backfill_done is cleared until user clicks → follower suspended.
@@ -2735,7 +2735,7 @@ def test_mirror_history_full_click_runs_backfill(bot, tmp_path):
         # 18 user/assistant pairs = 36 logical events, above threshold.
         _write_alternating_jsonl(jp, 18, prefix="hist")
 
-        bot.mod.on_open_in_bot(csid, cwd, None)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
         assert m is not None
         # The prompt was sent — find its callback_data for 'full'.
@@ -2800,7 +2800,7 @@ def test_mirror_history_short_click_emits_summary(bot, tmp_path):
         # 20 pairs = 40 logical events; short summary keeps last 12.
         _write_alternating_jsonl(jp, 20, prefix="S")
 
-        bot.mod.on_open_in_bot(csid, cwd, None)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
         before_count = len(bot.tg.calls_of("sendMessage"))
         prompts = [
