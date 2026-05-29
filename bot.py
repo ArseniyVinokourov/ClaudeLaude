@@ -26,6 +26,11 @@ from config import (OWNER_ID, PROJECTS_DIR, HOOK_PORT,
                     is_killed, activate_kill, deactivate_kill)
 import audit
 import telegram as tg
+from formatting import (
+    _chat_action_for_tool, _compact_tool_msg, _format_age, _is_mirror_noisy_tool,
+    _is_noisy_tool, _md_table_to_list, _normalize_tool_input, _short_cwd,
+    _strip_md,
+)
 from sessions import MODE_PRESETS, Session, SessionManager
 from hooks import HookBridge
 from terminal_mirror import (
@@ -180,41 +185,6 @@ def _do_kill():
                        seconds=15)
 
 
-# ── markdown table → list (mobile) ──────────────────────────────────
-
-_MD_TABLE_RE = re.compile(
-    r"((?:^[ \t]*\|.+\|[ \t]*$\n?){2,})",
-    re.MULTILINE,
-)
-_SEP_RE = re.compile(r"^[ \t]*\|[-| :]+\|[ \t]*$")
-
-
-def _md_table_to_list(text: str) -> str:
-    """Convert markdown tables to list format (outputs markdown, not HTML)."""
-    def _replace(m: re.Match) -> str:
-        lines = m.group(1).strip().splitlines()
-        rows = []
-        for line in lines:
-            if _SEP_RE.match(line):
-                continue
-            cells = [c.strip() for c in line.strip().strip("|").split("|")]
-            rows.append(cells)
-        if len(rows) < 2:
-            return m.group(0)
-        header = rows[0]
-        result = []
-        for row in rows[1:]:
-            val = row[0] if row else ""
-            if len(val) <= 3 or val.isdigit():
-                title = f"**{header[0]} {val}**"
-            else:
-                title = f"**{val}**"
-            details = [f"  {h}: {v}" for h, v in zip(header[1:], row[1:], strict=False)]
-            result.append(title + "\n" + "\n".join(details))
-        return "\n\n".join(result)
-    return _MD_TABLE_RE.sub(_replace, text)
-
-
 # ── helpers ──────────────────────────────────────────────────────────
 
 _CLOSE_ROW = [{"text": "✕ Close", "callback_data": "close"}]
@@ -255,10 +225,6 @@ def _ephemeral(chat_id, text, thread_id=None, seconds=15, buttons=None):
 
 # ── turn tracking ────────────────────────────────────────────────────
 
-_NOISE_TOOLS = {"Glob", "Grep", "Agent", "TodoWrite", "ToolSearch", "Read"}
-_NOISE_PATHS = ("/.claude/", "/memory/", "MEMORY.md")
-
-
 
 def _get_turn(session) -> TurnState:
     with state.lock:
@@ -286,67 +252,6 @@ def _enqueue_user_input(session, text: str, chat_id: int,
         turn = _get_turn(session)
         turn.user_msg_ids.append(msg_id)
         _record_topic_msg(session.topic_id, msg_id)
-
-
-_BASH_READONLY_PREFIXES = (
-    "cat ", "ls", "pwd", "echo ", "printf ",
-    "find ", "grep ", "rg ", "ag ",
-    "head ", "tail ", "wc ", "awk ", "sed -n",
-    "git log", "git status", "git diff", "git blame",
-    "git branch", "git show", "git ls-files",
-    "gh pr list", "gh issue list", "gh release list",
-    "gh pr view", "gh issue view",
-    "which ", "type ", "command -v",
-    "stat ", "file ", "du ", "df ",
-    "ps ", "top ", "htop",
-)
-
-
-def _is_noisy_tool(tool, inp):
-    if tool in _NOISE_TOOLS:
-        return True
-    if tool in ("Write", "Edit"):
-        path = inp.get("file_path", "")
-        if any(p in path for p in _NOISE_PATHS):
-            return True
-    if tool == "Bash":
-        cmd = inp.get("command", "") or ""
-        # Hide the slash command's own plumbing:
-        #  - direct hook curls (legacy inlined slash-command body),
-        #  - the `source …/bot-mirror-cmd.sh` form (current body that
-        #    delegates to the external script).
-        if "/hook/open_in_bot" in cmd or f":{HOOK_PORT}/hook/" in cmd:
-            return True
-        if "bot-mirror-cmd.sh" in cmd:
-            return True
-    return False
-
-
-def _is_mirror_noisy_tool(tool, inp):
-    """Stricter filter for the mirror channel: hide observational Bash
-    too (cat/grep/git log/etc) so the topic stays a clean conversation
-    transcript. Full tool trace is still visible in the terminal.
-
-    Used by the "lite" filter level (default). The "all" level hides
-    every tool_use upstream of this check.
-    """
-    if _is_noisy_tool(tool, inp):
-        return True
-    if tool == "Bash":
-        cmd = (inp.get("command", "") or "").lstrip()
-        cmd_head = cmd.split(" 2>")[0].split(" |")[0].split(" &&")[0].lstrip()
-        for prefix in _BASH_READONLY_PREFIXES:
-            if cmd_head.startswith(prefix):
-                return True
-        # python3 <<'PYEOF' … PYEOF style: implementation-detail
-        # work the owner doesn't need to see in the mirror.
-        if "<<'PYEOF'" in cmd or '<<"PYEOF"' in cmd or "<< PYEOF" in cmd:
-            return True
-    # Write/Edit/MultiEdit projections double up with the permission
-    # prompt the owner already approved — hide them on the lite level.
-    if tool in ("Write", "Edit", "MultiEdit"):
-        return True
-    return False
 
 
 def _mirror_welcome_text(mirror) -> str:
@@ -395,25 +300,6 @@ def _mirror_welcome_buttons(mirror) -> list:
     return rows
 
 
-def _normalize_tool_input(tool, ti) -> str:
-    """Return a stable signature for a tool_use's "what it does" so
-    a pending permission can be matched against the eventual tool_use
-    in the JSONL. Tool-specific to ignore spurious metadata like
-    `description` or buffer offsets.
-    """
-    if not isinstance(ti, dict):
-        return ""
-    if tool == "Bash":
-        return (ti.get("command", "") or "").strip()
-    if tool in ("Write", "Edit", "MultiEdit", "Read"):
-        return ti.get("file_path", "") or ""
-    # Fallback: full JSON of sorted keys.
-    try:
-        return json.dumps(ti, sort_keys=True, ensure_ascii=False)
-    except Exception:
-        return str(ti)
-
-
 def _react_user_msg(msg_id: int, chat_id: int, emoji: str | None):
     """Set/clear a reaction on a user message. Silent on failure."""
     try:
@@ -434,27 +320,6 @@ def _record_topic_msg(topic_id: int | None, msg_id: int | None):
         buf.append(int(msg_id))
         if len(buf) > _FORK_BACKFILL:
             del buf[:-_FORK_BACKFILL]
-
-
-def _chat_action_for_tool(name: str | None) -> str:
-    """Map a Claude tool name to a Telegram chat-action verb.
-
-    Telegram shows the action ("typing", "uploading photo", …) beneath
-    the chat title. Matching the verb to what Claude is actually doing
-    turns the indicator into a live status hint without adding a UI
-    element. Unknown / no-tool → typing.
-    """
-    if not name:
-        return "typing"
-    n = name.lower()
-    if n in ("read", "glob", "grep", "ls", "edit", "write", "notebookedit",
-             "multiedit"):
-        return "upload_document"
-    if n in ("webfetch", "websearch"):
-        return "find_location"
-    if "image" in n or "screenshot" in n or n in ("notebookread",):
-        return "upload_photo"
-    return "typing"
 
 
 def _react_progress(turn: TurnState, emoji: str):
@@ -875,21 +740,6 @@ def on_thinking(session):
             target=_turn_timer, args=(session, turn), daemon=True)
         turn._timer_thread = t
         t.start()
-
-
-def _compact_tool_msg(tool, inp):
-    if tool == "Bash":
-        cmd = inp.get("command", "?")
-        # Collapse multi-line shell snippets into one displayable line.
-        cmd = cmd.replace("\n", " ; ").strip()
-        return f"$ {cmd[:50]}" if len(cmd) <= 50 else f"$ {cmd[:47]}…"
-    if tool in ("Write", "Edit"):
-        path = inp.get("file_path", "?")
-        return f"{tool}: {os.path.basename(path)}"
-    if tool == "Read":
-        path = inp.get("file_path", "?")
-        return f"Read: {os.path.basename(path)}"
-    return tool
 
 
 # ── callbacks from HookBridge ────────────────────────────────────────
@@ -1361,12 +1211,6 @@ def _session_last_active(s) -> float:
     return s.started
 
 
-def _short_cwd(cwd: str, limit: int = 48) -> str:
-    if not cwd or len(cwd) <= limit:
-        return cwd or "?"
-    return "…" + cwd[-(limit - 1):]
-
-
 def cmd_sessions(chat_id, thread_id=None):
     all_sessions = [s for s in mgr._sessions.values()
                     if s.topic_id]
@@ -1422,16 +1266,6 @@ def cmd_sessions(chat_id, thread_id=None):
             threading.Thread(target=_cleanup, daemon=True).start()
     else:
         tg.send(text, chat_id, thread_id=thread_id, buttons=rows)
-
-
-_MD_INLINE = re.compile(r"[*_`]")
-
-
-def _strip_md(s: str) -> str:
-    """Strip leading markdown markers and inline emphasis chars from a preview."""
-    s = re.sub(r"^[#>\-*\s]+", "", s)
-    s = _MD_INLINE.sub("", s)
-    return " ".join(s.split())
 
 
 _RESUME_RECENT_SECONDS = 5 * 60
@@ -1573,16 +1407,6 @@ def _do_resume(claude_session_id: str, chat_id, thread_id=None):
 
 
 _RESUME_RECENT_LIMIT = 4
-
-
-def _format_age(seconds: float) -> str:
-    if seconds < 60:
-        return "just now"
-    if seconds < 3600:
-        return f"{int(seconds/60)}m ago"
-    if seconds < 86400:
-        return f"{int(seconds/3600)}h ago"
-    return f"{int(seconds/86400)}d ago"
 
 
 def _build_resume_picker(sessions, pick_id, max_items=None):
