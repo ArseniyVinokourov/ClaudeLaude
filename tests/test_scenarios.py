@@ -509,7 +509,8 @@ def test_markdown_table_to_mobile_list(bot):
         "| a.py | 100 |\n"
         "| b.py | 200 |\n"
     )
-    out = bot.mod._md_table_to_list(src)
+    import formatting
+    out = formatting._md_table_to_list(src)
     assert "**a.py**" in out
     assert "**b.py**" in out
     assert "Lines: 100" in out
@@ -1071,7 +1072,7 @@ def test_interrupt_repaints_status_message(bot, tmp_path):
     sid = next(iter(bot.mod.mgr._sessions))
     session = bot.mod.mgr._sessions[sid]
     # Plant a live turn with an existing status message.
-    turn = bot.mod._get_turn(session)
+    turn = bot.mod.turnctl._get_turn(session)
     turn.status_msg_id = 9999
     # Patch interrupt to no-op success.
     bot.mod.mgr.interrupt = lambda _sid: True
@@ -1147,7 +1148,8 @@ def test_status_text_is_time_free(bot):
     only on tool transitions, so the timer edit fires a few times per
     turn instead of ~20/min just for the seconds counter.
     """
-    from bot import _format_status, TurnState
+    from bot import TurnState
+    _format_status = bot.mod.turnctl._format_status
     now = time.time()
     turn = TurnState()
     # No tool ops yet: a stable "Думаю…" line, regardless of elapsed time.
@@ -1326,7 +1328,8 @@ def test_chat_action_mapper_unit(bot):
     Pulls _chat_action_for_tool through the `bot` fixture so config.py
     picks up the test BOT_TOKEN env-stub instead of trying to read .env.
     """
-    fn = bot.mod._chat_action_for_tool
+    import formatting
+    fn = formatting._chat_action_for_tool
     assert fn(None) == "typing"
     assert fn("Bash") == "typing"
     assert fn("Read") == "upload_document"
@@ -1367,7 +1370,7 @@ def test_multi_image_uses_send_media_group(bot, tmp_path, monkeypatch):
                         lambda chat_id, p, caption="", thread_id=None:
                         photo_calls.append((chat_id, p, thread_id)) or None)
 
-    bot.mod.on_result(sess, "", "")
+    bot.mod.turnctl.on_result(sess, "", "")
 
     assert len(group_calls) == 1, group_calls
     chat_id, sent_paths, thread = group_calls[0]
@@ -1396,7 +1399,7 @@ def test_single_image_uses_send_photo(bot, tmp_path, monkeypatch):
                         lambda chat_id, p, caption="", thread_id=None:
                         photo_calls.append(p) or None)
 
-    bot.mod.on_result(sess, "", "")
+    bot.mod.turnctl.on_result(sess, "", "")
     assert group_calls == [], group_calls
     assert photo_calls == [str(p)], photo_calls
 
@@ -1543,7 +1546,8 @@ def test_admin_sanity_silent_for_admin(bot, capsys):
 
 def test_record_topic_msg_trims_buffer(bot):
     """Rolling buffer caps at _FORK_BACKFILL entries."""
-    from bot import _record_topic_msg, _FORK_BACKFILL, state
+    from bot import _FORK_BACKFILL, state
+    _record_topic_msg = bot.mod.turnctl._record_topic_msg
     tid = 7777
     for i in range(_FORK_BACKFILL * 3):
         _record_topic_msg(tid, 1000 + i)

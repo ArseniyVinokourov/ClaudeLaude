@@ -6,14 +6,11 @@ See README.md or run setup.sh for first-time configuration.
 """
 import json
 import os
-import re
 import shutil
-import subprocess
 import sys
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -25,10 +22,10 @@ from config import (OWNER_ID, HOOK_PORT,
 import audit
 import telegram as tg
 from dashboard import Dashboard
+from turncontroller import TurnController, TurnState
 from formatting import (
-    _chat_action_for_tool, _compact_tool_msg, _format_age, _is_mirror_noisy_tool,
-    _is_noisy_tool, _md_table_to_list, _normalize_tool_input, _short_cwd,
-    _strip_md,
+    _compact_tool_msg, _format_age, _is_mirror_noisy_tool,
+    _normalize_tool_input, _short_cwd, _strip_md,
 )
 import session_discovery
 from session_discovery import (
@@ -69,31 +66,6 @@ _REACT_INTERRUPTED = "🤷"
 _REACT_ERROR = "😨"
 
 
-@dataclass
-class TurnState:
-    """Tracks messages and tool ops within one Claude turn."""
-    msg_ids: list[int] = field(default_factory=list)
-    msg_texts: list[str] = field(default_factory=list)
-    tool_ops: list[str] = field(default_factory=list)
-    status_msg_id: int | None = None
-    _last_status_text: str = ""
-    started_at: float = field(default_factory=time.time)
-    stop_event: threading.Event = field(default_factory=threading.Event)
-    _timer_thread: threading.Thread | None = None
-    interrupted: bool = False
-    # User-message ids (in the topic) whose response is awaited; their
-    # reaction is upgraded from 👀 → 🔥/⚡ → 👍 across the turn.
-    user_msg_ids: list[int] = field(default_factory=list)
-    # Progress flags: once True, the relevant 🔥/⚡ reaction has fired and
-    # later events do not regress (⚡ tool wins over 🔥 stream).
-    streamed: bool = False
-    tooled: bool = False
-    # Raw name of most recent tool ("Read", "Bash", "WebFetch", …) — drives
-    # the contextual sendChatAction indicator. Stays after the tool ends so
-    # the timer thread keeps refreshing the same action mid-thinking.
-    last_tool_name: str | None = None
-
-
 class BotState:
     def __init__(self):
         self.lock = threading.Lock()
@@ -118,6 +90,12 @@ class BotState:
 
 state = BotState()
 bot_running = True
+turnctl = TurnController(
+    state, _CLAUDE_BIN,
+    default_display=DEFAULT_DISPLAY,
+    icon_stopped=_ICON_STOPPED,
+    fork_backfill=_FORK_BACKFILL,
+)
 
 
 def forum():
@@ -229,35 +207,7 @@ def _ephemeral(chat_id, text, thread_id=None, seconds=15, buttons=None):
     return mid
 
 
-# ── turn tracking ────────────────────────────────────────────────────
-
-
-def _get_turn(session) -> TurnState:
-    with state.lock:
-        if session.sid not in state.turns:
-            state.turns[session.sid] = TurnState()
-        return state.turns[session.sid]
-
-
-def _enqueue_user_input(session, text: str, chat_id: int,
-                         msg_id: int | None, thread_id: int | None):
-    """Send a user message into Claude and wire up the 👀→👍 reaction.
-
-    Used for plain text, sticker descriptors, and file-attached prompts.
-    Reacting up-front gives the user immediate feedback that the bot saw
-    the message even before Claude starts streaming.
-    """
-    ok = mgr.send_user_message(session.sid, text)
-    if not ok:
-        tg.send("⚠️ Session died", chat_id, thread_id=thread_id)
-        return
-    if msg_id and chat_id:
-        # Auto-reaction 👀 removed — each reaction costs a budget unit
-        # and the "⏳ Думаю…" status + typing indicator already signal
-        # "got it, working on it" for free.
-        turn = _get_turn(session)
-        turn.user_msg_ids.append(msg_id)
-        _record_topic_msg(session.topic_id, msg_id)
+# ── mirror welcome ───────────────────────────────────────────────────
 
 
 def _mirror_welcome_text(mirror) -> str:
@@ -304,448 +254,6 @@ def _mirror_welcome_buttons(mirror) -> list:
              "callback_data": f"mm:{short}"},
         ])
     return rows
-
-
-def _react_user_msg(msg_id: int, chat_id: int, emoji: str | None):
-    """Set/clear a reaction on a user message. Silent on failure."""
-    try:
-        tg.set_message_reaction(chat_id, msg_id, emoji)
-    except Exception as e:
-        print(f"[react] {emoji!r} on {msg_id} failed: {e}",
-              file=sys.stderr, flush=True)
-
-
-def _record_topic_msg(topic_id: int | None, msg_id: int | None):
-    """Push a message id into the per-topic rolling window used for fork
-    backfill. Trims to _FORK_BACKFILL most-recent ids. Silently no-ops on
-    missing inputs so callers don't need to branch."""
-    if not topic_id or not msg_id:
-        return
-    with state.lock:
-        buf = state.recent_msgs.setdefault(topic_id, [])
-        buf.append(int(msg_id))
-        if len(buf) > _FORK_BACKFILL:
-            del buf[:-_FORK_BACKFILL]
-
-
-def _react_progress(turn: TurnState, emoji: str):
-    """Auto-reactions disabled — every reaction costs 1 budget unit and
-    a turn-lifecycle 👀→🔥/⚡→👍 burned 2-3 units per user message. The
-    `typing…` indicator carries the same "I'm working" signal for free.
-
-    Kept as a no-op so call sites don't all need to be deleted; manual
-    reactions still go through tg.set_message_reaction directly."""
-    return
-
-
-def _react_for_turn(turn: TurnState, kind: str = "completed"):
-    """Auto-reactions disabled (see _react_progress). This still clears
-    the per-turn tracking state so the next turn starts clean."""
-    turn.user_msg_ids.clear()
-    turn.streamed = False
-    turn.tooled = False
-    turn.last_tool_name = None
-
-
-def _format_status(turn: TurnState) -> str:
-    """Status text shown while Claude works on a turn.
-
-    Deliberately time-free: every tick that produced a different number
-    used one budget unit. Now the text only changes on tool transitions
-    (≤ a few per turn), and Telegram's free "typing…" indicator carries
-    the liveness signal.
-    """
-    n = len(turn.tool_ops)
-    if n == 0:
-        return "⏳ Думаю…"
-    last = turn.tool_ops[-1]
-    if n > 1:
-        return f"⚙️ <code>{tg.esc(last)}</code> ({n})"
-    return f"⚙️ <code>{tg.esc(last)}</code>"
-
-
-def _interrupt_button(session):
-    return [[{"text": "⏹ Interrupt", "callback_data": f"int:{session.sid}"}]]
-
-
-def _update_status(session, turn: TurnState):
-    fid = forum()
-    if not fid or not session.topic_id:
-        return
-    text = _format_status(turn)
-    if text == turn._last_status_text:
-        return
-    btn = _interrupt_button(session)
-    if turn.status_msg_id:
-        tg.edit(turn.status_msg_id, text, fid, buttons=btn)
-    else:
-        mid = tg.send(text, fid, thread_id=session.topic_id, buttons=btn)
-        if mid:
-            turn.status_msg_id = mid
-    turn._last_status_text = text
-
-
-def _finish_status(session, turn: TurnState):
-    """Remove status message (timer thread keeps running)."""
-    fid = forum()
-    if not fid:
-        return
-    if turn.status_msg_id:
-        tg.delete(turn.status_msg_id, fid)
-        turn.status_msg_id = None
-
-
-def _end_turn(turn: TurnState):
-    """Stop timer thread and clean up status message.
-
-    On a normal turn end the status message is deleted right away. On an
-    interrupted turn it sticks as "⏹ Interrupted" for ~3s so the user sees
-    the final state before it disappears.
-    """
-    turn.stop_event.set()
-    if turn._timer_thread:
-        turn._timer_thread.join(timeout=5)
-        turn._timer_thread = None
-    fid = forum()
-    if fid and turn.status_msg_id:
-        mid = turn.status_msg_id
-        if turn.interrupted:
-            try:
-                tg.edit(mid, "⏹ Interrupted", fid)
-            except Exception:
-                pass
-
-            def _del_later(mid=mid, fid=fid):
-                time.sleep(3)
-                tg.delete(mid, fid)
-            threading.Thread(target=_del_later, daemon=True).start()
-        else:
-            tg.delete(mid, fid)
-        turn.status_msg_id = None
-    _react_for_turn(turn, "completed")
-
-
-def _turn_timer(session, turn: TurnState):
-    """Background thread: update status timer."""
-    fid = forum()
-    while not turn.stop_event.wait(3):
-        mid = turn.status_msg_id
-        if mid and fid:
-            text = _format_status(turn)
-            if text != turn._last_status_text:
-                tg.edit(mid, text, fid, buttons=_interrupt_button(session))
-                turn._last_status_text = text
-        # Telegram hides the chat-action indicator after ~5s; refresh it
-        # on every tick (3s) so the verb stays visible for the full turn.
-        if fid and session.topic_id:
-            tg.send_chat_action(fid,
-                                action=_chat_action_for_tool(turn.last_tool_name),
-                                thread_id=session.topic_id)
-
-
-# ── compact / expand ────────────────────────────────────────────────
-
-_MAX_SAVED_TURNS = 50
-
-
-def _build_summary(texts: list[str], ops: list[str]) -> str:
-    combined = "\n".join(t.strip() for t in texts if t.strip())
-    combined = re.sub(r'<[^>]+>', '', combined)
-    combined = re.sub(r'[*_~`#]', '', combined)
-    combined = re.sub(r'\n{2,}', '\n', combined).strip()
-    try:
-        r = subprocess.run(
-            [_CLAUDE_BIN, '-p',
-             'Summarize in 1-2 sentences. Reply in the same language '
-             f'as the original text. Be very brief:\n{combined[:2000]}',
-             '--no-session-persistence', '--tools', ''],
-            capture_output=True, text=True, timeout=15,
-            cwd='/tmp',
-        )
-        summary = r.stdout.strip()
-        if summary:
-            parts = []
-            if ops:
-                parts.append(f"⚙️ {len(ops)} ops")
-            parts.append(tg.esc(summary))
-            return "\n".join(parts)
-    except Exception:
-        pass
-    if len(combined) > 200:
-        combined = combined[:197] + "…"
-    parts = []
-    if ops:
-        parts.append(f"⚙️ {len(ops)} ops")
-    parts.append(tg.esc(combined))
-    return "\n".join(parts)
-
-
-# ── session context for claude --append-system-prompt ────────────────
-
-def _session_context(session) -> str:
-    """Return the per-turn context appended to Claude's system prompt.
-
-    Tells Claude it's running inside the ClaudeLaude Telegram bot, plus
-    the topic/display-mode/mode it currently lives in and the bot
-    commands the user can hit from Telegram.
-    """
-    display = "mobile"
-    if session.topic_id:
-        with state.lock:
-            display = state.topic_display_mode.get(
-                session.topic_id, DEFAULT_DISPLAY)
-    lines = [
-        "## ClaudeLaude bot session",
-        "You are running inside ClaudeLaude — a Telegram bot that exposes "
-        "Claude Code over Telegram Forum Topics. Each topic is one session; "
-        "the owner reads your output in the Telegram client.",
-        "",
-        f"- topic_id: {session.topic_id}",
-        f"- session_id (bot): {session.sid}",
-        f"- cwd: {session.cwd}",
-        f"- display: {display} (mobile = 35-char width, no tables, no <pre>)",
-        f"- mode: {session.mode}",
-        "",
-        "Owner-side commands (sent from Telegram, not by you):",
-        "/new /sessions /resume /history /stop /restart /interrupt "
-        "/usage /display /mode /menu /help /update /stop_bot.",
-        "",
-        "Constraints:",
-        "- Telegram messages cap at 4096 chars; the bot splits long output.",
-        "- Markdown tables and <pre> blocks render badly in Telegram — "
-        "prefer key:value lists.",
-        "- Inline buttons truncate at ~25 chars on mobile.",
-        "- Photos/files the owner sends arrive as attachment paths in "
-        "your user message.",
-    ]
-    return "\n".join(lines)
-
-
-# ── noise filter ─────────────────────────────────────────────────────
-
-_NOISE_TEXTS = {
-    "claude is waiting for your input",
-}
-
-
-# ── callbacks from SessionManager ────────────────────────────────────
-
-def on_assistant(session, text):
-    if not session.topic_id:
-        return
-    if text.strip().lower() in _NOISE_TEXTS:
-        return
-    turn = _get_turn(session)
-    # Upgrade reaction to 🔥 on first real assistant text, but not over ⚡
-    # if a tool was already used in this turn.
-    if not turn.streamed and not turn.tooled:
-        _react_progress(turn, _REACT_STREAMING)
-        turn.streamed = True
-    with state.lock:
-        mode = state.topic_display_mode.get(session.topic_id, DEFAULT_DISPLAY)
-    if mode == "mobile":
-        text = _md_table_to_list(text)
-    fid = forum()
-    if fid:
-        ids = tg.send_long(text, fid, thread_id=session.topic_id, markdown=True)
-        turn.msg_ids.extend(ids)
-        turn.msg_texts.append(text)
-        for mid in ids:
-            _record_topic_msg(session.topic_id, mid)
-        # The status message keeps its position in the chronology — we
-        # used to delete-and-resend on every assistant text (2 budget
-        # units per chunk) just to keep it visually at the bottom. With
-        # the budget tight, the status stays put; users glance at it
-        # in place. End-of-turn cleanup is handled by _end_turn.
-
-
-def on_result(session, result_text, summary):
-    if not session.topic_id:
-        return
-    with state.lock:
-        turn = state.turns.pop(session.sid, TurnState())
-    _end_turn(turn)
-    fid = forum()
-    if not fid:
-        return
-
-    # Send pending images. 2+ → bundle into a single sendMediaGroup album
-    # so multi-chart output renders as one block instead of N separate
-    # photos. Telegram caps an album at 10 items; the rest spill over as
-    # individual sendPhoto calls.
-    imgs = [p for p in session.pending_images if os.path.isfile(p)]
-    if len(imgs) >= 2:
-        tg.send_media_group(fid, imgs[:10], thread_id=session.topic_id)
-        for extra in imgs[10:]:
-            tg.send_photo(fid, extra, thread_id=session.topic_id)
-    elif imgs:
-        tg.send_photo(fid, imgs[0], thread_id=session.topic_id)
-    session.pending_images.clear()
-
-    if turn.msg_ids:
-        with state.lock:
-            if len(state.saved_turns) >= _MAX_SAVED_TURNS:
-                oldest = next(iter(state.saved_turns))
-                state.saved_turns.pop(oldest)
-            compact_id = str(time.time_ns())[-10:]
-            state.saved_turns[compact_id] = (
-                turn.msg_ids[:], turn.msg_texts[:], turn.tool_ops[:])
-        btn = [[{"text": "\U0001f5dc Compact", "callback_data": f"c:{compact_id}"}]]
-        last_mid = turn.msg_ids[-1]
-        try:
-            tg._req("editMessageReplyMarkup", {
-                "chat_id": fid,
-                "message_id": last_mid,
-                "reply_markup": {"inline_keyboard": btn},
-            })
-        except Exception:
-            pass
-
-    if not session.alive:
-        stop_label = session.name
-        tg.edit_forum_topic(fid, session.topic_id, stop_label,
-                            icon_custom_emoji_id=_ICON_STOPPED)
-        with state.lock:
-            state.topic_labels[session.topic_id] = stop_label
-        session.topic_label = stop_label
-    elif session.topic_id not in state.renamed_topics and result_text.strip():
-        with state.lock:
-            state.renamed_topics.add(session.topic_id)
-        _auto_rename_topic(session, result_text, fid)
-
-
-def _auto_rename_topic(session, result_text, fid):
-    user_msg = None
-    for h in session.history:
-        if h.kind == "user":
-            user_msg = h.text.strip()
-            break
-    if not user_msg:
-        return
-
-    def _clean_title(raw):
-        if not raw:
-            return None
-        t = raw.strip().strip('"\'')
-        t = re.sub(r'\d{4}[-/]\d{2}[-/]\d{2}', '', t).strip(' -–')
-        t = re.sub(r'[-_]{2,}', ' ', t)
-        if re.fullmatch(r'[\w]+([-_][\w]+){2,}', t):
-            t = t.replace('-', ' ').replace('_', ' ')
-        t = re.sub(r'\s+', ' ', t).strip()
-        return t if t and len(t) <= 30 else None
-
-    def _do_rename():
-        context = f'User message: {user_msg[:300]}'
-        if result_text:
-            context += f'\nAssistant response (start): {result_text[:200]}'
-        try:
-            r = subprocess.run(
-                [_CLAUDE_BIN, '-p',
-                 'Reply with ONLY a short 2-4 word human-readable topic title '
-                 'that captures the INTENT of the conversation. '
-                 'Use natural words separated by spaces. '
-                 'No dashes, no dates, no file paths, no quotes, no explanation. '
-                 'Examples: "Library API Setup", "Fix Auth Bug", "Timesheet Review". '
-                 f'\n{context}',
-                 '--no-session-persistence', '--tools', ''],
-                capture_output=True, text=True, timeout=20,
-                cwd='/tmp',
-            )
-            title = _clean_title(r.stdout)
-        except Exception:
-            title = None
-        if not title:
-            title = _clean_title(result_text[:60] if result_text else None)
-        if not title:
-            text = re.sub(r'\d{4}[-/]\d{2}[-/]\d{2}', '', user_msg)
-            text = re.sub(r'[/\-_]+', ' ', text)
-            words = [w for w in text.split() if len(w) > 1][:3]
-            title = ' '.join(words).strip()
-            if len(title) > 20:
-                title = title[:17] + "…"
-        if title:
-            label = title
-            tg.edit_forum_topic(fid, session.topic_id, label[:128])
-            with state.lock:
-                state.topic_labels[session.topic_id] = label[:128]
-            session.topic_label = label[:128]
-            session.name = title
-            mgr._persist()
-
-    threading.Thread(target=_do_rename, daemon=True).start()
-
-
-def _send_fork_summary(parent, topic_id):
-    """Background: summarize parent session history and send to fork topic."""
-    history_lines = []
-    for h in parent.history:
-        if h.kind in ("user", "assistant", "result"):
-            text = h.text[:200] if len(h.text) > 200 else h.text
-            history_lines.append(f"{h.kind}: {text}")
-    if not history_lines:
-        return
-    digest = '\n'.join(history_lines[-30:])
-
-    def _do():
-        try:
-            r = subprocess.run(
-                [_CLAUDE_BIN, '-p',
-                 f'Summarize this conversation in 3-5 bullet points. '
-                 f'Reply in the same language as the conversation:\n{digest[:2000]}',
-                 '--no-session-persistence', '--tools', ''],
-                capture_output=True, text=True, timeout=20,
-                cwd='/tmp',
-            )
-            summary = r.stdout.strip()
-        except Exception:
-            summary = None
-        if summary:
-            send_to_topic(topic_id,
-                          f"📋 <b>Parent session summary:</b>\n{tg.esc(summary)}")
-
-    threading.Thread(target=_do, daemon=True).start()
-
-
-def on_tool_use(session, tool, inp):
-    if not session.topic_id:
-        return
-    audit.log("tool_use", f"{tool}: {json.dumps(inp, ensure_ascii=False)}"
-              if isinstance(inp, dict) else f"{tool}: {inp}",
-              sid=session.sid)
-    turn = _get_turn(session)
-    turn.last_tool_name = tool
-    # Push a fresh contextual chat-action so the indicator under the chat
-    # title matches what Claude is doing right now.
-    fid = forum()
-    if fid:
-        tg.send_chat_action(fid, action=_chat_action_for_tool(tool),
-                            thread_id=session.topic_id)
-    # Upgrade reaction to ⚡ on first tool use; ⚡ overrides 🔥.
-    if not turn.tooled:
-        _react_progress(turn, _REACT_TOOL)
-        turn.tooled = True
-    if not _is_noisy_tool(tool, inp):
-        compact = _compact_tool_msg(tool, inp)
-        turn.tool_ops.append(compact)
-        _update_status(session, turn)
-
-
-def on_thinking(session):
-    if not session.topic_id:
-        return
-    fid = forum()
-    if not fid:
-        return
-    turn = _get_turn(session)
-    if turn._timer_thread is None:
-        mid = tg.send("⏳ Думаю…", fid, thread_id=session.topic_id,
-                      buttons=_interrupt_button(session))
-        turn.status_msg_id = mid
-        tg.send_chat_action(fid, thread_id=session.topic_id)
-        t = threading.Thread(
-            target=_turn_timer, args=(session, turn), daemon=True)
-        turn._timer_thread = t
-        t.start()
 
 
 # ── callbacks from HookBridge ────────────────────────────────────────
@@ -923,7 +431,7 @@ def _invalidate_and_stop(session, reason: str):
     with state.lock:
         turn = state.turns.pop(sid, None)
     if turn:
-        _end_turn(turn)
+        turnctl.end_turn(turn)
     mgr.stop(sid, reason=reason)
     _invalidate_session(session)
 
@@ -1470,7 +978,7 @@ def cmd_stop(session, chat_id, thread_id):
     with state.lock:
         turn = state.turns.pop(session.sid, None)
     if turn:
-        _end_turn(turn)
+        turnctl.end_turn(turn)
     mgr.stop(session.sid)
     audit.log("session_stop", "user stop", sid=session.sid)
     fid = forum()
@@ -1853,13 +1361,14 @@ def _on_session_stop(session, reason: str):
 
 
 mgr = SessionManager(
-    on_assistant_message=on_assistant,
-    on_result=on_result,
-    on_tool_use=on_tool_use,
-    on_thinking=on_thinking,
+    on_assistant_message=turnctl.on_assistant,
+    on_result=turnctl.on_result,
+    on_tool_use=turnctl.on_tool_use,
+    on_thinking=turnctl.on_thinking,
     on_session_stop=_on_session_stop,
-    on_session_context=_session_context,
+    on_session_context=turnctl.session_context,
 )
+turnctl.mgr = mgr
 
 
 def on_mirror_event(mirror, event):
@@ -2607,7 +2116,7 @@ def _handle_update(u):
                          else f"[Attached file: {dest}]")
             audit.log("user_message", f"[file] {filename}",
                       sid=session.sid)
-            _enqueue_user_input(session, user_text, chat_id, msg_id, thread_id)
+            turnctl.enqueue_user_input(session, user_text, chat_id, msg_id, thread_id)
         else:
             tg.send("❌ Download failed", chat_id,
                     thread_id=thread_id)
@@ -2629,7 +2138,7 @@ def _handle_update(u):
         else:
             descr = "[Sticker]"
         audit.log("user_message", descr, sid=session.sid)
-        _enqueue_user_input(session, descr, chat_id, msg_id, thread_id)
+        turnctl.enqueue_user_input(session, descr, chat_id, msg_id, thread_id)
         return
 
     if not text:
@@ -2645,7 +2154,7 @@ def _handle_update(u):
         audit.log("user_message", text,
                   sid=session.sid if session else None)
         if session and session.is_bot_spawned:
-            _enqueue_user_input(session, text, chat_id, msg_id, thread_id)
+            turnctl.enqueue_user_input(session, text, chat_id, msg_id, thread_id)
         elif session:
             tg.send("Terminal session — use terminal",
                     chat_id, thread_id=thread_id)
@@ -2809,7 +2318,7 @@ def _handle_callback(cb, data):
                 tg.edit(cb_msg, "⏳ Summarizing…", cb_chat)
 
             def _do_compact():
-                summary = _build_summary(texts, ops)
+                summary = turnctl.build_summary(texts, ops)
                 btn = [[{"text": "\U0001f4c2 Expand",
                           "callback_data": f"uc:{compact_id}"}]]
                 if cb_msg:
@@ -2874,7 +2383,7 @@ def _handle_callback(cb, data):
                                 tg.copy_messages(
                                     fid, fid, recent[-_FORK_BACKFILL:],
                                     thread_id=topic_id)
-                        _send_fork_summary(parent, topic_id)
+                        turnctl.send_fork_summary(parent, topic_id)
                         url = _topic_url(topic_id)
                         if url:
                             _ephemeral(fid, "\U0001f500",

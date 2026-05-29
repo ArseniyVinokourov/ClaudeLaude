@@ -29,6 +29,11 @@ def _purge_bot_modules():
     for name in [
         "bot", "telegram", "sessions", "hooks", "config", "version",
         "audit", "device_monitor", "terminal_mirror",
+        # Component modules cache `import telegram as tg` at import time;
+        # purge them too so a fresh bot import rebinds their `tg` to the
+        # freshly-patched telegram module (else they hold a stale one).
+        "turncontroller", "dashboard", "formatting", "session_discovery",
+        "updater",
     ]:
         sys.modules.pop(name, None)
 
@@ -80,7 +85,8 @@ def bot(bot_env, monkeypatch: pytest.MonkeyPatch):
     bot_mod = importlib.import_module("bot")
 
     # Stub auto-rename — it spawns its own claude subprocess via shell.
-    monkeypatch.setattr(bot_mod, "_auto_rename_topic", lambda *a, **kw: None)
+    monkeypatch.setattr(bot_mod.turnctl, "_auto_rename_topic",
+                        lambda *a, **kw: None)
 
     # Stub _ephemeral so the auto-delete daemon thread doesn't outlive the
     # test: with the real impl, time.sleep(seconds) wakes up after the
