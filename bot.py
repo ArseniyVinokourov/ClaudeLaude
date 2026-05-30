@@ -23,6 +23,7 @@ import audit
 import telegram as tg
 from botui import BotUI
 from dashboard import Dashboard
+from lifecycle import SessionLifecycle
 from mirrorbridge import MirrorProjector
 from turncontroller import TurnController, TurnState
 from formatting import (
@@ -97,6 +98,7 @@ turnctl = TurnController(
     icon_stopped=_ICON_STOPPED,
     fork_backfill=_FORK_BACKFILL,
 )
+lifecycle = SessionLifecycle(state, ui, turnctl)
 
 
 def forum():
@@ -272,19 +274,6 @@ def _resolve_hook_session(claude_session_id, data):
     return session
 
 
-def _invalidate_session(session):
-    """Remove a session with a stale/deleted topic."""
-    sid = session.sid
-    if session.topic_id and mgr._topic_map.get(session.topic_id) == sid:
-        del mgr._topic_map[session.topic_id]
-    if session.cwd and mgr._cwd_map.get(session.cwd) == sid:
-        del mgr._cwd_map[session.cwd]
-    if session.claude_session_id and mgr._claude_id_map.get(session.claude_session_id) == sid:
-        del mgr._claude_id_map[session.claude_session_id]
-    mgr._sessions.pop(sid, None)
-    mgr._persist()
-
-
 _watcher_offsets: dict[str, int] = {}
 
 
@@ -304,71 +293,6 @@ def _track_terminal_msg(claude_session_id: str, msg_id: int,
     with state.lock:
         state.pending_terminal_msgs.setdefault(
             claude_session_id, []).append((msg_id, chat_id, kind))
-
-
-def _cancel_session_perms(sid: str, reason: str):
-    """Cancel pending permission requests tied to a session.
-
-    Edits the Allow/Deny message to "✗ Cancelled — {reason}", schedules
-    deletion, and unblocks the hook handler with deny so it can return.
-    """
-    with state.lock:
-        victims = [
-            (short_id, msg_id, chat_id)
-            for short_id, (msg_id, chat_id, p_sid)
-            in list(state.pending_permissions.items())
-            if p_sid == sid
-        ]
-        for short_id, _, _ in victims:
-            state.pending_permissions.pop(short_id, None)
-    for short_id, msg_id, chat_id in victims:
-        full_id = None
-        with state.lock:
-            full_id = state.perm_key_map.pop(short_id, None)
-        try:
-            tg.edit(msg_id, f"✗ Cancelled — {tg.esc(reason)}", chat_id)
-        except Exception as e:
-            print(f"[cancel_perm] edit failed: {e}",
-                  file=sys.stderr, flush=True)
-        def _delete_later(mid=msg_id, cid=chat_id):
-            time.sleep(5)
-            tg.delete(mid, cid)
-        threading.Thread(target=_delete_later, daemon=True).start()
-        if full_id:
-            bridge.abandon_permission(full_id)
-
-
-def _invalidate_and_stop(session, reason: str):
-    """Topic gone → clean up turn, stop session, drop maps.
-
-    Order matters: mgr.stop() fires the on_session_stop callback (which
-    cancels pending perms) only while the session is still in the
-    manager's tables.  _invalidate_session() removes the entry, so it has
-    to come last.
-    """
-    sid = session.sid
-    print(f"[lifecycle] invalidate_and_stop sid={sid} reason={reason}",
-          file=sys.stderr, flush=True)
-    with state.lock:
-        turn = state.turns.pop(sid, None)
-    if turn:
-        turnctl.end_turn(turn)
-    mgr.stop(sid, reason=reason)
-    _invalidate_session(session)
-
-
-def _valid_topic_id(session) -> int | None:
-    """Return session's topic_id only if it looks like a real session topic.
-
-    Filters out None, 0, and General (id 1) so a permission request can
-    never land in the General topic.
-    """
-    if not session:
-        return None
-    tid = session.topic_id
-    if not tid or tid == 1:
-        return None
-    return tid
 
 
 def on_hook_permission(req_id, data):
@@ -416,7 +340,7 @@ def on_hook_permission(req_id, data):
             # of "permission asked + tool ran" both projected).
             mirror.pending_perm_tool = (tool, _normalize_tool_input(tool, ti))
         else:
-            topic_id = _valid_topic_id(session)
+            topic_id = lifecycle.valid_topic_id(session)
             msg_id = None
             chat_id = None
             if topic_id:
@@ -427,9 +351,9 @@ def on_hook_permission(req_id, data):
             if msg_id is None and session and topic_id:
                 print(f"[resolve] stale topic {topic_id}, recreating",
                       file=sys.stderr, flush=True)
-                _invalidate_and_stop(session, "topic gone")
+                lifecycle.invalidate_and_stop(session, "topic gone")
                 session = _resolve_hook_session(claude_session_id, data)
-                topic_id = _valid_topic_id(session)
+                topic_id = lifecycle.valid_topic_id(session)
                 if topic_id:
                     chat_id = forum()
                     msg_id = tg.send(body, chat_id, thread_id=topic_id,
@@ -488,40 +412,6 @@ def cmd_setup(chat_id):
     tg.send("✅ Forum linked. Use /new to start a session.", chat_id)
 
 
-def _spawn_session(cwd, name=None):
-    fid = forum()
-    if not fid:
-        ui.send_general("❌ Run /setup in a forum group first.")
-        return
-    if not name:
-        name = os.path.basename(cwd.rstrip("/"))
-    with state.lock:
-        state.topic_counter[name] = state.topic_counter.get(name, 0) + 1
-        n = state.topic_counter[name]
-    ts = time.strftime("%H:%M")
-    label = (f"{name} #{n} — {ts}" if n > 1
-             else f"{name} — {ts}")
-    try:
-        topic_id = tg.create_forum_topic(fid, label, icon_color=0x6FB9F0)
-    except Exception as e:
-        ui.ephemeral(fid, f"❌ Failed to create topic: {tg.esc(str(e))}", seconds=7)
-        return
-    if not topic_id:
-        ui.ephemeral(fid, "❌ Failed to create topic. Check bot admin rights.", seconds=7)
-        return
-    with state.lock:
-        state.topic_labels[topic_id] = label
-    s = mgr.create(cwd=cwd, name=name, topic_id=topic_id)
-    s.topic_label = label
-    mgr._persist()
-    audit.log("session_start", cwd, sid=s.sid)
-    ui.send_to_topic(topic_id,
-                  f"▶️ <code>{tg.esc(cwd)}</code>")
-    url = ui.topic_url(topic_id)
-    if url:
-        ui.ephemeral(fid, f"▶ {name}",
-                   buttons=[[{"text": "Open", "url": url}]],
-                   seconds=5)
 
 
 def cmd_new(args: str, chat_id=None, thread_id=None):
@@ -540,7 +430,7 @@ def cmd_new(args: str, chat_id=None, thread_id=None):
                 ui.reply(chat_id, thread_id,
                        f"❌ Not a directory: <code>{tg.esc(cwd)}</code>")
             return
-        _spawn_session(cwd, name)
+        lifecycle.spawn_session(cwd, name)
         return
     projects = _discover_projects()
     if not projects:
@@ -939,7 +829,7 @@ def _do_interrupt(session, chat_id, thread_id):
             except Exception as e:
                 print(f"[interrupt] status edit failed: {e}",
                       file=sys.stderr, flush=True)
-    _cancel_session_perms(session.sid, "interrupted")
+    lifecycle.cancel_session_perms(session.sid, "interrupted")
     if not edited:
         # No live status to repaint (or edit failed) — fall back to ephemeral.
         ui.ephemeral(chat_id, "⏹ Turn interrupted.",
@@ -1269,19 +1159,17 @@ def cmd_menu(chat_id, thread_id=None, session=None):
 
 # ── main loop ────────────────────────────────────────────────────────
 
-def _on_session_stop(session, reason: str):
-    _cancel_session_perms(session.sid, reason)
-
 
 mgr = SessionManager(
     on_assistant_message=turnctl.on_assistant,
     on_result=turnctl.on_result,
     on_tool_use=turnctl.on_tool_use,
     on_thinking=turnctl.on_thinking,
-    on_session_stop=_on_session_stop,
+    on_session_stop=lifecycle.on_session_stop,
     on_session_context=turnctl.session_context,
 )
 turnctl.mgr = mgr
+lifecycle.mgr = mgr
 
 
 mirror = MirrorProjector(state, ui.topic_url, _ICON_TERMINAL)
@@ -1295,6 +1183,7 @@ bridge = HookBridge(
     on_permission=on_hook_permission,
     on_open_in_bot=mirror.on_open_in_bot,
 )
+lifecycle.bridge = bridge
 
 
 def _dashboard_loop():
@@ -1323,7 +1212,7 @@ def _on_topic_dead(chat_id: int, thread_id: int) -> None:
         print(f"[topic_dead] session {sess.sid[:8]} — invalidating",
               file=sys.stderr, flush=True)
         try:
-            _invalidate_and_stop(sess, "topic deleted")
+            lifecycle.invalidate_and_stop(sess, "topic deleted")
         except Exception as e:
             print(f"[topic_dead] stop error: {e}",
                   file=sys.stderr, flush=True)
@@ -1880,7 +1769,7 @@ def _handle_callback(cb, data):
                 if 0 <= idx < len(projects):
                     if cb_chat and cb_msg:
                         tg.delete(cb_msg, cb_chat)
-                    _spawn_session(projects[idx])
+                    lifecycle.spawn_session(projects[idx])
 
     elif data.startswith("ra:"):
         pick_id = data.split(":")[1]

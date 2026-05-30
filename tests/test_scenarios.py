@@ -466,7 +466,7 @@ def test_invalidate_session_cleans_maps(bot, tmp_path):
     # invalidate pops from _sessions, after which stop becomes a no-op.
     # The lifecycle-batch branch consolidates this into a single helper.)
     bot.mod.mgr.stop(sess.sid)
-    bot.mod._invalidate_session(sess)
+    bot.mod.lifecycle._invalidate_session(sess)
 
     assert sess.alive is False
     assert bot.mod.mgr.by_topic(sess.topic_id) is None
@@ -493,7 +493,7 @@ def test_invalidate_stop_drops_routing_maps(bot, tmp_path):
     sess = next(iter(bot.mod.mgr._sessions.values()))
     bot.mod.mgr.link_claude_id("claude-probed", sess)
 
-    bot.mod._invalidate_and_stop(sess, "topic deleted")
+    bot.mod.lifecycle.invalidate_and_stop(sess, "topic deleted")
     assert sess.alive is False
     assert bot.mod.mgr.by_topic(sess.topic_id) is None
     assert bot.mod.mgr.by_cwd(str(cwd)) is None
