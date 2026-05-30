@@ -217,7 +217,7 @@ def test_permission_flow_allow(bot, tmp_path):
     # Simulate hook arriving via the bridge callback.
     req_id = "req-1"
     bot.mod.bridge._pending[req_id] = __import__("threading").Event()
-    bot.mod.on_hook_permission(req_id, {
+    bot.mod.hooks.on_hook_permission(req_id, {
         "tool_name": "Bash",
         "tool_input": {"command": "rm -rf /"},
         "session_id": "claude-sess-perm",
@@ -330,7 +330,7 @@ def test_permission_flow_deny(bot, tmp_path):
     import threading
     req_id = "req-deny"
     bot.mod.bridge._pending[req_id] = threading.Event()
-    bot.mod.on_hook_permission(req_id, {
+    bot.mod.hooks.on_hook_permission(req_id, {
         "tool_name": "Write",
         "tool_input": {"file_path": "/etc/passwd"},
         "session_id": "claude-sess-perm-d",
@@ -375,7 +375,7 @@ def test_hook_routing_skips_bot_session_by_cwd(bot, tmp_path):
     assert bot_session is not None and bot_session.is_bot_spawned
 
     # Terminal hook arrives with the same cwd but a fresh claude_session_id.
-    resolved = bot.mod._resolve_hook_session(
+    resolved = bot.mod.hooks._resolve_hook_session(
         "terminal-claude-id",
         {"cwd": str(bot_cwd)},
     )
@@ -555,7 +555,7 @@ def test_permission_done_ephemeral(bot, tmp_path):
     import threading
     req_id = "req-eph"
     bot.mod.bridge._pending[req_id] = threading.Event()
-    bot.mod.on_hook_permission(req_id, {
+    bot.mod.hooks.on_hook_permission(req_id, {
         "tool_name": "Bash",
         "tool_input": {"command": "echo hi"},
         "session_id": "claude-perm-eph",
@@ -793,14 +793,14 @@ def test_terminal_watcher_cleans_notification(bot, tmp_path, monkeypatch):
     bot.mod.mgr.register_terminal(csid, 100, cwd="/tmp")
     mid = bot.mod.ui.send_to_topic(100, "\U0001f514 test notification")
     assert mid is not None
-    bot.mod._track_terminal_msg(csid, mid, bot.forum_chat_id, "notification")
+    bot.mod.hooks._track_terminal_msg(csid, mid, bot.forum_chat_id, "notification")
 
     # JSONL grows → watcher should clean up
     with open(jsonl, "a") as f:
         f.write(_json.dumps({"type": "assistant", "message": {"content": [
             {"type": "text", "text": "done"}]}}) + "\n")
 
-    bot.mod._cleanup_terminal_pending(csid)
+    bot.mod.hooks._cleanup_terminal_pending(csid)
     assert mid in bot.tg.deleted_messages
 
 
@@ -827,7 +827,7 @@ def test_terminal_watcher_cleans_permission(bot, tmp_path, monkeypatch):
         bot.mod.state.perm_key_map[short_id] = f"full-req-{short_id}"
         bot.mod.state.pending_permissions[short_id] = (
             mid, bot.forum_chat_id, session.sid)
-    bot.mod._track_terminal_msg(csid, mid, bot.forum_chat_id,
+    bot.mod.hooks._track_terminal_msg(csid, mid, bot.forum_chat_id,
                                 f"perm:{short_id}")
 
     # Grow JSONL
@@ -835,7 +835,7 @@ def test_terminal_watcher_cleans_permission(bot, tmp_path, monkeypatch):
         f.write(_json.dumps({"type": "assistant", "message": {"content": [
             {"type": "text", "text": "ok"}]}}) + "\n")
 
-    bot.mod._cleanup_terminal_pending(csid)
+    bot.mod.hooks._cleanup_terminal_pending(csid)
 
     # Permission should be resolved
     assert bot.tg.messages[mid]["text"] == "✓ Resolved in terminal"
@@ -862,8 +862,8 @@ def test_terminal_watcher_offset_init(bot, tmp_path, monkeypatch):
     assert mid is not None
 
     # Track records current offset
-    bot.mod._track_terminal_msg(csid, mid, bot.forum_chat_id, "notification")
-    initial_offset = bot.mod._watcher_offsets[csid]
+    bot.mod.hooks._track_terminal_msg(csid, mid, bot.forum_chat_id, "notification")
+    initial_offset = bot.mod.hooks._watcher_offsets[csid]
     assert initial_offset > 0
 
     # Watcher poll: no growth → no cleanup
@@ -1047,7 +1047,7 @@ def test_mode_persists_across_restore(bot, tmp_path, monkeypatch):
 def test_hook_resolver_refuses_empty_payload(bot, tmp_path):
     """An empty hook body must NOT spawn a forum topic."""
     before = len(bot.tg.calls_of("createForumTopic"))
-    result = bot.mod._resolve_hook_session("", {})
+    result = bot.mod.hooks._resolve_hook_session("", {})
     after = len(bot.tg.calls_of("createForumTopic"))
     assert result is None
     assert after == before, "empty hook payload caused topic creation (DoS)"
@@ -1056,7 +1056,7 @@ def test_hook_resolver_refuses_empty_payload(bot, tmp_path):
 def test_hook_resolver_refuses_no_sid_no_cwd(bot, tmp_path):
     """Payload with hook_event_name but no session_id/cwd is still rejected."""
     before = len(bot.tg.calls_of("createForumTopic"))
-    result = bot.mod._resolve_hook_session(
+    result = bot.mod.hooks._resolve_hook_session(
         "", {"hook_event_name": "Notification", "message": "ping"}
     )
     after = len(bot.tg.calls_of("createForumTopic"))
@@ -2199,7 +2199,7 @@ def test_permission_routes_to_mirror_topic_when_present(bot, tmp_path):
         # Count topics created up to this point.
         n_create_before = len(bot.tg.calls_of("createForumTopic"))
 
-        bot.mod.on_hook_permission("req-XXX", {
+        bot.mod.hooks.on_hook_permission("req-XXX", {
             "session_id": csid,
             "cwd": cwd,
             "tool_name": "Bash",

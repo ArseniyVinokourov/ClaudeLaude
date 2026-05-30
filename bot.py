@@ -23,18 +23,19 @@ import audit
 import telegram as tg
 from botui import BotUI
 from dashboard import Dashboard
+from hookhandlers import HookHandlers
 from lifecycle import SessionLifecycle
 from mirrorbridge import MirrorProjector
 from turncontroller import TurnController, TurnState
 from formatting import (
-    _format_age, _normalize_tool_input, _short_cwd, _strip_md,
+    _format_age, _short_cwd, _strip_md,
 )
 import session_discovery
 from session_discovery import (
     _discover_projects, _live_claude_session_ids,
-    _resolve_session_cwd, _session_jsonl_path, _session_last_active,
+    _resolve_session_cwd, _session_last_active,
 )
-from sessions import MODE_PRESETS, Session, SessionManager
+from sessions import MODE_PRESETS, SessionManager
 from updater import (
     _check_update, _has_local_changes, _restart_bot, _run_update,
 )
@@ -177,224 +178,6 @@ def _do_kill():
 _CLOSE_ROW = [{"text": "✕ Close", "callback_data": "close"}]
 
 _PICKER_TTL = 60
-
-
-# ── callbacks from HookBridge ────────────────────────────────────────
-
-def on_hook_notification(text, claude_session_id, data=None):
-    try:
-        session = (mgr.by_claude_session_id(claude_session_id)
-                   if claude_session_id else None)
-        if not (session and session.topic_id):
-            _resolve_hook_session(claude_session_id, data or {})
-            session = (mgr.by_claude_session_id(claude_session_id)
-                       if claude_session_id else None)
-
-        if session and session.topic_id:
-            mid = ui.send_to_topic(session.topic_id,
-                                f"\U0001f514 {tg.esc(text)}")
-            if mid and claude_session_id and not session.is_bot_spawned:
-                _track_terminal_msg(claude_session_id, mid,
-                                    forum(), "notification")
-        else:
-            tg.send(f"\U0001f514 {tg.esc(text)}", OWNER_ID)
-    except Exception as e:
-        print(f"hook notification error: {e}", file=sys.stderr, flush=True)
-
-
-def _resolve_hook_session(claude_session_id, data):
-    _log = lambda m: print(f"[resolve] {m}", file=sys.stderr, flush=True)
-    _log(f"keys={list(data.keys())} sid={claude_session_id!r}")
-
-    if claude_session_id:
-        session = mgr.by_claude_session_id(claude_session_id)
-        if session and session.topic_id:
-            _log(f"found by claude_id → topic {session.topic_id}")
-            return session
-
-    cwd = data.get("cwd", "")
-    if cwd:
-        existing = mgr.by_cwd(cwd)
-        if existing and existing.topic_id and not existing.is_bot_spawned:
-            _log(f"found by cwd → topic {existing.topic_id}")
-            if claude_session_id:
-                mgr.link_claude_id(claude_session_id, existing)
-            return existing
-        if existing and existing.is_bot_spawned:
-            _log(f"skipping bot-spawned session for cwd={cwd}")
-
-    # DoS guard: with neither a session_id nor a cwd we have nothing to
-    # anchor a topic to — refuse rather than spawning a "terminal — HH:MM"
-    # topic for every malformed POST that slipped past hooks.py.
-    if not claude_session_id and not cwd:
-        _log("refuse: no session_id and no cwd, not creating topic")
-        return None
-
-    fid = forum()
-    if not fid:
-        _log("no forum chat configured")
-        return None
-
-    dirname = os.path.basename(cwd) if cwd else "terminal"
-    with state.lock:
-        state.topic_counter[dirname] = state.topic_counter.get(dirname, 0) + 1
-        n = state.topic_counter[dirname]
-    ts = time.strftime("%H:%M")
-    label = (f"{dirname} #{n} — {ts}" if n > 1
-             else f"{dirname} — {ts}")
-    try:
-        topic_id = tg.create_forum_topic(fid, label, icon_color=0x6FB9F0,
-                                          icon_custom_emoji_id=_ICON_TERMINAL)
-        _log(f"created topic {topic_id}")
-    except Exception as e:
-        _log(f"create_forum_topic FAILED: {e}")
-        return None
-    if not topic_id:
-        _log("create_forum_topic returned None")
-        return None
-    with state.lock:
-        state.topic_labels[topic_id] = label
-    if claude_session_id:
-        s = mgr.register_terminal(claude_session_id, topic_id, cwd=cwd)
-        s.topic_label = label
-        mgr._persist()
-        return s
-    _log(f"registered topic {topic_id} (no claude session_id)")
-    sid = uuid.uuid4().hex[:8]
-    session = Session(
-        sid=sid, topic_id=topic_id, cwd=cwd,
-        name=dirname, is_bot_spawned=False,
-        topic_label=label,
-    )
-    mgr._sessions[sid] = session
-    mgr._topic_map[topic_id] = sid
-    if cwd:
-        mgr._cwd_map[cwd] = sid
-    mgr._persist()
-    return session
-
-
-_watcher_offsets: dict[str, int] = {}
-
-
-def _track_terminal_msg(claude_session_id: str, msg_id: int,
-                        chat_id: int, kind: str):
-    if claude_session_id not in _watcher_offsets:
-        path = _session_jsonl_path(claude_session_id)
-        try:
-            _watcher_offsets[claude_session_id] = (
-                os.path.getsize(path) if path else 0)
-        except OSError:
-            _watcher_offsets[claude_session_id] = 0
-        print(f"[watcher] track csid={claude_session_id[:8]}… "
-              f"offset={_watcher_offsets[claude_session_id]} "
-              f"kind={kind} msg={msg_id}",
-              file=sys.stderr, flush=True)
-    with state.lock:
-        state.pending_terminal_msgs.setdefault(
-            claude_session_id, []).append((msg_id, chat_id, kind))
-
-
-def on_hook_permission(req_id, data):
-    try:
-        claude_session_id = (data.get("session_id")
-                             or data.get("sessionId") or "")
-        # If the terminal claude that fired this hook is already
-        # mirrored, route the permission Allow/Deny into the SAME
-        # mirror topic instead of spawning a separate "terminal — HH:MM"
-        # topic. Keeps the conversation + tool prompts in one place.
-        mirror = mirror_mgr.by_csid(claude_session_id) if claude_session_id else None
-        session = None if mirror else _resolve_hook_session(
-            claude_session_id, data)
-
-        tool = data.get("tool_name", "?")
-        ti = data.get("tool_input", {})
-
-        if tool == "Bash":
-            cmd = ti.get("command", "?")
-            if len(cmd) > 500:
-                cmd = cmd[:500] + "..."
-            detail = tg.esc(cmd)
-        elif tool in ("Write", "Edit", "Read"):
-            detail = tg.esc(ti.get("file_path", "?"))
-        else:
-            raw = json.dumps(ti, ensure_ascii=False)
-            if len(raw) > 400:
-                raw = raw[:400] + "..."
-            detail = tg.esc(raw)
-
-        short_id = req_id[-12:]
-        body = f"<b>{tg.esc(tool)}</b>\n<code>{detail}</code>"
-        buttons = [[
-            {"text": "✅ Allow", "callback_data": f"p:{short_id}:a"},
-            {"text": "❌ Deny", "callback_data": f"p:{short_id}:d"},
-        ]]
-
-        if mirror:
-            topic_id = mirror.topic_id
-            chat_id = forum()
-            msg_id = tg.send(body, chat_id, thread_id=topic_id,
-                             buttons=buttons) if chat_id else None
-            # Track the in-flight permission so its tool_use can be
-            # filtered from mirror projection (avoids duplicate signal
-            # of "permission asked + tool ran" both projected).
-            mirror.pending_perm_tool = (tool, _normalize_tool_input(tool, ti))
-        else:
-            topic_id = lifecycle.valid_topic_id(session)
-            msg_id = None
-            chat_id = None
-            if topic_id:
-                chat_id = forum()
-                msg_id = tg.send(body, chat_id, thread_id=topic_id,
-                                 buttons=buttons)
-
-            if msg_id is None and session and topic_id:
-                print(f"[resolve] stale topic {topic_id}, recreating",
-                      file=sys.stderr, flush=True)
-                lifecycle.invalidate_and_stop(session, "topic gone")
-                session = _resolve_hook_session(claude_session_id, data)
-                topic_id = lifecycle.valid_topic_id(session)
-                if topic_id:
-                    chat_id = forum()
-                    msg_id = tg.send(body, chat_id, thread_id=topic_id,
-                                     buttons=buttons)
-
-        if msg_id is None:
-            # No valid topic anywhere — fall back to OWNER DM so the user
-            # can still decide.  Never leak into General.
-            cwd = data.get("cwd", "?")
-            print(f"[perm] no topic, falling back to DM — tool={tool} "
-                  f"cwd={cwd} sid={claude_session_id}",
-                  file=sys.stderr, flush=True)
-            chat_id = OWNER_ID
-            topic_id = None
-            msg_id = tg.send(
-                f"⚠️ <i>no topic</i>\n"
-                f"<b>{tg.esc(tool)}</b>\n<code>{detail}</code>\n"
-                f"cwd: <code>{tg.esc(cwd)}</code>",
-                OWNER_ID, buttons=buttons,
-            )
-            if msg_id is None:
-                # DM also failed — last resort: abandon, claude decides.
-                print("[perm] DM fallback failed; abandoning",
-                      file=sys.stderr, flush=True)
-                bridge.abandon_permission(req_id)
-                return
-
-        sid = session.sid if session else None
-        with state.lock:
-            state.perm_key_map[short_id] = req_id
-            state.pending_permissions[short_id] = (msg_id, chat_id, sid)
-
-        if (session and not session.is_bot_spawned
-                and claude_session_id and msg_id and chat_id):
-            _track_terminal_msg(claude_session_id, msg_id, chat_id,
-                                f"perm:{short_id}")
-
-        bridge.set_perm_context(req_id, chat_id=chat_id, topic_id=topic_id)
-
-    except Exception as e:
-        print(f"hook permission error: {e}", file=sys.stderr, flush=True)
 
 
 # ── command handlers ─────────────────────────────────────────────────
@@ -1176,14 +959,17 @@ mirror = MirrorProjector(state, ui.topic_url, _ICON_TERMINAL)
 mirror_mgr = TerminalMirrorManager(on_event=mirror.on_mirror_event)
 mirror.mgr = mirror_mgr
 dashboard = Dashboard(state, mirror_mgr, _validate_help, _CLAUDE_BIN)
+hooks = HookHandlers(state, mgr, ui, mirror_mgr, lifecycle, _ICON_TERMINAL,
+                     should_run=lambda: bot_running)
 
 
 bridge = HookBridge(
-    on_notification=on_hook_notification,
-    on_permission=on_hook_permission,
+    on_notification=hooks.on_hook_notification,
+    on_permission=hooks.on_hook_permission,
     on_open_in_bot=mirror.on_open_in_bot,
 )
 lifecycle.bridge = bridge
+hooks.bridge = bridge
 
 
 def _dashboard_loop():
@@ -1301,59 +1087,6 @@ def _mirror_socket_watcher():
                 mirror_mgr.set_dtach_socket(mirror.csid, None)
 
 
-def _cleanup_terminal_pending(csid: str):
-    """Remove stale messages from a terminal topic after session progressed."""
-    with state.lock:
-        msgs = state.pending_terminal_msgs.pop(csid, [])
-    if not msgs:
-        return
-    for msg_id, chat_id, kind in msgs:
-        if kind.startswith("perm:"):
-            short_id = kind[5:]
-            with state.lock:
-                full_id = state.perm_key_map.pop(short_id, None)
-                state.pending_permissions.pop(short_id, None)
-            try:
-                tg.edit(msg_id, "✓ Resolved in terminal", chat_id)
-            except Exception:
-                pass
-            if full_id:
-                bridge.abandon_permission(full_id)
-            def _del(mid=msg_id, cid=chat_id):
-                time.sleep(5)
-                tg.delete(mid, cid)
-            threading.Thread(target=_del, daemon=True).start()
-        else:
-            try:
-                tg.delete(msg_id, chat_id)
-            except Exception:
-                pass
-
-
-def _terminal_watcher():
-    """Poll JSONL files of terminal sessions; clean stale messages on progress."""
-    while bot_running:
-        time.sleep(5)
-        with state.lock:
-            watched = list(state.pending_terminal_msgs.keys())
-        for csid in watched:
-            path = _session_jsonl_path(csid)
-            if not path:
-                continue
-            try:
-                size = os.path.getsize(path)
-            except OSError:
-                continue
-            prev = _watcher_offsets.get(csid, 0)
-            if size <= prev:
-                continue
-            print(f"[watcher] JSONL grew csid={csid[:8]}… "
-                  f"{prev}→{size}, cleaning",
-                  file=sys.stderr, flush=True)
-            _watcher_offsets[csid] = size
-            _cleanup_terminal_pending(csid)
-
-
 def _device_monitor_loop():
     """Background: check for new TG sessions every 5 minutes."""
     import device_monitor
@@ -1416,7 +1149,7 @@ def main():
     # The dtach-socket watcher only does local filesystem checks.
     threading.Thread(target=_mirror_socket_watcher, daemon=True).start()
     threading.Thread(target=_dashboard_loop, daemon=True).start()
-    threading.Thread(target=_terminal_watcher, daemon=True).start()
+    threading.Thread(target=hooks.terminal_watcher, daemon=True).start()
     threading.Thread(target=_device_monitor_loop, daemon=True).start()
     tg.set_my_commands([
         {"command": "new", "description": "New Claude session"},
