@@ -21,6 +21,7 @@ from config import (OWNER_ID, HOOK_PORT,
                     is_killed, activate_kill, deactivate_kill)
 import audit
 import telegram as tg
+from botui import BotUI
 from dashboard import Dashboard
 from mirrorbridge import MirrorProjector
 from turncontroller import TurnController, TurnState
@@ -89,6 +90,7 @@ class BotState:
 
 state = BotState()
 bot_running = True
+ui = BotUI()
 turnctl = TurnController(
     state, _CLAUDE_BIN,
     default_display=DEFAULT_DISPLAY,
@@ -123,7 +125,7 @@ def _try_unkill(text: str, chat_id: int, msg_id: int | None,
     if len(_unkill_attempts) >= _UNKILL_MAX_ATTEMPTS:
         audit.log("kill_switch", "unlock rate-limited")
         remaining = int(_UNKILL_COOLDOWN - (now - _unkill_attempts[0]))
-        _ephemeral(chat_id, f"Rate limited. Try again in {remaining}s.",
+        ui.ephemeral(chat_id, f"Rate limited. Try again in {remaining}s.",
                    seconds=10)
         if msg_id:
             tg.delete(msg_id, chat_id)
@@ -135,7 +137,7 @@ def _try_unkill(text: str, chat_id: int, msg_id: int | None,
         audit.log("kill_switch", "unlock failed attempt")
         left = _UNKILL_MAX_ATTEMPTS - len(_unkill_attempts)
         if left > 0:
-            _ephemeral(chat_id, f"Wrong. {left} attempt(s) left.", seconds=5)
+            ui.ephemeral(chat_id, f"Wrong. {left} attempt(s) left.", seconds=5)
         if msg_id:
             tg.delete(msg_id, chat_id)
         return True
@@ -144,7 +146,7 @@ def _try_unkill(text: str, chat_id: int, msg_id: int | None,
     audit.log("kill_switch", "deactivated via unlock word")
     if msg_id:
         tg.delete(msg_id, chat_id)
-    _ephemeral(chat_id, "\U0001f513 Bot unlocked.", seconds=5)
+    ui.ephemeral(chat_id, "\U0001f513 Bot unlocked.", seconds=5)
     dashboard.sync()
     return True
 
@@ -159,11 +161,11 @@ def _do_kill():
     if fid:
         dashboard.sync()
         if UNLOCK_WORD:
-            _ephemeral(fid, "\U0001f512 Bot killed. All sessions stopped.\n"
+            ui.ephemeral(fid, "\U0001f512 Bot killed. All sessions stopped.\n"
                        "Send unlock word in General to restore.",
                        seconds=15)
         else:
-            _ephemeral(fid, "\U0001f512 Bot killed. All sessions stopped.\n"
+            ui.ephemeral(fid, "\U0001f512 Bot killed. All sessions stopped.\n"
                        "Delete .kill file on the machine to restore.",
                        seconds=15)
 
@@ -173,38 +175,6 @@ def _do_kill():
 _CLOSE_ROW = [{"text": "✕ Close", "callback_data": "close"}]
 
 _PICKER_TTL = 60
-
-
-def send_to_topic(topic_id, text, buttons=None):
-    fid = forum()
-    if fid and topic_id:
-        return tg.send(text, fid, thread_id=topic_id, buttons=buttons)
-    return None
-
-
-def send_general(text, buttons=None):
-    fid = forum()
-    if fid:
-        return tg.send(text, fid, buttons=buttons)
-    return tg.send(text, OWNER_ID, buttons=buttons)
-
-
-def _reply(chat_id, thread_id, text, buttons=None):
-    if chat_id:
-        return tg.send(text, chat_id, thread_id=thread_id, buttons=buttons)
-    return send_general(text, buttons=buttons)
-
-
-def _ephemeral(chat_id, text, thread_id=None, seconds=15, buttons=None):
-    """Send a message that auto-deletes after `seconds`."""
-    mid = tg.send(text, chat_id, thread_id=thread_id, buttons=buttons)
-    if mid:
-        def _cleanup():
-            time.sleep(seconds)
-            tg.delete(mid, chat_id)
-        threading.Thread(target=_cleanup, daemon=True).start()
-    return mid
-
 
 
 # ── callbacks from HookBridge ────────────────────────────────────────
@@ -219,7 +189,7 @@ def on_hook_notification(text, claude_session_id, data=None):
                        if claude_session_id else None)
 
         if session and session.topic_id:
-            mid = send_to_topic(session.topic_id,
+            mid = ui.send_to_topic(session.topic_id,
                                 f"\U0001f514 {tg.esc(text)}")
             if mid and claude_session_id and not session.is_bot_spawned:
                 _track_terminal_msg(claude_session_id, mid,
@@ -521,7 +491,7 @@ def cmd_setup(chat_id):
 def _spawn_session(cwd, name=None):
     fid = forum()
     if not fid:
-        send_general("❌ Run /setup in a forum group first.")
+        ui.send_general("❌ Run /setup in a forum group first.")
         return
     if not name:
         name = os.path.basename(cwd.rstrip("/"))
@@ -534,10 +504,10 @@ def _spawn_session(cwd, name=None):
     try:
         topic_id = tg.create_forum_topic(fid, label, icon_color=0x6FB9F0)
     except Exception as e:
-        _ephemeral(fid, f"❌ Failed to create topic: {tg.esc(str(e))}", seconds=7)
+        ui.ephemeral(fid, f"❌ Failed to create topic: {tg.esc(str(e))}", seconds=7)
         return
     if not topic_id:
-        _ephemeral(fid, "❌ Failed to create topic. Check bot admin rights.", seconds=7)
+        ui.ephemeral(fid, "❌ Failed to create topic. Check bot admin rights.", seconds=7)
         return
     with state.lock:
         state.topic_labels[topic_id] = label
@@ -545,11 +515,11 @@ def _spawn_session(cwd, name=None):
     s.topic_label = label
     mgr._persist()
     audit.log("session_start", cwd, sid=s.sid)
-    send_to_topic(topic_id,
+    ui.send_to_topic(topic_id,
                   f"▶️ <code>{tg.esc(cwd)}</code>")
-    url = _topic_url(topic_id)
+    url = ui.topic_url(topic_id)
     if url:
-        _ephemeral(fid, f"▶ {name}",
+        ui.ephemeral(fid, f"▶ {name}",
                    buttons=[[{"text": "Open", "url": url}]],
                    seconds=5)
 
@@ -557,7 +527,7 @@ def _spawn_session(cwd, name=None):
 def cmd_new(args: str, chat_id=None, thread_id=None):
     fid = forum()
     if not fid:
-        send_general("❌ Run /setup in a forum group first.")
+        ui.send_general("❌ Run /setup in a forum group first.")
         return
     parts = args.strip().split(None, 1)
     if parts:
@@ -565,9 +535,9 @@ def cmd_new(args: str, chat_id=None, thread_id=None):
         name = parts[1] if len(parts) > 1 else None
         if not os.path.isdir(cwd):
             if not thread_id and chat_id:
-                _ephemeral(chat_id, f"❌ Not a directory: <code>{tg.esc(cwd)}</code>", seconds=7)
+                ui.ephemeral(chat_id, f"❌ Not a directory: <code>{tg.esc(cwd)}</code>", seconds=7)
             else:
-                _reply(chat_id, thread_id,
+                ui.reply(chat_id, thread_id,
                        f"❌ Not a directory: <code>{tg.esc(cwd)}</code>")
             return
         _spawn_session(cwd, name)
@@ -575,9 +545,9 @@ def cmd_new(args: str, chat_id=None, thread_id=None):
     projects = _discover_projects()
     if not projects:
         if not thread_id and chat_id:
-            _ephemeral(chat_id, "❌ No projects found. Use: /new /path/to/project", seconds=7)
+            ui.ephemeral(chat_id, "❌ No projects found. Use: /new /path/to/project", seconds=7)
         else:
-            _reply(chat_id, thread_id,
+            ui.reply(chat_id, thread_id,
                    "❌ No projects found. Use: /new /path/to/project")
         return
     pick_id = str(time.time_ns())[-10:]
@@ -592,7 +562,7 @@ def cmd_new(args: str, chat_id=None, thread_id=None):
         rows.append([{"text": f"\U0001f4cb Show all ({len(projects)})",
                        "callback_data": f"na:{pick_id}"}])
     rows.append(_CLOSE_ROW)
-    mid = _reply(chat_id, thread_id, "\U0001f4c2 Choose project:", buttons=rows)
+    mid = ui.reply(chat_id, thread_id, "\U0001f4c2 Choose project:", buttons=rows)
     if not thread_id and mid and chat_id:
         def _cleanup_picker():
             time.sleep(_PICKER_TTL)
@@ -602,21 +572,13 @@ def cmd_new(args: str, chat_id=None, thread_id=None):
         threading.Thread(target=_cleanup_picker, daemon=True).start()
 
 
-def _topic_url(topic_id):
-    fid = forum()
-    if not fid:
-        return None
-    short_id = str(fid).replace("-100", "")
-    return f"https://t.me/c/{short_id}/{topic_id}"
-
-
 def cmd_sessions(chat_id, thread_id=None):
     all_sessions = [s for s in mgr._sessions.values()
                     if s.topic_id]
     all_sessions.sort(key=lambda s: (not s.alive, -_session_last_active(s)))
     if not all_sessions:
         if not thread_id:
-            _ephemeral(chat_id, "No sessions.", seconds=5)
+            ui.ephemeral(chat_id, "No sessions.", seconds=5)
         else:
             tg.send("No sessions.", chat_id, thread_id=thread_id)
         return
@@ -647,7 +609,7 @@ def cmd_sessions(chat_id, thread_id=None):
             buttons.append({"text": btn_label,
                             "callback_data": f"fork:{s.sid}"})
         else:
-            url = _topic_url(s.topic_id) if s.topic_id else None
+            url = ui.topic_url(s.topic_id) if s.topic_id else None
             if url:
                 buttons.append({"text": btn_label, "url": url})
             else:
@@ -744,20 +706,20 @@ def _do_resume(claude_session_id: str, chat_id, thread_id=None):
         return
     existing = mgr.by_claude_session_id(claude_session_id)
     if existing and existing.alive and existing.is_bot_spawned:
-        url = _topic_url(existing.topic_id) if existing.topic_id else None
+        url = ui.topic_url(existing.topic_id) if existing.topic_id else None
         if url:
-            _reply(chat_id, thread_id,
+            ui.reply(chat_id, thread_id,
                    f"ℹ️ Already active: <b>{tg.esc(existing.name)}</b>",
                    buttons=[[{"text": "Open", "url": url}]])
         else:
-            _reply(chat_id, thread_id,
+            ui.reply(chat_id, thread_id,
                    f"ℹ️ Already active: <b>{tg.esc(existing.name)}</b>")
         return
     if existing:
         mgr.detach_terminal(existing.sid)
     cwd = _resolve_session_cwd(claude_session_id)
     if not cwd or not os.path.isdir(cwd):
-        _reply(chat_id, thread_id,
+        ui.reply(chat_id, thread_id,
                f"❌ Can't find cwd for session <code>{tg.esc(claude_session_id[:12])}…</code>")
         return
     name = os.path.basename(cwd.rstrip("/"))
@@ -770,20 +732,20 @@ def _do_resume(claude_session_id: str, chat_id, thread_id=None):
     try:
         topic_id = tg.create_forum_topic(fid, label, icon_color=0x6FB9F0)
     except Exception as e:
-        _ephemeral(fid, f"❌ Failed to create topic: {tg.esc(str(e))}", seconds=7)
+        ui.ephemeral(fid, f"❌ Failed to create topic: {tg.esc(str(e))}", seconds=7)
         return
     if not topic_id:
-        _ephemeral(fid, "❌ Failed to create topic.", seconds=7)
+        ui.ephemeral(fid, "❌ Failed to create topic.", seconds=7)
         return
     with state.lock:
         state.topic_labels[topic_id] = label
     s = mgr.resume(claude_session_id, topic_id, name, cwd)
     s.topic_label = label
-    send_to_topic(topic_id,
+    ui.send_to_topic(topic_id,
                   f"▶️ <code>{tg.esc(cwd)}</code>")
-    url = _topic_url(topic_id)
+    url = ui.topic_url(topic_id)
     if url:
-        _ephemeral(fid, f"▶ {name}",
+        ui.ephemeral(fid, f"▶ {name}",
                    buttons=[[{"text": "Open", "url": url}]],
                    seconds=5)
 
@@ -823,7 +785,7 @@ def _build_resume_picker(sessions, pick_id, max_items=None):
 def cmd_resume(args: str, chat_id, thread_id=None):
     fid = forum()
     if not fid:
-        send_general("❌ Run /setup in a forum group first.")
+        ui.send_general("❌ Run /setup in a forum group first.")
         return
     claude_session_id = args.strip()
     if claude_session_id:
@@ -831,14 +793,14 @@ def cmd_resume(args: str, chat_id, thread_id=None):
         return
     sessions = _discover_resumable_sessions()
     if not sessions:
-        _reply(chat_id, thread_id, "No resumable sessions found.")
+        ui.reply(chat_id, thread_id, "No resumable sessions found.")
         return
     pick_id = str(time.time_ns())[-10:]
     with state.lock:
         state.pending_resume_picks[pick_id] = sessions
     text, rows = _build_resume_picker(sessions, pick_id,
                                       max_items=_RESUME_RECENT_LIMIT)
-    mid = _reply(chat_id, thread_id, text, buttons=rows)
+    mid = ui.reply(chat_id, thread_id, text, buttons=rows)
     if not thread_id and mid and chat_id:
         def _cleanup():
             time.sleep(_PICKER_TTL)
@@ -851,7 +813,7 @@ def cmd_resume(args: str, chat_id, thread_id=None):
 def cmd_history(session, chat_id, thread_id, args):
     if not session:
         if not thread_id:
-            _ephemeral(chat_id, "Use in a session topic", seconds=5)
+            ui.ephemeral(chat_id, "Use in a session topic", seconds=5)
         else:
             tg.send("Use in a session topic", chat_id, thread_id=thread_id)
         return
@@ -880,7 +842,7 @@ def cmd_mode(session, chat_id, thread_id, args):
         else:
             fid = forum()
             if fid:
-                _ephemeral(fid, "Use in a session topic", seconds=5)
+                ui.ephemeral(fid, "Use in a session topic", seconds=5)
         return
     name = args.strip().lower()
     if not name:
@@ -906,7 +868,7 @@ def cmd_display(chat_id, thread_id, args):
     if not thread_id:
         fid = forum()
         if fid:
-            _ephemeral(fid, "Use in a session topic", seconds=5)
+            ui.ephemeral(fid, "Use in a session topic", seconds=5)
         return
     mode = args.strip().lower()
     if mode not in ("mobile", "desktop"):
@@ -922,7 +884,7 @@ def cmd_display(chat_id, thread_id, args):
 def cmd_stop(session, chat_id, thread_id):
     if not session:
         if not thread_id:
-            _ephemeral(chat_id, "Use in a session topic", seconds=5)
+            ui.ephemeral(chat_id, "Use in a session topic", seconds=5)
         else:
             tg.send("Use in a session topic", chat_id, thread_id=thread_id)
         return
@@ -947,7 +909,7 @@ def cmd_stop(session, chat_id, thread_id):
 def cmd_interrupt(session, chat_id, thread_id):
     if not session:
         if not thread_id:
-            _ephemeral(chat_id, "Use in a session topic", seconds=5)
+            ui.ephemeral(chat_id, "Use in a session topic", seconds=5)
         else:
             tg.send("Use in a session topic", chat_id, thread_id=thread_id)
         return
@@ -960,7 +922,7 @@ def cmd_interrupt(session, chat_id, thread_id):
 
 def _do_interrupt(session, chat_id, thread_id):
     if not mgr.interrupt(session.sid):
-        _ephemeral(chat_id, "Nothing to interrupt.",
+        ui.ephemeral(chat_id, "Nothing to interrupt.",
                    thread_id=thread_id, seconds=5)
         return
     edited = False
@@ -980,7 +942,7 @@ def _do_interrupt(session, chat_id, thread_id):
     _cancel_session_perms(session.sid, "interrupted")
     if not edited:
         # No live status to repaint (or edit failed) — fall back to ephemeral.
-        _ephemeral(chat_id, "⏹ Turn interrupted.",
+        ui.ephemeral(chat_id, "⏹ Turn interrupted.",
                    thread_id=thread_id, seconds=5)
 
 
@@ -988,7 +950,7 @@ def cmd_restart(chat_id, thread_id):
     if not thread_id:
         fid = forum()
         if fid:
-            _ephemeral(fid, "Use in a session topic", seconds=5)
+            ui.ephemeral(fid, "Use in a session topic", seconds=5)
         return
     session = mgr.by_topic(thread_id)
     if not session:
@@ -1023,7 +985,7 @@ def cmd_usage(session, chat_id, thread_id):
             lines.append(f"Cost: ${session.total_cost_usd:.4f}")
         text = "\n".join(lines)
         if not thread_id:
-            _ephemeral(chat_id, text, seconds=7)
+            ui.ephemeral(chat_id, text, seconds=7)
         else:
             tg.send(text, chat_id, thread_id=thread_id)
 
@@ -1037,18 +999,18 @@ def cmd_usage(session, chat_id, thread_id):
             if result:
                 text = f"<b>Account</b>\n{tg.esc(result)}"
                 if in_general:
-                    _ephemeral(chat_id, text, seconds=7)
+                    ui.ephemeral(chat_id, text, seconds=7)
                 else:
                     tg.send(text, chat_id, thread_id=thread_id)
             else:
                 if in_general:
-                    _ephemeral(chat_id, "⚠️ Could not fetch account usage.", seconds=7)
+                    ui.ephemeral(chat_id, "⚠️ Could not fetch account usage.", seconds=7)
                 else:
                     tg.send("⚠️ Could not fetch account usage.", chat_id,
                             thread_id=thread_id)
         except Exception as e:
             if in_general:
-                _ephemeral(chat_id, f"⚠️ Error: {tg.esc(str(e))}", seconds=7)
+                ui.ephemeral(chat_id, f"⚠️ Error: {tg.esc(str(e))}", seconds=7)
             else:
                 tg.send(f"⚠️ Error: {tg.esc(str(e))}", chat_id,
                         thread_id=thread_id)
@@ -1065,7 +1027,7 @@ def cmd_audit(args, chat_id, thread_id=None):
         n = min(int(args.strip()), 100)
     entries = audit.tail(n)
     if not entries:
-        _ephemeral(chat_id, "No audit events.", seconds=5,
+        ui.ephemeral(chat_id, "No audit events.", seconds=5,
                    thread_id=thread_id)
         return
     lines = []
@@ -1077,7 +1039,7 @@ def cmd_audit(args, chat_id, thread_id=None):
             detail = detail[:57] + "..."
         lines.append(f"<code>{ts}</code> <b>{tg.esc(ev)}</b> {tg.esc(detail)}")
     text = "\n".join(lines)
-    _ephemeral(chat_id, text, seconds=30, thread_id=thread_id)
+    ui.ephemeral(chat_id, text, seconds=30, thread_id=thread_id)
 
 
 def cmd_test_perm(chat_id, thread_id=None):
@@ -1104,26 +1066,26 @@ def cmd_test_perm(chat_id, thread_id=None):
                     tg.send(f"Test OK! Decision: {tg.esc(dec)}",
                             chat_id, thread_id=thread_id)
                 else:
-                    _ephemeral(chat_id, f"Test OK! Decision: {tg.esc(dec)}",
+                    ui.ephemeral(chat_id, f"Test OK! Decision: {tg.esc(dec)}",
                                seconds=7)
         except Exception as e:
             msg = f"Test failed: {tg.esc(str(e))}"
             if thread_id:
                 tg.send(msg, chat_id, thread_id=thread_id)
             else:
-                _ephemeral(chat_id, msg, seconds=7)
+                ui.ephemeral(chat_id, msg, seconds=7)
 
     threading.Thread(target=_do_test, daemon=True).start()
     if thread_id:
         tg.send("Test permission sent — click Allow/Deny.",
                 chat_id, thread_id=thread_id)
     else:
-        _ephemeral(chat_id, "Test permission sent — click Allow/Deny.",
+        ui.ephemeral(chat_id, "Test permission sent — click Allow/Deny.",
                    seconds=10)
 
 
 def cmd_update(chat_id, thread_id=None):
-    mid = _reply(chat_id, thread_id, "⏳ Checking for updates...")
+    mid = ui.reply(chat_id, thread_id, "⏳ Checking for updates...")
 
     def _do_check():
         result = _check_update()
@@ -1131,7 +1093,7 @@ def cmd_update(chat_id, thread_id=None):
             tg.delete(mid, chat_id)
         if not result:
             if not thread_id:
-                _ephemeral(chat_id, "✅ Already up to date.", seconds=5)
+                ui.ephemeral(chat_id, "✅ Already up to date.", seconds=5)
             else:
                 tg.send("✅ Already up to date.", chat_id,
                         thread_id=thread_id)
@@ -1152,7 +1114,7 @@ def cmd_update(chat_id, thread_id=None):
             {"text": "⬆️ Update now", "callback_data": "upd:go"},
             {"text": "❌ Cancel", "callback_data": "upd:no"},
         ]]
-        _reply(chat_id, thread_id, text, buttons=buttons)
+        ui.reply(chat_id, thread_id, text, buttons=buttons)
 
     threading.Thread(target=_do_check, daemon=True).start()
 
@@ -1189,7 +1151,7 @@ def _auto_update_loop():
                 else:
                     fid = forum()
                     if fid:
-                        _ephemeral(fid,
+                        ui.ephemeral(fid,
                                    f"⬆️ Update available: {tg.esc(current)} → <b>{tg.esc(latest)}</b>\n"
                                    f"{len(modified)} locally modified file(s). Use /update to review.",
                                    seconds=30)
@@ -1246,7 +1208,7 @@ _HELP_DOCUMENTED_COMMANDS = {
 
 def cmd_help(chat_id, thread_id=None):
     if not thread_id:
-        _ephemeral(chat_id, _HELP_TEXT, seconds=_PICKER_TTL)
+        ui.ephemeral(chat_id, _HELP_TEXT, seconds=_PICKER_TTL)
     else:
         tg.send(_HELP_TEXT, chat_id, thread_id=thread_id)
 
@@ -1322,7 +1284,7 @@ mgr = SessionManager(
 turnctl.mgr = mgr
 
 
-mirror = MirrorProjector(state, _topic_url, _ICON_TERMINAL)
+mirror = MirrorProjector(state, ui.topic_url, _ICON_TERMINAL)
 mirror_mgr = TerminalMirrorManager(on_event=mirror.on_mirror_event)
 mirror.mgr = mirror_mgr
 dashboard = Dashboard(state, mirror_mgr, _validate_help, _CLAUDE_BIN)
@@ -1444,7 +1406,7 @@ def _mirror_socket_watcher():
                 continue
             if (mirror.dtach_socket and
                     not dtach_socket_alive(mirror.dtach_socket)):
-                send_to_topic(
+                ui.send_to_topic(
                     mirror.topic_id,
                     "\U0001f50c Terminal closed — mirror is now output-only")
                 mirror_mgr.set_dtach_socket(mirror.csid, None)
@@ -1704,14 +1666,14 @@ def _handle_update(u):
         document = msg.get("document")
         sticker = msg.get("sticker")
         if photos or document or sticker:
-            _ephemeral(chat_id,
+            ui.ephemeral(chat_id,
                        "\U0001f501 Mirror does not bridge files/stickers — type text",
                        thread_id=thread_id, seconds=5)
             return
         if not text:
             return
         if not mirror.dtach_socket:
-            _ephemeral(chat_id,
+            ui.ephemeral(chat_id,
                        "\U0001f501 Output-only mirror — terminal input is not bridged "
                        "(start your terminal claude inside dtach to enable it)",
                        thread_id=thread_id, seconds=8)
@@ -1721,7 +1683,7 @@ def _handle_update(u):
         if not ok:
             # On delivery failure surface an ephemeral notice — that
             # is more visible than a small reaction and self-cleans.
-            _ephemeral(chat_id,
+            ui.ephemeral(chat_id,
                        "❌ Could not deliver to terminal "
                        "(dtach socket missing or unresponsive)",
                        thread_id=thread_id, seconds=8)
@@ -1805,7 +1767,7 @@ def _handle_update(u):
         else:
             fid = forum()
             if fid and chat_id == fid:
-                _ephemeral(chat_id, "Use in a session topic, or /new", seconds=5)
+                ui.ephemeral(chat_id, "Use in a session topic, or /new", seconds=5)
 
 
 def _handle_command(cmd, args, chat_id, thread_id, session):
@@ -1843,7 +1805,7 @@ def _handle_command(cmd, args, chat_id, thread_id, session):
     elif cmd == "/stop_bot":
         fid = forum()
         if fid:
-            _ephemeral(fid, "\U0001f44b Shutting down.", seconds=5)
+            ui.ephemeral(fid, "\U0001f44b Shutting down.", seconds=5)
         bot_running = False
     elif cmd in ("/help", "/start"):
         cmd_help(chat_id, thread_id)
@@ -2008,7 +1970,7 @@ def _handle_callback(cb, data):
                     session = mgr.fork(parent, topic_id, parent.name)
                     if session:
                         session.topic_label = label
-                        send_to_topic(topic_id,
+                        ui.send_to_topic(topic_id,
                                       f"\U0001f500 Fork of <b>{tg.esc(parent.name)}</b>")
                         # Copy the last few messages from the parent topic
                         # so the fork doesn't open empty — the user sees
@@ -2022,9 +1984,9 @@ def _handle_callback(cb, data):
                                     fid, fid, recent[-_FORK_BACKFILL:],
                                     thread_id=topic_id)
                         turnctl.send_fork_summary(parent, topic_id)
-                        url = _topic_url(topic_id)
+                        url = ui.topic_url(topic_id)
                         if url:
-                            _ephemeral(fid, "\U0001f500",
+                            ui.ephemeral(fid, "\U0001f500",
                                        buttons=[[{"text": "Open fork", "url": url}]],
                                        seconds=5)
 

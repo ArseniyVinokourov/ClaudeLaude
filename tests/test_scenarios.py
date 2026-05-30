@@ -791,7 +791,7 @@ def test_terminal_watcher_cleans_notification(bot, tmp_path, monkeypatch):
 
     # Simulate: terminal session registered, notification sent to topic
     bot.mod.mgr.register_terminal(csid, 100, cwd="/tmp")
-    mid = bot.mod.send_to_topic(100, "\U0001f514 test notification")
+    mid = bot.mod.ui.send_to_topic(100, "\U0001f514 test notification")
     assert mid is not None
     bot.mod._track_terminal_msg(csid, mid, bot.forum_chat_id, "notification")
 
@@ -821,7 +821,7 @@ def test_terminal_watcher_cleans_permission(bot, tmp_path, monkeypatch):
 
     # Simulate a permission message
     short_id = "abcdef123456"
-    mid = bot.mod.send_to_topic(100, "Bash\nls -la")
+    mid = bot.mod.ui.send_to_topic(100, "Bash\nls -la")
     assert mid is not None
     with bot.mod.state.lock:
         bot.mod.state.perm_key_map[short_id] = f"full-req-{short_id}"
@@ -858,7 +858,7 @@ def test_terminal_watcher_offset_init(bot, tmp_path, monkeypatch):
     jsonl.write_text(_json.dumps({"type": "user", "cwd": "/tmp"}) + "\n")
 
     bot.mod.mgr.register_terminal(csid, 100, cwd="/tmp")
-    mid = bot.mod.send_to_topic(100, "\U0001f514 hello")
+    mid = bot.mod.ui.send_to_topic(100, "\U0001f514 hello")
     assert mid is not None
 
     # Track records current offset

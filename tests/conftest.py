@@ -33,7 +33,7 @@ def _purge_bot_modules():
         # purge them too so a fresh bot import rebinds their `tg` to the
         # freshly-patched telegram module (else they hold a stale one).
         "turncontroller", "dashboard", "formatting", "session_discovery",
-        "updater", "mirrorbridge",
+        "updater", "mirrorbridge", "botui",
     ]:
         sys.modules.pop(name, None)
 
@@ -96,7 +96,9 @@ def bot(bot_env, monkeypatch: pytest.MonkeyPatch):
     def _ephemeral_no_timer(chat_id, text, thread_id=None, seconds=15,
                             buttons=None):
         return _tg_mod.send(text, chat_id, thread_id=thread_id, buttons=buttons)
-    monkeypatch.setattr(bot_mod, "_ephemeral", _ephemeral_no_timer)
+    # `ui` is the shared BotUI instance; patching its bound method covers
+    # every controller that was handed the same instance.
+    monkeypatch.setattr(bot_mod.ui, "ephemeral", _ephemeral_no_timer)
 
     return SimpleNamespace(
         mod=bot_mod,
