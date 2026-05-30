@@ -29,6 +29,12 @@ def _purge_bot_modules():
     for name in [
         "bot", "telegram", "sessions", "hooks", "config", "version",
         "audit", "device_monitor", "terminal_mirror",
+        # Component modules cache `import telegram as tg` at import time;
+        # purge them too so a fresh bot import rebinds their `tg` to the
+        # freshly-patched telegram module (else they hold a stale one).
+        "turncontroller", "dashboard", "formatting", "session_discovery",
+        "updater", "mirrorbridge", "botui", "lifecycle", "hookhandlers",
+        "commands",
     ]:
         sys.modules.pop(name, None)
 
@@ -80,17 +86,27 @@ def bot(bot_env, monkeypatch: pytest.MonkeyPatch):
     bot_mod = importlib.import_module("bot")
 
     # Stub auto-rename — it spawns its own claude subprocess via shell.
-    monkeypatch.setattr(bot_mod, "_auto_rename_topic", lambda *a, **kw: None)
+    monkeypatch.setattr(bot_mod.turnctl, "_auto_rename_topic",
+                        lambda *a, **kw: None)
 
-    # Stub _ephemeral so the auto-delete daemon thread doesn't outlive the
-    # test: with the real impl, time.sleep(seconds) wakes up after the
-    # monkeypatch is reverted and the deleteMessage call hits real Telegram.
-    # Tests only assert on the send, not on the deferred delete.
-    import telegram as _tg_mod
-    def _ephemeral_no_timer(chat_id, text, thread_id=None, seconds=15,
-                            buttons=None):
-        return _tg_mod.send(text, chat_id, thread_id=thread_id, buttons=buttons)
-    monkeypatch.setattr(bot_mod, "_ephemeral", _ephemeral_no_timer)
+    # Stub the per-turn status timer. on_thinking starts a daemon thread that
+    # loops every 3s calling tg.edit / send_chat_action until the turn ends;
+    # if it outlives the test it lands stray calls in another test's fake.
+    # Tests assert on the initial status send and on_tool_use updates, not on
+    # the periodic refresh, so a no-op timer is behaviour-equivalent here.
+    monkeypatch.setattr(bot_mod.turnctl, "_turn_timer",
+                        lambda *a, **kw: None)
+
+    # Neutralise every deferred delete. All "sleep N then deleteMessage"
+    # timers (ephemeral, picker expiry, perm cancel, terminal cleanup,
+    # interrupted-status fade) route through the one shared BotUI instance's
+    # `delete_after`. With the real impl the daemon thread wakes after the
+    # test's monkeypatch is reverted and either hits real Telegram or — worse
+    # — lands a stray call in another test's fake, which is what made the
+    # suite flaky under random ordering. Stub it to a no-op: the send still
+    # happens (tests assert on that), only the timer is dropped.
+    monkeypatch.setattr(bot_mod.ui, "delete_after",
+                        lambda *a, **kw: None)
 
     return SimpleNamespace(
         mod=bot_mod,

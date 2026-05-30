@@ -217,7 +217,7 @@ def test_permission_flow_allow(bot, tmp_path):
     # Simulate hook arriving via the bridge callback.
     req_id = "req-1"
     bot.mod.bridge._pending[req_id] = __import__("threading").Event()
-    bot.mod.on_hook_permission(req_id, {
+    bot.mod.hooks.on_hook_permission(req_id, {
         "tool_name": "Bash",
         "tool_input": {"command": "rm -rf /"},
         "session_id": "claude-sess-perm",
@@ -330,7 +330,7 @@ def test_permission_flow_deny(bot, tmp_path):
     import threading
     req_id = "req-deny"
     bot.mod.bridge._pending[req_id] = threading.Event()
-    bot.mod.on_hook_permission(req_id, {
+    bot.mod.hooks.on_hook_permission(req_id, {
         "tool_name": "Write",
         "tool_input": {"file_path": "/etc/passwd"},
         "session_id": "claude-sess-perm-d",
@@ -375,7 +375,7 @@ def test_hook_routing_skips_bot_session_by_cwd(bot, tmp_path):
     assert bot_session is not None and bot_session.is_bot_spawned
 
     # Terminal hook arrives with the same cwd but a fresh claude_session_id.
-    resolved = bot.mod._resolve_hook_session(
+    resolved = bot.mod.hooks._resolve_hook_session(
         "terminal-claude-id",
         {"cwd": str(bot_cwd)},
     )
@@ -466,7 +466,7 @@ def test_invalidate_session_cleans_maps(bot, tmp_path):
     # invalidate pops from _sessions, after which stop becomes a no-op.
     # The lifecycle-batch branch consolidates this into a single helper.)
     bot.mod.mgr.stop(sess.sid)
-    bot.mod._invalidate_session(sess)
+    bot.mod.lifecycle._invalidate_session(sess)
 
     assert sess.alive is False
     assert bot.mod.mgr.by_topic(sess.topic_id) is None
@@ -493,7 +493,7 @@ def test_invalidate_stop_drops_routing_maps(bot, tmp_path):
     sess = next(iter(bot.mod.mgr._sessions.values()))
     bot.mod.mgr.link_claude_id("claude-probed", sess)
 
-    bot.mod._invalidate_and_stop(sess, "topic deleted")
+    bot.mod.lifecycle.invalidate_and_stop(sess, "topic deleted")
     assert sess.alive is False
     assert bot.mod.mgr.by_topic(sess.topic_id) is None
     assert bot.mod.mgr.by_cwd(str(cwd)) is None
@@ -509,7 +509,8 @@ def test_markdown_table_to_mobile_list(bot):
         "| a.py | 100 |\n"
         "| b.py | 200 |\n"
     )
-    out = bot.mod._md_table_to_list(src)
+    import formatting
+    out = formatting._md_table_to_list(src)
     assert "**a.py**" in out
     assert "**b.py**" in out
     assert "Lines: 100" in out
@@ -554,7 +555,7 @@ def test_permission_done_ephemeral(bot, tmp_path):
     import threading
     req_id = "req-eph"
     bot.mod.bridge._pending[req_id] = threading.Event()
-    bot.mod.on_hook_permission(req_id, {
+    bot.mod.hooks.on_hook_permission(req_id, {
         "tool_name": "Bash",
         "tool_input": {"command": "echo hi"},
         "session_id": "claude-perm-eph",
@@ -654,7 +655,7 @@ def test_dashboard_has_version_no_active_count(bot, tmp_path):
     ))
     _drain_updates(bot)
 
-    text = bot.mod._build_dashboard()
+    text = bot.mod.dashboard.build()
     assert "ClaudeLaude" in text
     assert "active" not in text  # the old healthcheck-driven line is gone
     assert "waiting" not in text  # no pending permissions in this test
@@ -665,13 +666,13 @@ def test_dashboard_shows_waiting_when_permissions_pending(bot, tmp_path):
     """When permission requests are queued, dashboard surfaces the count."""
     with bot.mod.state.lock:
         bot.mod.state.pending_permissions["xyz12345"] = (1234, 5678, "sid")
-    text = bot.mod._build_dashboard()
+    text = bot.mod.dashboard.build()
     assert "1 waiting" in text
 
 
 def test_dashboard_no_waiting_line_when_empty(bot):
     """The 🔔 line is omitted entirely when nothing is pending."""
-    assert "waiting" not in bot.mod._build_dashboard()
+    assert "waiting" not in bot.mod.dashboard.build()
 
 
 # ── security: callback OWNER_ID check ─────────────────────────────
@@ -781,7 +782,8 @@ def test_terminal_watcher_cleans_notification(bot, tmp_path, monkeypatch):
 
     projects_dir = tmp_path / "claude_projects" / "proj"
     projects_dir.mkdir(parents=True)
-    monkeypatch.setattr(bot.mod, "CLAUDE_PROJECTS_DIR",
+    import session_discovery as _sd
+    monkeypatch.setattr(_sd, "CLAUDE_PROJECTS_DIR",
                         str(projects_dir.parent))
 
     csid = "term-session-001"
@@ -790,16 +792,16 @@ def test_terminal_watcher_cleans_notification(bot, tmp_path, monkeypatch):
 
     # Simulate: terminal session registered, notification sent to topic
     bot.mod.mgr.register_terminal(csid, 100, cwd="/tmp")
-    mid = bot.mod.send_to_topic(100, "\U0001f514 test notification")
+    mid = bot.mod.ui.send_to_topic(100, "\U0001f514 test notification")
     assert mid is not None
-    bot.mod._track_terminal_msg(csid, mid, bot.forum_chat_id, "notification")
+    bot.mod.hooks._track_terminal_msg(csid, mid, bot.forum_chat_id, "notification")
 
     # JSONL grows → watcher should clean up
     with open(jsonl, "a") as f:
         f.write(_json.dumps({"type": "assistant", "message": {"content": [
             {"type": "text", "text": "done"}]}}) + "\n")
 
-    bot.mod._cleanup_terminal_pending(csid)
+    bot.mod.hooks._cleanup_terminal_pending(csid)
     assert mid in bot.tg.deleted_messages
 
 
@@ -809,7 +811,8 @@ def test_terminal_watcher_cleans_permission(bot, tmp_path, monkeypatch):
 
     projects_dir = tmp_path / "claude_projects" / "proj"
     projects_dir.mkdir(parents=True)
-    monkeypatch.setattr(bot.mod, "CLAUDE_PROJECTS_DIR",
+    import session_discovery as _sd
+    monkeypatch.setattr(_sd, "CLAUDE_PROJECTS_DIR",
                         str(projects_dir.parent))
 
     csid = "term-session-002"
@@ -820,13 +823,13 @@ def test_terminal_watcher_cleans_permission(bot, tmp_path, monkeypatch):
 
     # Simulate a permission message
     short_id = "abcdef123456"
-    mid = bot.mod.send_to_topic(100, "Bash\nls -la")
+    mid = bot.mod.ui.send_to_topic(100, "Bash\nls -la")
     assert mid is not None
     with bot.mod.state.lock:
         bot.mod.state.perm_key_map[short_id] = f"full-req-{short_id}"
         bot.mod.state.pending_permissions[short_id] = (
             mid, bot.forum_chat_id, session.sid)
-    bot.mod._track_terminal_msg(csid, mid, bot.forum_chat_id,
+    bot.mod.hooks._track_terminal_msg(csid, mid, bot.forum_chat_id,
                                 f"perm:{short_id}")
 
     # Grow JSONL
@@ -834,7 +837,7 @@ def test_terminal_watcher_cleans_permission(bot, tmp_path, monkeypatch):
         f.write(_json.dumps({"type": "assistant", "message": {"content": [
             {"type": "text", "text": "ok"}]}}) + "\n")
 
-    bot.mod._cleanup_terminal_pending(csid)
+    bot.mod.hooks._cleanup_terminal_pending(csid)
 
     # Permission should be resolved
     assert bot.tg.messages[mid]["text"] == "✓ Resolved in terminal"
@@ -849,7 +852,8 @@ def test_terminal_watcher_offset_init(bot, tmp_path, monkeypatch):
 
     projects_dir = tmp_path / "claude_projects" / "proj"
     projects_dir.mkdir(parents=True)
-    monkeypatch.setattr(bot.mod, "CLAUDE_PROJECTS_DIR",
+    import session_discovery as _sd
+    monkeypatch.setattr(_sd, "CLAUDE_PROJECTS_DIR",
                         str(projects_dir.parent))
 
     csid = "term-session-003"
@@ -857,12 +861,12 @@ def test_terminal_watcher_offset_init(bot, tmp_path, monkeypatch):
     jsonl.write_text(_json.dumps({"type": "user", "cwd": "/tmp"}) + "\n")
 
     bot.mod.mgr.register_terminal(csid, 100, cwd="/tmp")
-    mid = bot.mod.send_to_topic(100, "\U0001f514 hello")
+    mid = bot.mod.ui.send_to_topic(100, "\U0001f514 hello")
     assert mid is not None
 
     # Track records current offset
-    bot.mod._track_terminal_msg(csid, mid, bot.forum_chat_id, "notification")
-    initial_offset = bot.mod._watcher_offsets[csid]
+    bot.mod.hooks._track_terminal_msg(csid, mid, bot.forum_chat_id, "notification")
+    initial_offset = bot.mod.hooks._watcher_offsets[csid]
     assert initial_offset > 0
 
     # Watcher poll: no growth → no cleanup
@@ -1046,7 +1050,7 @@ def test_mode_persists_across_restore(bot, tmp_path, monkeypatch):
 def test_hook_resolver_refuses_empty_payload(bot, tmp_path):
     """An empty hook body must NOT spawn a forum topic."""
     before = len(bot.tg.calls_of("createForumTopic"))
-    result = bot.mod._resolve_hook_session("", {})
+    result = bot.mod.hooks._resolve_hook_session("", {})
     after = len(bot.tg.calls_of("createForumTopic"))
     assert result is None
     assert after == before, "empty hook payload caused topic creation (DoS)"
@@ -1055,7 +1059,7 @@ def test_hook_resolver_refuses_empty_payload(bot, tmp_path):
 def test_hook_resolver_refuses_no_sid_no_cwd(bot, tmp_path):
     """Payload with hook_event_name but no session_id/cwd is still rejected."""
     before = len(bot.tg.calls_of("createForumTopic"))
-    result = bot.mod._resolve_hook_session(
+    result = bot.mod.hooks._resolve_hook_session(
         "", {"hook_event_name": "Notification", "message": "ping"}
     )
     after = len(bot.tg.calls_of("createForumTopic"))
@@ -1071,12 +1075,12 @@ def test_interrupt_repaints_status_message(bot, tmp_path):
     sid = next(iter(bot.mod.mgr._sessions))
     session = bot.mod.mgr._sessions[sid]
     # Plant a live turn with an existing status message.
-    turn = bot.mod._get_turn(session)
+    turn = bot.mod.turnctl._get_turn(session)
     turn.status_msg_id = 9999
     # Patch interrupt to no-op success.
     bot.mod.mgr.interrupt = lambda _sid: True
     bot.tg.reset()
-    bot.mod._do_interrupt(session, bot.forum_chat_id, session.topic_id)
+    bot.mod.commands._do_interrupt(session, bot.forum_chat_id, session.topic_id)
     edits = [m for m in bot.tg.calls_of("editMessageText")
              if m.get("message_id") == 9999]
     assert any("Interrupted" in e.get("text", "") for e in edits), \
@@ -1147,7 +1151,8 @@ def test_status_text_is_time_free(bot):
     only on tool transitions, so the timer edit fires a few times per
     turn instead of ~20/min just for the seconds counter.
     """
-    from bot import _format_status, TurnState
+    from bot import TurnState
+    _format_status = bot.mod.turnctl._format_status
     now = time.time()
     turn = TurnState()
     # No tool ops yet: a stable "Думаю…" line, regardless of elapsed time.
@@ -1326,7 +1331,8 @@ def test_chat_action_mapper_unit(bot):
     Pulls _chat_action_for_tool through the `bot` fixture so config.py
     picks up the test BOT_TOKEN env-stub instead of trying to read .env.
     """
-    fn = bot.mod._chat_action_for_tool
+    import formatting
+    fn = formatting._chat_action_for_tool
     assert fn(None) == "typing"
     assert fn("Bash") == "typing"
     assert fn("Read") == "upload_document"
@@ -1367,7 +1373,7 @@ def test_multi_image_uses_send_media_group(bot, tmp_path, monkeypatch):
                         lambda chat_id, p, caption="", thread_id=None:
                         photo_calls.append((chat_id, p, thread_id)) or None)
 
-    bot.mod.on_result(sess, "", "")
+    bot.mod.turnctl.on_result(sess, "", "")
 
     assert len(group_calls) == 1, group_calls
     chat_id, sent_paths, thread = group_calls[0]
@@ -1396,7 +1402,7 @@ def test_single_image_uses_send_photo(bot, tmp_path, monkeypatch):
                         lambda chat_id, p, caption="", thread_id=None:
                         photo_calls.append(p) or None)
 
-    bot.mod.on_result(sess, "", "")
+    bot.mod.turnctl.on_result(sess, "", "")
     assert group_calls == [], group_calls
     assert photo_calls == [str(p)], photo_calls
 
@@ -1543,7 +1549,8 @@ def test_admin_sanity_silent_for_admin(bot, capsys):
 
 def test_record_topic_msg_trims_buffer(bot):
     """Rolling buffer caps at _FORK_BACKFILL entries."""
-    from bot import _record_topic_msg, _FORK_BACKFILL, state
+    from bot import _FORK_BACKFILL, state
+    _record_topic_msg = bot.mod.turnctl._record_topic_msg
     tid = 7777
     for i in range(_FORK_BACKFILL * 3):
         _record_topic_msg(tid, 1000 + i)
@@ -1576,7 +1583,7 @@ def test_mirror_register_creates_topic_and_starts_follower(bot, tmp_path):
     (tmp_path / "mirror_project_1").mkdir()
     jp = _make_fake_jsonl(tmp_path, csid, cwd)
     try:
-        result = bot.mod.on_open_in_bot(csid, cwd, None)
+        result = bot.mod.mirror.on_open_in_bot(csid, cwd, None)
         assert "topic_url" in result, result
         topic_calls = bot.tg.calls_of("createForumTopic")
         assert len(topic_calls) == 1, topic_calls
@@ -1623,8 +1630,8 @@ def test_mirror_register_idempotent(bot, tmp_path):
     cwd = str(tmp_path / "mirror_project_2")
     (tmp_path / "mirror_project_2").mkdir()
     try:
-        r1 = bot.mod.on_open_in_bot(csid, cwd, None)
-        r2 = bot.mod.on_open_in_bot(csid, cwd, None)
+        r1 = bot.mod.mirror.on_open_in_bot(csid, cwd, None)
+        r2 = bot.mod.mirror.on_open_in_bot(csid, cwd, None)
         assert r1.get("topic_url") == r2.get("topic_url")
         assert r2.get("existing") is True
         assert len(bot.tg.calls_of("createForumTopic")) == 1
@@ -1644,13 +1651,13 @@ def test_mirror_response_input_bridge_flag(bot, tmp_path):
     (tmp_path / "bridge_off").mkdir()
     sock = str(tmp_path / "fake.sock")
     try:
-        on_resp = bot.mod.on_open_in_bot(csid_a, cwd_a, sock)
-        off_resp = bot.mod.on_open_in_bot(csid_b, cwd_b, None)
+        on_resp = bot.mod.mirror.on_open_in_bot(csid_a, cwd_a, sock)
+        off_resp = bot.mod.mirror.on_open_in_bot(csid_b, cwd_b, None)
         assert on_resp.get("input_bridge") is True, on_resp
         assert off_resp.get("input_bridge") is False, off_resp
         # On the existing-mirror return path the flag must still
         # reflect actual dtach binding state.
-        on_resp_again = bot.mod.on_open_in_bot(csid_a, cwd_a, sock)
+        on_resp_again = bot.mod.mirror.on_open_in_bot(csid_a, cwd_a, sock)
         assert on_resp_again.get("input_bridge") is True, on_resp_again
     finally:
         bot.mod.mirror_mgr.unregister(csid_a)
@@ -1674,7 +1681,7 @@ def test_mirror_input_bridge_pushes_to_dtach(bot, tmp_path, monkeypatch):
     )
 
     try:
-        bot.mod.on_open_in_bot(csid, cwd, sock)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, sock)
         m = bot.mod.mirror_mgr.by_csid(csid)
         assert m and m.dtach_socket == sock
 
@@ -1703,7 +1710,7 @@ def test_mirror_input_bridge_output_only_rejects(bot, tmp_path, monkeypatch):
     )
 
     try:
-        bot.mod.on_open_in_bot(csid, cwd, None)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
         assert m and m.dtach_socket is None
 
@@ -1773,7 +1780,7 @@ def test_mirror_register_backfills_only_tail(bot, tmp_path):
                     }]},
                 }) + "\n")
 
-        bot.mod.on_open_in_bot(csid, cwd, None)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
         assert m is not None
 
@@ -1845,7 +1852,7 @@ def test_mirror_suppresses_tg_echo(bot, tmp_path, monkeypatch):
     )
 
     try:
-        bot.mod.on_open_in_bot(csid, cwd, sock)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, sock)
         m = bot.mod.mirror_mgr.by_csid(csid)
         assert m is not None
 
@@ -1917,7 +1924,7 @@ def test_mirror_hides_slash_command_bash_tool_use(bot, tmp_path):
     (tmp_path / "mirror_project_slashcall").mkdir()
     jp = _make_fake_jsonl(tmp_path, csid, cwd)
     try:
-        bot.mod.on_open_in_bot(csid, cwd, None)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
 
         with open(jp, "a") as f:
@@ -1993,7 +2000,7 @@ def test_mirror_filter_level_all_hides_every_tool_use(bot, tmp_path):
     (tmp_path / "mirror_project_filter").mkdir()
     jp = _make_fake_jsonl(tmp_path, csid, cwd)
     try:
-        bot.mod.on_open_in_bot(csid, cwd, None)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
         bot.mod.mirror_mgr.set_filter_level(csid, "all")
 
@@ -2050,7 +2057,7 @@ def test_mirror_filter_lite_hides_write_and_heredoc(bot, tmp_path):
     (tmp_path / "mirror_project_lite").mkdir()
     jp = _make_fake_jsonl(tmp_path, csid, cwd)
     try:
-        bot.mod.on_open_in_bot(csid, cwd, None)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
         assert m.filter_level == "lite"
 
@@ -2123,7 +2130,7 @@ def test_mirror_permission_paired_tool_use_skipped(bot, tmp_path):
     (tmp_path / "mirror_project_perm_paired").mkdir()
     jp = _make_fake_jsonl(tmp_path, csid, cwd)
     try:
-        bot.mod.on_open_in_bot(csid, cwd, None)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
         # Simulate the permission prompt having set pending_perm_tool.
         m.pending_perm_tool = ("Bash", "make test")
@@ -2188,14 +2195,14 @@ def test_permission_routes_to_mirror_topic_when_present(bot, tmp_path):
     (tmp_path / "mirror_project_perm_routing").mkdir()
     _make_fake_jsonl(tmp_path, csid, cwd)
     try:
-        bot.mod.on_open_in_bot(csid, cwd, None)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
         topic_before = m.topic_id
 
         # Count topics created up to this point.
         n_create_before = len(bot.tg.calls_of("createForumTopic"))
 
-        bot.mod.on_hook_permission("req-XXX", {
+        bot.mod.hooks.on_hook_permission("req-XXX", {
             "session_id": csid,
             "cwd": cwd,
             "tool_name": "Bash",
@@ -2234,7 +2241,7 @@ def test_mirror_filter_toggle_callback_changes_level(bot, tmp_path):
     (tmp_path / "mirror_project_toggle").mkdir()
     _make_fake_jsonl(tmp_path, csid, cwd)
     try:
-        bot.mod.on_open_in_bot(csid, cwd, None)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
         assert m.filter_level == "lite"
         assert m.welcome_msg_id is not None
@@ -2284,7 +2291,7 @@ def test_mirror_mode_cycle_callback_pushes_shift_tab(bot, tmp_path, monkeypatch)
     monkeypatch.setattr(bot.mod, "push_to_dtach", _fake_push)
 
     try:
-        bot.mod.on_open_in_bot(csid, cwd, sock)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, sock)
         m = bot.mod.mirror_mgr.by_csid(csid)
         assert m.dtach_socket == sock
 
@@ -2336,7 +2343,7 @@ def test_mirror_drops_resume_recovery_pair(bot, tmp_path):
     (tmp_path / "mirror_project_resume").mkdir()
     jp = _make_fake_jsonl(tmp_path, csid, cwd)
     try:
-        bot.mod.on_open_in_bot(csid, cwd, None)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
 
         with open(jp, "a") as f:
@@ -2423,7 +2430,7 @@ def test_mirror_drops_slash_command_url_echo(bot, tmp_path):
     (tmp_path / "mirror_project_slashcmd").mkdir()
     jp = _make_fake_jsonl(tmp_path, csid, cwd)
     try:
-        bot.mod.on_open_in_bot(csid, cwd, None)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
 
         with open(jp, "a") as f:
@@ -2550,7 +2557,7 @@ def test_mirror_drops_slash_command_body_via_is_meta(bot, tmp_path):
     (tmp_path / "mirror_project_ismeta").mkdir()
     jp = _make_fake_jsonl(tmp_path, csid, cwd)
     try:
-        bot.mod.on_open_in_bot(csid, cwd, None)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
 
         # Append the exact event shape Claude Code emits for the body
@@ -2618,7 +2625,7 @@ def test_mirror_open_sends_welcome_message(bot, tmp_path):
     (tmp_path / "welcome_bridged").mkdir()
     (tmp_path / "welcome_output_only").mkdir()
     try:
-        bot.mod.on_open_in_bot(
+        bot.mod.mirror.on_open_in_bot(
             csid_on, cwd_on, str(tmp_path / "welcome.sock"))
         m_on = bot.mod.mirror_mgr.by_csid(csid_on)
         bridged = [
@@ -2629,7 +2636,7 @@ def test_mirror_open_sends_welcome_message(bot, tmp_path):
         assert any("Mirror attached" in t for t in bridged), bridged
         assert not any("output-only" in t.lower() for t in bridged), bridged
 
-        bot.mod.on_open_in_bot(csid_off, cwd_off, None)
+        bot.mod.mirror.on_open_in_bot(csid_off, cwd_off, None)
         m_off = bot.mod.mirror_mgr.by_csid(csid_off)
         out_only = [
             p.get("text", "")
@@ -2679,7 +2686,7 @@ def test_mirror_prompts_above_threshold(bot, tmp_path):
         # threshold so the bot must prompt instead of silent full.
         _write_alternating_jsonl(jp, 20, prefix="old")
 
-        bot.mod.on_open_in_bot(csid, cwd, None)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
         assert m is not None
         # backfill_done is cleared until user clicks → follower suspended.
@@ -2731,7 +2738,7 @@ def test_mirror_history_full_click_runs_backfill(bot, tmp_path):
         # 18 user/assistant pairs = 36 logical events, above threshold.
         _write_alternating_jsonl(jp, 18, prefix="hist")
 
-        bot.mod.on_open_in_bot(csid, cwd, None)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
         assert m is not None
         # The prompt was sent — find its callback_data for 'full'.
@@ -2796,7 +2803,7 @@ def test_mirror_history_short_click_emits_summary(bot, tmp_path):
         # 20 pairs = 40 logical events; short summary keeps last 12.
         _write_alternating_jsonl(jp, 20, prefix="S")
 
-        bot.mod.on_open_in_bot(csid, cwd, None)
+        bot.mod.mirror.on_open_in_bot(csid, cwd, None)
         m = bot.mod.mirror_mgr.by_csid(csid)
         before_count = len(bot.tg.calls_of("sendMessage"))
         prompts = [
