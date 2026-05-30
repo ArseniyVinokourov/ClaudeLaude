@@ -4,38 +4,27 @@
 Each person runs their own instance of this bot on their machine.
 See README.md or run setup.sh for first-time configuration.
 """
-import json
 import os
 import shutil
 import sys
 import threading
 import time
-import uuid
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from config import (OWNER_ID, HOOK_PORT,
-                    AUTO_UPDATE, AUTO_UPDATE_POLICY,
+from config import (OWNER_ID, AUTO_UPDATE, AUTO_UPDATE_POLICY,
                     UNLOCK_WORD,
-                    get_forum_chat_id, set_forum_chat_id,
-                    is_killed, activate_kill, deactivate_kill)
+                    get_forum_chat_id, is_killed, activate_kill, deactivate_kill)
 import audit
 import telegram as tg
-from botui import BotUI
+from botui import BotUI, CLOSE_ROW
+from commands import Commands
 from dashboard import Dashboard
 from hookhandlers import HookHandlers
 from lifecycle import SessionLifecycle
 from mirrorbridge import MirrorProjector
 from turncontroller import TurnController, TurnState
-from formatting import (
-    _format_age, _short_cwd, _strip_md,
-)
-import session_discovery
-from session_discovery import (
-    _discover_projects, _live_claude_session_ids,
-    _resolve_session_cwd, _session_last_active,
-)
-from sessions import MODE_PRESETS, SessionManager
+from sessions import SessionManager
 from updater import (
     _check_update, _has_local_changes, _restart_bot, _run_update,
 )
@@ -173,625 +162,6 @@ def _do_kill():
                        seconds=15)
 
 
-# ── helpers ──────────────────────────────────────────────────────────
-
-_CLOSE_ROW = [{"text": "✕ Close", "callback_data": "close"}]
-
-_PICKER_TTL = 60
-
-
-# ── command handlers ─────────────────────────────────────────────────
-
-def cmd_setup(chat_id):
-    try:
-        r = tg._req("getChat", {"chat_id": chat_id})
-        is_forum = r.get("result", {}).get("is_forum", False)
-    except Exception:
-        is_forum = False
-    if not is_forum:
-        tg.send("❌ Enable Topics in this group first.", chat_id)
-        return
-    set_forum_chat_id(chat_id)
-    tg.send("✅ Forum linked. Use /new to start a session.", chat_id)
-
-
-
-
-def cmd_new(args: str, chat_id=None, thread_id=None):
-    fid = forum()
-    if not fid:
-        ui.send_general("❌ Run /setup in a forum group first.")
-        return
-    parts = args.strip().split(None, 1)
-    if parts:
-        cwd = parts[0]
-        name = parts[1] if len(parts) > 1 else None
-        if not os.path.isdir(cwd):
-            if not thread_id and chat_id:
-                ui.ephemeral(chat_id, f"❌ Not a directory: <code>{tg.esc(cwd)}</code>", seconds=7)
-            else:
-                ui.reply(chat_id, thread_id,
-                       f"❌ Not a directory: <code>{tg.esc(cwd)}</code>")
-            return
-        lifecycle.spawn_session(cwd, name)
-        return
-    projects = _discover_projects()
-    if not projects:
-        if not thread_id and chat_id:
-            ui.ephemeral(chat_id, "❌ No projects found. Use: /new /path/to/project", seconds=7)
-        else:
-            ui.reply(chat_id, thread_id,
-                   "❌ No projects found. Use: /new /path/to/project")
-        return
-    pick_id = str(time.time_ns())[-10:]
-    with state.lock:
-        state.pending_project_picks[pick_id] = projects
-    RECENT_LIMIT = 4
-    rows = []
-    for i, p in enumerate(projects[:RECENT_LIMIT]):
-        label = os.path.basename(p.rstrip("/"))
-        rows.append([{"text": label, "callback_data": f"n:{pick_id}:{i}"}])
-    if len(projects) > RECENT_LIMIT:
-        rows.append([{"text": f"\U0001f4cb Show all ({len(projects)})",
-                       "callback_data": f"na:{pick_id}"}])
-    rows.append(_CLOSE_ROW)
-    mid = ui.reply(chat_id, thread_id, "\U0001f4c2 Choose project:", buttons=rows)
-    if not thread_id and mid and chat_id:
-        def _cleanup_picker():
-            time.sleep(_PICKER_TTL)
-            with state.lock:
-                state.pending_project_picks.pop(pick_id, None)
-            tg.delete(mid, chat_id)
-        threading.Thread(target=_cleanup_picker, daemon=True).start()
-
-
-def cmd_sessions(chat_id, thread_id=None):
-    all_sessions = [s for s in mgr._sessions.values()
-                    if s.topic_id]
-    all_sessions.sort(key=lambda s: (not s.alive, -_session_last_active(s)))
-    if not all_sessions:
-        if not thread_id:
-            ui.ephemeral(chat_id, "No sessions.", seconds=5)
-        else:
-            tg.send("No sessions.", chat_id, thread_id=thread_id)
-        return
-    blocks = []
-    buttons = []
-    now = time.time()
-    for i, s in enumerate(all_sessions):
-        age = int(now - _session_last_active(s))
-        if age < 60:
-            age_str = "just now"
-        elif age < 3600:
-            age_str = f"{age // 60}m ago"
-        elif age < 86400:
-            age_str = f"{age // 3600}h ago"
-        else:
-            age_str = f"{age // 86400}d ago"
-        icon = "▶" if s.alive else "·"
-        num = i + 1
-        name = s.name if len(s.name) <= 25 else s.name[:22] + "…"
-        blocks.append(
-            f"<b>{num}.</b> {icon} {tg.esc(name)} · <i>{age_str}</i>\n"
-            f"    <code>{tg.esc(_short_cwd(s.cwd))}</code>"
-        )
-        btn_label = f"{num}. {name}"
-        if len(btn_label) > 25:
-            btn_label = btn_label[:22] + "…"
-        if s.claude_session_id:
-            buttons.append({"text": btn_label,
-                            "callback_data": f"fork:{s.sid}"})
-        else:
-            url = ui.topic_url(s.topic_id) if s.topic_id else None
-            if url:
-                buttons.append({"text": btn_label, "url": url})
-            else:
-                buttons.append({"text": btn_label,
-                                "callback_data": "noop"})
-    rows = [buttons[j:j+3] for j in range(0, len(buttons), 3)]
-    rows.append(_CLOSE_ROW)
-    text = "\U0001f4cb <b>Sessions</b>\n\n" + "\n\n".join(blocks)
-    if not thread_id:
-        mid = tg.send(text, chat_id, buttons=rows)
-        if mid:
-            def _cleanup():
-                time.sleep(_PICKER_TTL)
-                tg.delete(mid, chat_id)
-            threading.Thread(target=_cleanup, daemon=True).start()
-    else:
-        tg.send(text, chat_id, thread_id=thread_id, buttons=rows)
-
-
-_RESUME_RECENT_SECONDS = 5 * 60
-
-
-def _discover_resumable_sessions(limit=10):
-    bot_sids = (mgr._known_bot_sids |
-                {s.claude_session_id for s in mgr._sessions.values()
-                 if s.claude_session_id})
-    live_terminal_sids = _live_claude_session_ids() - bot_sids
-    recent_cutoff = time.time() - _RESUME_RECENT_SECONDS
-    raw = []
-    try:
-        for d in os.listdir(session_discovery.CLAUDE_PROJECTS_DIR):
-            proj_dir = os.path.join(session_discovery.CLAUDE_PROJECTS_DIR, d)
-            if not os.path.isdir(proj_dir):
-                continue
-            for f in os.listdir(proj_dir):
-                if not f.endswith(".jsonl") or len(f) != 42:
-                    continue
-                sid = f[:-6]
-                if sid in bot_sids:
-                    continue
-                path = os.path.join(proj_dir, f)
-                mtime = os.path.getmtime(path)
-                if sid not in live_terminal_sids and mtime < recent_cutoff:
-                    continue
-                cwd = None
-                first_msg = None
-                title = None
-                try:
-                    with open(path) as fh:
-                        for i, line in enumerate(fh):
-                            if i > 50:
-                                break
-                            obj = json.loads(line)
-                            if not cwd:
-                                cwd = obj.get("cwd")
-                            t = obj.get("type")
-                            if t == "ai-title" and not title:
-                                title = (obj.get("aiTitle") or "").strip()
-                            elif t == "user" and not first_msg:
-                                msg = obj.get("message", {})
-                                if isinstance(msg, dict):
-                                    c = msg.get("content", "")
-                                    if isinstance(c, list):
-                                        c = "".join(
-                                            b.get("text", "") for b in c
-                                            if isinstance(b, dict)
-                                            and b.get("type") == "text"
-                                        )
-                                    if isinstance(c, str) and c.strip():
-                                        first_msg = _strip_md(c)[:80]
-                            if title and first_msg and cwd:
-                                break
-                except Exception:
-                    continue
-                desc = title or first_msg
-                if cwd and os.path.isdir(cwd):
-                    raw.append((sid, cwd, desc, mtime))
-    except Exception:
-        pass
-    # Dedup by (cwd, desc) — keep newest mtime per group
-    seen: dict[tuple, tuple] = {}
-    for sid, cwd, desc, mtime in raw:
-        key = (cwd, desc or "")
-        if key not in seen or mtime > seen[key][3]:
-            seen[key] = (sid, cwd, desc, mtime)
-    found = list(seen.values())
-    found.sort(key=lambda x: x[3], reverse=True)
-    return found[:limit]
-
-
-def _do_resume(claude_session_id: str, chat_id, thread_id=None):
-    fid = forum()
-    if not fid:
-        return
-    existing = mgr.by_claude_session_id(claude_session_id)
-    if existing and existing.alive and existing.is_bot_spawned:
-        url = ui.topic_url(existing.topic_id) if existing.topic_id else None
-        if url:
-            ui.reply(chat_id, thread_id,
-                   f"ℹ️ Already active: <b>{tg.esc(existing.name)}</b>",
-                   buttons=[[{"text": "Open", "url": url}]])
-        else:
-            ui.reply(chat_id, thread_id,
-                   f"ℹ️ Already active: <b>{tg.esc(existing.name)}</b>")
-        return
-    if existing:
-        mgr.detach_terminal(existing.sid)
-    cwd = _resolve_session_cwd(claude_session_id)
-    if not cwd or not os.path.isdir(cwd):
-        ui.reply(chat_id, thread_id,
-               f"❌ Can't find cwd for session <code>{tg.esc(claude_session_id[:12])}…</code>")
-        return
-    name = os.path.basename(cwd.rstrip("/"))
-    with state.lock:
-        state.topic_counter[name] = state.topic_counter.get(name, 0) + 1
-        n = state.topic_counter[name]
-    ts = time.strftime("%H:%M")
-    label = (f"{name} #{n} — {ts}" if n > 1
-             else f"{name} — {ts}")
-    try:
-        topic_id = tg.create_forum_topic(fid, label, icon_color=0x6FB9F0)
-    except Exception as e:
-        ui.ephemeral(fid, f"❌ Failed to create topic: {tg.esc(str(e))}", seconds=7)
-        return
-    if not topic_id:
-        ui.ephemeral(fid, "❌ Failed to create topic.", seconds=7)
-        return
-    with state.lock:
-        state.topic_labels[topic_id] = label
-    s = mgr.resume(claude_session_id, topic_id, name, cwd)
-    s.topic_label = label
-    ui.send_to_topic(topic_id,
-                  f"▶️ <code>{tg.esc(cwd)}</code>")
-    url = ui.topic_url(topic_id)
-    if url:
-        ui.ephemeral(fid, f"▶ {name}",
-                   buttons=[[{"text": "Open", "url": url}]],
-                   seconds=5)
-
-
-_RESUME_RECENT_LIMIT = 4
-
-
-def _build_resume_picker(sessions, pick_id, max_items=None):
-    show = sessions if max_items is None else sessions[:max_items]
-    blocks = []
-    rows = []
-    now = time.time()
-    for i, (_sid, cwd, desc, mtime) in enumerate(show):
-        proj = os.path.basename(cwd.rstrip("/"))
-        age_str = _format_age(now - mtime)
-        hint = ""
-        if desc:
-            hint = desc[:50].rstrip()
-            if len(desc) > 50:
-                hint += "…"
-        num = i + 1
-        head = f"<b>{num}.</b> {tg.esc(proj)} · <i>{age_str}</i>"
-        blocks.append(f"{head}\n    <i>{tg.esc(hint)}</i>" if hint else head)
-        btn_label = f"{num}. {proj}"
-        if len(btn_label) > 25:
-            btn_label = btn_label[:22] + "…"
-        rows.append([{"text": btn_label,
-                      "callback_data": f"r:{pick_id}:{i}"}])
-    if max_items is not None and len(sessions) > max_items:
-        rows.append([{"text": f"\U0001f4cb Show all ({len(sessions)})",
-                      "callback_data": f"ra:{pick_id}"}])
-    rows.append(_CLOSE_ROW)
-    text = "▶️ <b>Resume</b>\n\n" + "\n\n".join(blocks)
-    return text, rows
-
-
-def cmd_resume(args: str, chat_id, thread_id=None):
-    fid = forum()
-    if not fid:
-        ui.send_general("❌ Run /setup in a forum group first.")
-        return
-    claude_session_id = args.strip()
-    if claude_session_id:
-        _do_resume(claude_session_id, chat_id, thread_id)
-        return
-    sessions = _discover_resumable_sessions()
-    if not sessions:
-        ui.reply(chat_id, thread_id, "No resumable sessions found.")
-        return
-    pick_id = str(time.time_ns())[-10:]
-    with state.lock:
-        state.pending_resume_picks[pick_id] = sessions
-    text, rows = _build_resume_picker(sessions, pick_id,
-                                      max_items=_RESUME_RECENT_LIMIT)
-    mid = ui.reply(chat_id, thread_id, text, buttons=rows)
-    if not thread_id and mid and chat_id:
-        def _cleanup():
-            time.sleep(_PICKER_TTL)
-            with state.lock:
-                state.pending_resume_picks.pop(pick_id, None)
-            tg.delete(mid, chat_id)
-        threading.Thread(target=_cleanup, daemon=True).start()
-
-
-def cmd_history(session, chat_id, thread_id, args):
-    if not session:
-        if not thread_id:
-            ui.ephemeral(chat_id, "Use in a session topic", seconds=5)
-        else:
-            tg.send("Use in a session topic", chat_id, thread_id=thread_id)
-        return
-    n = 30
-    if args.strip().isdigit():
-        n = int(args.strip())
-    entries = session.history[-n:]
-    if not entries:
-        tg.send("Empty history", chat_id, thread_id=thread_id)
-        return
-    lines = []
-    for e in entries:
-        t = time.strftime("%H:%M:%S", time.localtime(e.ts))
-        icon = {"user": "\U0001f464", "assistant": "\U0001f916",
-                "tool": "\U0001f527", "system": "⚙️",
-                "result": "✅"}.get(e.kind, "·")
-        text = e.text[:200] if len(e.text) > 200 else e.text
-        lines.append(f"<code>{t}</code> {icon} {tg.esc(text)}")
-    tg.send("\n".join(lines), chat_id, thread_id=thread_id)
-
-
-def cmd_mode(session, chat_id, thread_id, args):
-    if not session:
-        if thread_id:
-            tg.send("Use in a session topic", chat_id, thread_id=thread_id)
-        else:
-            fid = forum()
-            if fid:
-                ui.ephemeral(fid, "Use in a session topic", seconds=5)
-        return
-    name = args.strip().lower()
-    if not name:
-        lines = [f"<b>Current mode:</b> {tg.esc(session.mode)}", "", "Modes:"]
-        for key, preset in MODE_PRESETS.items():
-            marker = "•" if key == session.mode else " "
-            lines.append(f"{marker} <code>{key}</code> — {tg.esc(preset['label'])}")
-        lines.append("")
-        lines.append("Set with <code>/mode &lt;name&gt;</code>.")
-        tg.send("\n".join(lines), chat_id, thread_id=thread_id)
-        return
-    if not mgr.set_mode(session.sid, name):
-        valid = ", ".join(MODE_PRESETS.keys())
-        tg.send(f"Unknown mode: <code>{tg.esc(name)}</code>\nAvailable: {valid}",
-                chat_id, thread_id=thread_id)
-        return
-    preset = MODE_PRESETS[name]
-    tg.send(f"\U0001f3af Mode: <b>{tg.esc(name)}</b> — {tg.esc(preset['label'])}",
-            chat_id, thread_id=thread_id)
-
-
-def cmd_display(chat_id, thread_id, args):
-    if not thread_id:
-        fid = forum()
-        if fid:
-            ui.ephemeral(fid, "Use in a session topic", seconds=5)
-        return
-    mode = args.strip().lower()
-    if mode not in ("mobile", "desktop"):
-        with state.lock:
-            current = state.topic_display_mode.get(thread_id, DEFAULT_DISPLAY)
-        mode = "desktop" if current == "mobile" else "mobile"
-    with state.lock:
-        state.topic_display_mode[thread_id] = mode
-    icon = "\U0001f4f1" if mode == "mobile" else "\U0001f5a5"
-    tg.send(f"{icon} Display: <b>{mode}</b>", chat_id, thread_id=thread_id)
-
-
-def cmd_stop(session, chat_id, thread_id):
-    if not session:
-        if not thread_id:
-            ui.ephemeral(chat_id, "Use in a session topic", seconds=5)
-        else:
-            tg.send("Use in a session topic", chat_id, thread_id=thread_id)
-        return
-    with state.lock:
-        turn = state.turns.pop(session.sid, None)
-    if turn:
-        turnctl.end_turn(turn)
-    mgr.stop(session.sid)
-    audit.log("session_stop", "user stop", sid=session.sid)
-    fid = forum()
-    if fid and session.topic_id:
-        stop_label = session.name
-        tg.edit_forum_topic(fid, session.topic_id, stop_label,
-                            icon_custom_emoji_id=_ICON_STOPPED)
-        with state.lock:
-            state.topic_labels[session.topic_id] = stop_label
-        session.topic_label = stop_label
-        tg.close_forum_topic(fid, session.topic_id)
-    tg.send("⏹ Stopped", chat_id, thread_id=thread_id)
-
-
-def cmd_interrupt(session, chat_id, thread_id):
-    if not session:
-        if not thread_id:
-            ui.ephemeral(chat_id, "Use in a session topic", seconds=5)
-        else:
-            tg.send("Use in a session topic", chat_id, thread_id=thread_id)
-        return
-    if not session.is_bot_spawned:
-        tg.send("ℹ️ Terminal — Ctrl-C in terminal",
-                chat_id, thread_id=thread_id)
-        return
-    _do_interrupt(session, chat_id, thread_id)
-
-
-def _do_interrupt(session, chat_id, thread_id):
-    if not mgr.interrupt(session.sid):
-        ui.ephemeral(chat_id, "Nothing to interrupt.",
-                   thread_id=thread_id, seconds=5)
-        return
-    edited = False
-    with state.lock:
-        turn = state.turns.get(session.sid)
-    if turn:
-        turn.interrupted = True
-        fid = forum()
-        if fid and turn.status_msg_id:
-            try:
-                tg.edit(turn.status_msg_id, "⏹ Interrupted", fid)
-                turn._last_status_text = "⏹ Interrupted"
-                edited = True
-            except Exception as e:
-                print(f"[interrupt] status edit failed: {e}",
-                      file=sys.stderr, flush=True)
-    lifecycle.cancel_session_perms(session.sid, "interrupted")
-    if not edited:
-        # No live status to repaint (or edit failed) — fall back to ephemeral.
-        ui.ephemeral(chat_id, "⏹ Turn interrupted.",
-                   thread_id=thread_id, seconds=5)
-
-
-def cmd_restart(chat_id, thread_id):
-    if not thread_id:
-        fid = forum()
-        if fid:
-            ui.ephemeral(fid, "Use in a session topic", seconds=5)
-        return
-    session = mgr.by_topic(thread_id)
-    if not session:
-        tg.send("No session here", chat_id, thread_id=thread_id)
-        return
-    if session.alive:
-        tg.send("Already running", chat_id, thread_id=thread_id)
-        return
-    if mgr.restart(session.sid):
-        fid = forum()
-        if fid:
-            tg.reopen_forum_topic(fid, session.topic_id)
-            tg.edit_forum_topic(fid, session.topic_id, session.name,
-                                icon_custom_emoji_id=_ICON_ACTIVE)
-            with state.lock:
-                state.topic_labels[session.topic_id] = session.name
-            session.topic_label = session.name
-        tg.send("▶️ Restarted", chat_id,
-                thread_id=thread_id)
-    else:
-        tg.send("❌ Failed to restart", chat_id, thread_id=thread_id)
-
-
-def cmd_usage(session, chat_id, thread_id):
-    if session and (session.total_input_tokens or session.total_output_tokens):
-        lines = ["<b>Session</b>"]
-        total = session.total_input_tokens + session.total_output_tokens
-        lines.append(f"Tokens: {total:,} (in {session.total_input_tokens:,} / out {session.total_output_tokens:,})")
-        if session.total_cache_read:
-            lines.append(f"Cache read: {session.total_cache_read:,}")
-        if session.total_cost_usd > 0:
-            lines.append(f"Cost: ${session.total_cost_usd:.4f}")
-        text = "\n".join(lines)
-        if not thread_id:
-            ui.ephemeral(chat_id, text, seconds=7)
-        else:
-            tg.send(text, chat_id, thread_id=thread_id)
-
-    mid = tg.send("⏳ Fetching account usage...", chat_id, thread_id=thread_id)
-
-    in_general = not thread_id
-
-    def _do_fetch():
-        try:
-            result = dashboard.fetch_account_usage()
-            if result:
-                text = f"<b>Account</b>\n{tg.esc(result)}"
-                if in_general:
-                    ui.ephemeral(chat_id, text, seconds=7)
-                else:
-                    tg.send(text, chat_id, thread_id=thread_id)
-            else:
-                if in_general:
-                    ui.ephemeral(chat_id, "⚠️ Could not fetch account usage.", seconds=7)
-                else:
-                    tg.send("⚠️ Could not fetch account usage.", chat_id,
-                            thread_id=thread_id)
-        except Exception as e:
-            if in_general:
-                ui.ephemeral(chat_id, f"⚠️ Error: {tg.esc(str(e))}", seconds=7)
-            else:
-                tg.send(f"⚠️ Error: {tg.esc(str(e))}", chat_id,
-                        thread_id=thread_id)
-        finally:
-            if mid:
-                tg.delete(mid, chat_id)
-
-    threading.Thread(target=_do_fetch, daemon=True).start()
-
-
-def cmd_audit(args, chat_id, thread_id=None):
-    n = 20
-    if args.strip().isdigit():
-        n = min(int(args.strip()), 100)
-    entries = audit.tail(n)
-    if not entries:
-        ui.ephemeral(chat_id, "No audit events.", seconds=5,
-                   thread_id=thread_id)
-        return
-    lines = []
-    for e in entries:
-        ts = e.get("ts", "?")[11:]  # HH:MM:SS
-        ev = e.get("event", "?")
-        detail = e.get("detail", "")
-        if len(detail) > 60:
-            detail = detail[:57] + "..."
-        lines.append(f"<code>{ts}</code> <b>{tg.esc(ev)}</b> {tg.esc(detail)}")
-    text = "\n".join(lines)
-    ui.ephemeral(chat_id, text, seconds=30, thread_id=thread_id)
-
-
-def cmd_test_perm(chat_id, thread_id=None):
-    """Simulate a permission request to test the hook flow end-to-end."""
-    def _do_test():
-        import urllib.request
-        payload = json.dumps({
-            "tool_name": "Bash",
-            "tool_input": {"command": "echo 'test permission flow'"},
-            "session_id": f"test-{uuid.uuid4().hex[:8]}",
-            "cwd": os.path.expanduser("~"),
-        }).encode()
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{HOOK_PORT}/hook/permission",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=130) as resp:
-                body = json.loads(resp.read().decode())
-                dec = body.get("hookSpecificOutput", {}).get(
-                    "decision", {}).get("behavior", "?")
-                if thread_id:
-                    tg.send(f"Test OK! Decision: {tg.esc(dec)}",
-                            chat_id, thread_id=thread_id)
-                else:
-                    ui.ephemeral(chat_id, f"Test OK! Decision: {tg.esc(dec)}",
-                               seconds=7)
-        except Exception as e:
-            msg = f"Test failed: {tg.esc(str(e))}"
-            if thread_id:
-                tg.send(msg, chat_id, thread_id=thread_id)
-            else:
-                ui.ephemeral(chat_id, msg, seconds=7)
-
-    threading.Thread(target=_do_test, daemon=True).start()
-    if thread_id:
-        tg.send("Test permission sent — click Allow/Deny.",
-                chat_id, thread_id=thread_id)
-    else:
-        ui.ephemeral(chat_id, "Test permission sent — click Allow/Deny.",
-                   seconds=10)
-
-
-def cmd_update(chat_id, thread_id=None):
-    mid = ui.reply(chat_id, thread_id, "⏳ Checking for updates...")
-
-    def _do_check():
-        result = _check_update()
-        if mid:
-            tg.delete(mid, chat_id)
-        if not result:
-            if not thread_id:
-                ui.ephemeral(chat_id, "✅ Already up to date.", seconds=5)
-            else:
-                tg.send("✅ Already up to date.", chat_id,
-                        thread_id=thread_id)
-            return
-
-        current, latest = result
-        modified = _has_local_changes()
-
-        text = f"<b>Update available</b>\n{tg.esc(current)} → <b>{tg.esc(latest)}</b>"
-        if modified:
-            text += f"\n\n⚠️ {len(modified)} locally modified file(s):"
-            for f in modified[:5]:
-                text += f"\n  <code>{tg.esc(f)}</code>"
-            if len(modified) > 5:
-                text += f"\n  … and {len(modified) - 5} more"
-
-        buttons = [[
-            {"text": "⬆️ Update now", "callback_data": "upd:go"},
-            {"text": "❌ Cancel", "callback_data": "upd:no"},
-        ]]
-        ui.reply(chat_id, thread_id, text, buttons=buttons)
-
-    threading.Thread(target=_do_check, daemon=True).start()
-
-
 def _auto_update_loop():
     """Background thread: check for updates at startup + every hour."""
     if not AUTO_UPDATE:
@@ -835,36 +205,6 @@ def _auto_update_loop():
                 return
             time.sleep(1)
 
-_HELP_TEXT = (
-    "<b>ClaudeLaude — Help</b>\n"
-    "\n"
-    "<b>Sessions</b>\n"
-    "/new — project picker\n"
-    "/new &lt;path&gt; [name] — session in dir\n"
-    "/sessions — list sessions + fork\n"
-    "/resume — pick session to continue\n"
-    "/resume &lt;id&gt; — continue by session id\n"
-    "/stop — stop current session\n"
-    "/restart — restart stopped session\n"
-    "/interrupt — abort current turn\n"
-    "\n"
-    "<b>In topic</b>\n"
-    "/history [N] — last N events (default 30)\n"
-    "/usage — session tokens + account limits\n"
-    "/display [mobile|desktop] — toggle view\n"
-    "/mode [default|terse|verbose|beginner|plan|burn] — response style\n"
-    "\n"
-    "<b>Other</b>\n"
-    "/update — check for bot updates\n"
-    "/menu — quick actions\n"
-    "/help — this message\n"
-    "/stop_bot — shutdown bot\n"
-    "\n"
-    "Unknown /commands in bot sessions are\n"
-    "forwarded to Claude as user messages.\n"
-    "Photos/files in bot topics are sent\n"
-    "to the session as attachments."
-)
 
 _KNOWN_COMMANDS = {
     "/setup", "/new", "/sessions", "/resume", "/history", "/stop",
@@ -878,12 +218,6 @@ _HELP_DOCUMENTED_COMMANDS = {
     "/history", "/usage", "/display", "/mode", "/update",
     "/menu", "/help", "/stop_bot",
 }
-
-def cmd_help(chat_id, thread_id=None):
-    if not thread_id:
-        ui.ephemeral(chat_id, _HELP_TEXT, seconds=_PICKER_TTL)
-    else:
-        tg.send(_HELP_TEXT, chat_id, thread_id=thread_id)
 
 
 _HIDDEN_COMMANDS = {"/setup", "/test_perm", "/start", "/kill", "/audit"}
@@ -900,44 +234,6 @@ def _validate_help():
     if extra:
         print(f"[WARN] help references unknown commands: {extra}",
               file=sys.stderr, flush=True)
-
-
-def cmd_menu(chat_id, thread_id=None, session=None):
-    rows = [
-        [{"text": "\U0001f195 New session", "callback_data": "m:new"},
-         {"text": "\U0001f4cb Sessions", "callback_data": "m:sessions"}],
-    ]
-    if session:
-        with state.lock:
-            mode = state.topic_display_mode.get(
-                session.topic_id, DEFAULT_DISPLAY)
-        mode_label = ("\U0001f4f1 → \U0001f5a5" if mode == "mobile"
-                      else "\U0001f5a5 → \U0001f4f1")
-        if session.alive:
-            rows.append([
-                {"text": f"{mode_label} Display",
-                 "callback_data": "m:display"},
-                {"text": "⏹ Stop", "callback_data": "m:stop"},
-            ])
-            rows.append([
-                {"text": "\U0001f4ca Usage", "callback_data": "m:usage"},
-                {"text": "\U0001f4dc History", "callback_data": "m:history"},
-            ])
-        else:
-            rows.append([
-                {"text": "▶️ Restart", "callback_data": "m:restart"},
-            ])
-    rows.append([
-        {"text": "❓ Help", "callback_data": "m:help"},
-    ])
-    rows.append(_CLOSE_ROW)
-    mid = tg.send("\U0001f3ae <b>Quick actions</b>", chat_id,
-                   thread_id=thread_id, buttons=rows)
-    if not thread_id and mid:
-        def _cleanup():
-            time.sleep(_PICKER_TTL)
-            tg.delete(mid, chat_id)
-        threading.Thread(target=_cleanup, daemon=True).start()
 
 
 # ── main loop ────────────────────────────────────────────────────────
@@ -970,6 +266,12 @@ bridge = HookBridge(
 )
 lifecycle.bridge = bridge
 hooks.bridge = bridge
+commands = Commands(
+    state, mgr, ui, dashboard, turnctl, lifecycle,
+    default_display=DEFAULT_DISPLAY,
+    icon_stopped=_ICON_STOPPED,
+    icon_active=_ICON_ACTIVE,
+)
 
 
 def _dashboard_loop():
@@ -1395,44 +697,44 @@ def _handle_update(u):
 def _handle_command(cmd, args, chat_id, thread_id, session):
     global bot_running
     if cmd == "/setup":
-        cmd_setup(chat_id)
+        commands.cmd_setup(chat_id)
     elif cmd == "/new":
-        cmd_new(args, chat_id=chat_id, thread_id=thread_id)
+        commands.cmd_new(args, chat_id=chat_id, thread_id=thread_id)
     elif cmd == "/sessions":
-        cmd_sessions(chat_id, thread_id)
+        commands.cmd_sessions(chat_id, thread_id)
     elif cmd == "/resume":
-        cmd_resume(args, chat_id, thread_id)
+        commands.cmd_resume(args, chat_id, thread_id)
     elif cmd == "/history":
-        cmd_history(session, chat_id, thread_id, args)
+        commands.cmd_history(session, chat_id, thread_id, args)
     elif cmd == "/stop":
-        cmd_stop(session, chat_id, thread_id)
+        commands.cmd_stop(session, chat_id, thread_id)
     elif cmd == "/interrupt":
-        cmd_interrupt(session, chat_id, thread_id)
+        commands.cmd_interrupt(session, chat_id, thread_id)
     elif cmd == "/restart":
-        cmd_restart(chat_id, thread_id)
+        commands.cmd_restart(chat_id, thread_id)
     elif cmd == "/usage":
-        cmd_usage(session, chat_id, thread_id)
+        commands.cmd_usage(session, chat_id, thread_id)
     elif cmd == "/display":
-        cmd_display(chat_id, thread_id, args)
+        commands.cmd_display(chat_id, thread_id, args)
     elif cmd == "/mode":
-        cmd_mode(session, chat_id, thread_id, args)
+        commands.cmd_mode(session, chat_id, thread_id, args)
     elif cmd == "/update":
-        cmd_update(chat_id, thread_id)
+        commands.cmd_update(chat_id, thread_id)
     elif cmd == "/test_perm":
-        cmd_test_perm(chat_id, thread_id)
+        commands.cmd_test_perm(chat_id, thread_id)
     elif cmd == "/kill":
         _do_kill()
     elif cmd == "/audit":
-        cmd_audit(args, chat_id, thread_id)
+        commands.cmd_audit(args, chat_id, thread_id)
     elif cmd == "/stop_bot":
         fid = forum()
         if fid:
             ui.ephemeral(fid, "\U0001f44b Shutting down.", seconds=5)
         bot_running = False
     elif cmd in ("/help", "/start"):
-        cmd_help(chat_id, thread_id)
+        commands.cmd_help(chat_id, thread_id)
     elif cmd == "/menu":
-        cmd_menu(chat_id, thread_id, session)
+        commands.cmd_menu(chat_id, thread_id, session)
     else:
         if session and session.is_bot_spawned:
             ok = mgr.send_user_message(session.sid,
@@ -1454,7 +756,7 @@ def _handle_callback(cb, data):
         sid = data[4:]
         session = mgr._sessions.get(sid)
         if session:
-            _do_interrupt(session, cb_chat, cb_thread)
+            commands._do_interrupt(session, cb_chat, cb_thread)
         return
 
     if data.startswith("p:"):
@@ -1486,7 +788,7 @@ def _handle_callback(cb, data):
                 label = os.path.basename(p.rstrip("/"))
                 rows.append([{"text": label,
                               "callback_data": f"n:{pick_id}:{i}"}])
-            rows.append(_CLOSE_ROW)
+            rows.append(CLOSE_ROW)
             if cb_chat and cb_msg:
                 tg.edit(cb_msg, "\U0001f4c2 Choose project:",
                         cb_chat, buttons=rows)
@@ -1509,7 +811,7 @@ def _handle_callback(cb, data):
         with state.lock:
             sessions_list = state.pending_resume_picks.get(pick_id)
         if sessions_list and cb_chat and cb_msg:
-            text, rows = _build_resume_picker(sessions_list, pick_id,
+            text, rows = commands._build_resume_picker(sessions_list, pick_id,
                                               max_items=None)
             tg.edit(cb_msg, text, cb_chat, buttons=rows)
 
@@ -1525,7 +827,7 @@ def _handle_callback(cb, data):
                     if cb_chat and cb_msg:
                         tg.delete(cb_msg, cb_chat)
                     sid, cwd, _, _ = sessions_list[idx]
-                    _do_resume(sid, cb_chat, cb_thread)
+                    commands._do_resume(sid, cb_chat, cb_thread)
 
     elif data.startswith("c:"):
         compact_id = data[2:]
@@ -1736,23 +1038,23 @@ def _handle_callback(cb, data):
         session = mgr.by_topic(cb_thread) if cb_thread else None
         # Don't delete the source message — it may be the dashboard pin
         if action == "new":
-            cmd_new("", chat_id=cb_chat, thread_id=cb_thread)
+            commands.cmd_new("", chat_id=cb_chat, thread_id=cb_thread)
         elif action == "sessions":
-            cmd_sessions(cb_chat, cb_thread)
+            commands.cmd_sessions(cb_chat, cb_thread)
         elif action == "resume":
-            cmd_resume("", cb_chat, cb_thread)
+            commands.cmd_resume("", cb_chat, cb_thread)
         elif action == "display" and cb_thread:
-            cmd_display(cb_chat, cb_thread, "")
+            commands.cmd_display(cb_chat, cb_thread, "")
         elif action == "stop" and session:
-            cmd_stop(session, cb_chat, cb_thread)
+            commands.cmd_stop(session, cb_chat, cb_thread)
         elif action == "restart":
-            cmd_restart(cb_chat, cb_thread)
+            commands.cmd_restart(cb_chat, cb_thread)
         elif action == "usage" and session:
-            cmd_usage(session, cb_chat, cb_thread)
+            commands.cmd_usage(session, cb_chat, cb_thread)
         elif action == "history" and session:
-            cmd_history(session, cb_chat, cb_thread, "")
+            commands.cmd_history(session, cb_chat, cb_thread, "")
         elif action == "help":
-            cmd_help(cb_chat, cb_thread)
+            commands.cmd_help(cb_chat, cb_thread)
 
 
 if __name__ == "__main__":

@@ -14,6 +14,10 @@ import time
 import telegram as tg
 from config import OWNER_ID, get_forum_chat_id
 
+# Shared inline-keyboard row used by every picker/menu (and the callback
+# dispatcher that handles its `close` action).
+CLOSE_ROW = [{"text": "✕ Close", "callback_data": "close"}]
+
 
 class BotUI:
     def send_to_topic(self, topic_id, text, buttons=None):

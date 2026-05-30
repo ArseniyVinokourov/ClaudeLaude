@@ -782,7 +782,8 @@ def test_terminal_watcher_cleans_notification(bot, tmp_path, monkeypatch):
 
     projects_dir = tmp_path / "claude_projects" / "proj"
     projects_dir.mkdir(parents=True)
-    monkeypatch.setattr(bot.mod.session_discovery, "CLAUDE_PROJECTS_DIR",
+    import session_discovery as _sd
+    monkeypatch.setattr(_sd, "CLAUDE_PROJECTS_DIR",
                         str(projects_dir.parent))
 
     csid = "term-session-001"
@@ -810,7 +811,8 @@ def test_terminal_watcher_cleans_permission(bot, tmp_path, monkeypatch):
 
     projects_dir = tmp_path / "claude_projects" / "proj"
     projects_dir.mkdir(parents=True)
-    monkeypatch.setattr(bot.mod.session_discovery, "CLAUDE_PROJECTS_DIR",
+    import session_discovery as _sd
+    monkeypatch.setattr(_sd, "CLAUDE_PROJECTS_DIR",
                         str(projects_dir.parent))
 
     csid = "term-session-002"
@@ -850,7 +852,8 @@ def test_terminal_watcher_offset_init(bot, tmp_path, monkeypatch):
 
     projects_dir = tmp_path / "claude_projects" / "proj"
     projects_dir.mkdir(parents=True)
-    monkeypatch.setattr(bot.mod.session_discovery, "CLAUDE_PROJECTS_DIR",
+    import session_discovery as _sd
+    monkeypatch.setattr(_sd, "CLAUDE_PROJECTS_DIR",
                         str(projects_dir.parent))
 
     csid = "term-session-003"
@@ -1077,7 +1080,7 @@ def test_interrupt_repaints_status_message(bot, tmp_path):
     # Patch interrupt to no-op success.
     bot.mod.mgr.interrupt = lambda _sid: True
     bot.tg.reset()
-    bot.mod._do_interrupt(session, bot.forum_chat_id, session.topic_id)
+    bot.mod.commands._do_interrupt(session, bot.forum_chat_id, session.topic_id)
     edits = [m for m in bot.tg.calls_of("editMessageText")
              if m.get("message_id") == 9999]
     assert any("Interrupted" in e.get("text", "") for e in edits), \

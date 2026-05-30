@@ -34,6 +34,7 @@ def _purge_bot_modules():
         # freshly-patched telegram module (else they hold a stale one).
         "turncontroller", "dashboard", "formatting", "session_discovery",
         "updater", "mirrorbridge", "botui", "lifecycle", "hookhandlers",
+        "commands",
     ]:
         sys.modules.pop(name, None)
 
