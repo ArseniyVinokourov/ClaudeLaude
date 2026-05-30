@@ -83,7 +83,7 @@ state = BotState()
 bot_running = True
 ui = BotUI()
 turnctl = TurnController(
-    state, _CLAUDE_BIN,
+    state, ui, _CLAUDE_BIN,
     default_display=DEFAULT_DISPLAY,
     icon_stopped=_ICON_STOPPED,
     fork_backfill=_FORK_BACKFILL,

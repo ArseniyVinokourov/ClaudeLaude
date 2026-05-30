@@ -40,12 +40,26 @@ class BotUI:
     def ephemeral(self, chat_id, text, thread_id=None, seconds=15, buttons=None):
         """Send a message that auto-deletes after `seconds`."""
         mid = tg.send(text, chat_id, thread_id=thread_id, buttons=buttons)
-        if mid:
-            def _cleanup():
-                time.sleep(seconds)
-                tg.delete(mid, chat_id)
-            threading.Thread(target=_cleanup, daemon=True).start()
+        self.delete_after(mid, chat_id, seconds)
         return mid
+
+    def delete_after(self, mid, chat_id, seconds, before_delete=None):
+        """Schedule a message deletion `seconds` from now in a daemon thread.
+
+        The single place deferred deletes go through (picker expiry, perm
+        cancellation, terminal-notice cleanup, interrupted-status fade) so
+        the fire-and-forget timer can be neutralised in tests at one point.
+        `before_delete`, if given, runs just before the delete (used to
+        expire the matching pending-pick state).
+        """
+        if not mid:
+            return
+        def _run():
+            time.sleep(seconds)
+            if before_delete is not None:
+                before_delete()
+            tg.delete(mid, chat_id)
+        threading.Thread(target=_run, daemon=True).start()
 
     def topic_url(self, topic_id):
         fid = get_forum_chat_id()

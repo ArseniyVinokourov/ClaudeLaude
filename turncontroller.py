@@ -65,9 +65,10 @@ class TurnState:
 
 
 class TurnController:
-    def __init__(self, state, claude_bin, *, default_display,
+    def __init__(self, state, ui, claude_bin, *, default_display,
                  icon_stopped, fork_backfill):
         self.state = state
+        self.ui = ui
         self.mgr = None  # setter-injected after SessionManager is built
         self._claude_bin = claude_bin
         self._default_display = default_display
@@ -202,11 +203,7 @@ class TurnController:
                     tg.edit(mid, "⏹ Interrupted", fid)
                 except Exception:
                     pass
-
-                def _del_later(mid=mid, fid=fid):
-                    time.sleep(3)
-                    tg.delete(mid, fid)
-                threading.Thread(target=_del_later, daemon=True).start()
+                self.ui.delete_after(mid, fid, 3)
             else:
                 tg.delete(mid, fid)
             turn.status_msg_id = None

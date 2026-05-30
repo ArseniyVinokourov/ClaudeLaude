@@ -18,7 +18,6 @@ Telegram and config are imported directly — tests fake Telegram at the
 import json
 import os
 import sys
-import threading
 import time
 import uuid
 
@@ -275,10 +274,7 @@ class HookHandlers:
                     pass
                 if full_id:
                     self.bridge.abandon_permission(full_id)
-                def _del(mid=msg_id, cid=chat_id):
-                    time.sleep(5)
-                    tg.delete(mid, cid)
-                threading.Thread(target=_del, daemon=True).start()
+                self.ui.delete_after(msg_id, chat_id, 5)
             else:
                 try:
                     tg.delete(msg_id, chat_id)

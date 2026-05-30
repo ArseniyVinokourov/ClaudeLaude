@@ -133,12 +133,10 @@ class Commands:
         rows.append(CLOSE_ROW)
         mid = self.ui.reply(chat_id, thread_id, "\U0001f4c2 Choose project:", buttons=rows)
         if not thread_id and mid and chat_id:
-            def _cleanup_picker():
-                time.sleep(_PICKER_TTL)
+            def _expire():
                 with self.state.lock:
                     self.state.pending_project_picks.pop(pick_id, None)
-                tg.delete(mid, chat_id)
-            threading.Thread(target=_cleanup_picker, daemon=True).start()
+            self.ui.delete_after(mid, chat_id, _PICKER_TTL, before_delete=_expire)
 
     def cmd_sessions(self, chat_id, thread_id=None):
         all_sessions = [s for s in self.mgr._sessions.values()
@@ -188,11 +186,7 @@ class Commands:
         text = "\U0001f4cb <b>Sessions</b>\n\n" + "\n\n".join(blocks)
         if not thread_id:
             mid = tg.send(text, chat_id, buttons=rows)
-            if mid:
-                def _cleanup():
-                    time.sleep(_PICKER_TTL)
-                    tg.delete(mid, chat_id)
-                threading.Thread(target=_cleanup, daemon=True).start()
+            self.ui.delete_after(mid, chat_id, _PICKER_TTL)
         else:
             tg.send(text, chat_id, thread_id=thread_id, buttons=rows)
 
@@ -359,12 +353,10 @@ class Commands:
                                                max_items=_RESUME_RECENT_LIMIT)
         mid = self.ui.reply(chat_id, thread_id, text, buttons=rows)
         if not thread_id and mid and chat_id:
-            def _cleanup():
-                time.sleep(_PICKER_TTL)
+            def _expire():
                 with self.state.lock:
                     self.state.pending_resume_picks.pop(pick_id, None)
-                tg.delete(mid, chat_id)
-            threading.Thread(target=_cleanup, daemon=True).start()
+            self.ui.delete_after(mid, chat_id, _PICKER_TTL, before_delete=_expire)
 
     def cmd_history(self, session, chat_id, thread_id, args):
         if not session:
@@ -701,7 +693,4 @@ class Commands:
         mid = tg.send("\U0001f3ae <b>Quick actions</b>", chat_id,
                       thread_id=thread_id, buttons=rows)
         if not thread_id and mid:
-            def _cleanup():
-                time.sleep(_PICKER_TTL)
-                tg.delete(mid, chat_id)
-            threading.Thread(target=_cleanup, daemon=True).start()
+            self.ui.delete_after(mid, chat_id, _PICKER_TTL)

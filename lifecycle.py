@@ -11,7 +11,6 @@ detection and dispatch all call into this layer, so it sits below them.
 
 import os
 import sys
-import threading
 import time
 
 import audit
@@ -102,10 +101,7 @@ class SessionLifecycle:
             except Exception as e:
                 print(f"[cancel_perm] edit failed: {e}",
                       file=sys.stderr, flush=True)
-            def _delete_later(mid=msg_id, cid=chat_id):
-                time.sleep(5)
-                tg.delete(mid, cid)
-            threading.Thread(target=_delete_later, daemon=True).start()
+            self.ui.delete_after(msg_id, chat_id, 5)
             if full_id:
                 self.bridge.abandon_permission(full_id)
 
