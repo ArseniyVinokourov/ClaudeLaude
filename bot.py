@@ -528,6 +528,69 @@ def _handle_my_chat_member(mcm: dict):
               f"{title} ({chat_id}): {old_status} -> {new_status}")
 
 
+# ── media-group (album) assembly ────────────────────────────────────
+# Telegram delivers an album (multiple photos/files sent together) as N
+# SEPARATE messages that share one `media_group_id`; the caption rides on
+# the first part only. The parts arrive back-to-back. We buffer them and
+# flush once no new part has shown up for _MEDIA_GROUP_FLUSH_S, then hand
+# Claude a single turn carrying every attachment path. Flushing is done on
+# a daemon Timer (not the poll thread) so it fires even while the long-poll
+# is blocked; the buffer dict is guarded by a lock since two threads touch
+# it. enqueue_user_input is queue-based, so calling it off-thread is safe.
+_MEDIA_GROUP_FLUSH_S = 1.5
+_media_groups: dict = {}
+_media_group_lock = threading.Lock()
+
+
+def _buffer_media_group(gid, session, file_id, filename, caption,
+                        chat_id, msg_id, thread_id):
+    """Append one album part and (re)arm its flush timer."""
+    with _media_group_lock:
+        grp = _media_groups.get(gid)
+        if grp is None:
+            grp = {"session": session, "chat_id": chat_id,
+                   "thread_id": thread_id, "caption": "",
+                   "items": [], "first_msg_id": msg_id, "timer": None}
+            _media_groups[gid] = grp
+        grp["items"].append((file_id, filename))
+        if caption and not grp["caption"]:
+            grp["caption"] = caption
+        if grp["timer"] is not None:
+            grp["timer"].cancel()
+        t = threading.Timer(_MEDIA_GROUP_FLUSH_S, _flush_media_group, args=(gid,))
+        t.daemon = True
+        grp["timer"] = t
+        t.start()
+
+
+def _flush_media_group(gid):
+    """Download every buffered part and enqueue one combined turn."""
+    with _media_group_lock:
+        grp = _media_groups.pop(gid, None)
+    if not grp:
+        return
+    session = grp["session"]
+    chat_id = grp["chat_id"]
+    thread_id = grp["thread_id"]
+    paths = []
+    for i, (file_id, filename) in enumerate(grp["items"]):
+        # Index the name: album parts download within the same second and
+        # photos all carry filename "photo.jpg", so a bare timestamp would
+        # collide and each download would overwrite the last.
+        dest = os.path.join(_UPLOAD_DIR, f"{int(time.time())}_{i}_{filename}")
+        if tg.download_file(file_id, dest):
+            paths.append(dest)
+    if not paths:
+        tg.send("❌ Download failed", chat_id, thread_id=thread_id)
+        return
+    attach = "\n".join(f"[Attached file: {p}]" for p in paths)
+    caption = grp["caption"]
+    user_text = f"{caption}\n{attach}" if caption else attach
+    audit.log("user_message", f"[album] {len(paths)} files", sid=session.sid)
+    turnctl.enqueue_user_input(session, user_text, chat_id,
+                               grp["first_msg_id"], thread_id)
+
+
 def _handle_update(u):
     global bot_running
 
@@ -633,6 +696,13 @@ def _handle_update(u):
         file_id = photos[-1]["file_id"] if photos else document["file_id"]
         filename = ("photo.jpg" if photos
                     else document.get("file_name", "file"))
+        # Album? Buffer this part and let the flush timer combine them into
+        # a single turn instead of one turn per image.
+        media_group_id = msg.get("media_group_id")
+        if media_group_id:
+            _buffer_media_group(media_group_id, session, file_id, filename,
+                                caption, chat_id, msg_id, thread_id)
+            return
         dest = os.path.join(_UPLOAD_DIR,
                             f"{int(time.time())}_{filename}")
         if tg.download_file(file_id, dest):

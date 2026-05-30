@@ -1407,6 +1407,66 @@ def test_single_image_uses_send_photo(bot, tmp_path, monkeypatch):
     assert photo_calls == [str(p)], photo_calls
 
 
+def test_media_group_album_combines_into_one_turn(bot, tmp_path, monkeypatch):
+    """An incoming album (N messages sharing media_group_id) → ONE Claude
+    turn whose prompt carries every attachment path, not N separate turns."""
+    import os
+    import telegram as tg_mod
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    tid = sess.topic_id
+
+    # Fake the TG download: create the dest file, report success.
+    def _fake_dl(file_id, dest):
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "wb") as f:
+            f.write(b"img")
+        return True
+    monkeypatch.setattr(tg_mod, "download_file", _fake_dl)
+
+    gid = "album-1"
+
+    def _album_part(file_id, n, caption=None):
+        msg = {
+            "message_id": 5000 + n,
+            "from": {"id": bot.owner_id},
+            "chat": {"id": bot.forum_chat_id, "type": "supergroup"},
+            "date": int(time.time()),
+            "message_thread_id": tid,
+            "photo": [{"file_id": file_id}],
+            "media_group_id": gid,
+        }
+        if caption:
+            msg["caption"] = caption
+        return {"update_id": 9000 + n, "message": msg}
+
+    bot.tg.inject_update(_album_part("f1", 1, caption="my album"))
+    bot.tg.inject_update(_album_part("f2", 2))
+    bot.tg.inject_update(_album_part("f3", 3))
+    _drain_updates(bot)
+
+    # Parts are buffered, NOT yet turned into a turn (no premature send).
+    assert [h for h in sess.history if h.kind == "user"] == []
+
+    # Cancel the real flush timer and flush deterministically.
+    with bot.mod._media_group_lock:
+        grp = bot.mod._media_groups.get(gid)
+        assert grp is not None and len(grp["items"]) == 3
+        grp["timer"].cancel()
+    bot.mod._flush_media_group(gid)
+
+    users = [h for h in sess.history if h.kind == "user"]
+    assert len(users) == 1, users
+    combined = users[0].text
+    assert combined.count("[Attached file:") == 3, combined
+    assert "my album" in combined
+    # Each part must land at a DISTINCT path — a shared timestamp+filename
+    # would collide and overwrite, leaving Claude 3 copies of one image.
+    import re as _re
+    paths = _re.findall(r"\[Attached file: (.+?)\]", combined)
+    assert len(set(paths)) == 3, paths
+
+
 # ── copyMessages backfill on /fork (Batch A #14) ─────────────────────
 
 def test_fork_backfills_recent_messages(bot, tmp_path):
