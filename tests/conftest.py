@@ -71,6 +71,14 @@ def bot_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 @pytest.fixture
 def bot(bot_env, monkeypatch: pytest.MonkeyPatch):
+    # Fresh group-budget singleton per test. It's a module global whose
+    # 60s sliding window does NOT decay within a ~30s suite run, so writes
+    # from earlier tests would otherwise throttle/pace later ones — e.g.
+    # starving the mirror-backfill test until its poll window expires
+    # (sends then leak past teardown into the real API). Reset isolates it.
+    import budget as _budget
+    _budget.reset_for_tests()
+
     fake_tg = FakeTelegram()
     fake_claude = FakeClaudeFactory()
 
@@ -78,6 +86,14 @@ def bot(bot_env, monkeypatch: pytest.MonkeyPatch):
     # import time, which can spawn worker threads on _restore().
     import telegram as telegram_mod
     monkeypatch.setattr(telegram_mod, "_req", fake_tg.req)
+
+    # Bypass the group-budget queue in scenario tests: run every paid write
+    # directly through the fake. The budget only paces/drops sends to respect
+    # real TG rate limits — against an instant fake it adds nothing but timing
+    # nondeterminism (e.g. the mirror backfill's 20 sends getting paced past a
+    # poll deadline). The budget itself is covered by test_budget.py.
+    monkeypatch.setattr(telegram_mod, "_via_budget",
+                        lambda chat_id, prio, fn, *a, **kw: fn(*a, **kw))
 
     import sessions as sessions_mod
     monkeypatch.setattr(sessions_mod.subprocess, "Popen", fake_claude)
@@ -108,7 +124,7 @@ def bot(bot_env, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(bot_mod.ui, "delete_after",
                         lambda *a, **kw: None)
 
-    return SimpleNamespace(
+    ns = SimpleNamespace(
         mod=bot_mod,
         tg=fake_tg,
         claude=fake_claude,
@@ -116,3 +132,7 @@ def bot(bot_env, monkeypatch: pytest.MonkeyPatch):
         forum_chat_id=bot_env.forum_chat_id,
         sessions_file=bot_env.sessions_file,
     )
+    yield ns
+    # Stop the budget worker thread so it can't outlive the test and land
+    # stray calls in the next test's fake.
+    _budget.reset_for_tests()
