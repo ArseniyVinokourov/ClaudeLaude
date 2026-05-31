@@ -2135,7 +2135,13 @@ def test_mirror_register_backfills_only_tail(bot, tmp_path):
         # The pre-registration backfill (20 events) and the post-register
         # POST-FRESH event race in the follower thread; breaking as soon as
         # POST-FRESH appears can capture topic_texts mid-backfill (evt-* not
-        # yet flushed) → flaky on slow CI runners. Poll for all markers.
+        # yet flushed) → flaky on slow CI runners. First wait on the actual
+        # completion signal the backfill thread sets once it has projected
+        # every pre-registration event — a deterministic gate that doesn't
+        # depend on how promptly a loaded CI runner schedules the daemon
+        # thread. Then poll the markers (POST-FRESH is tailed by the follower
+        # right after backfill_done releases it).
+        m.backfill_done.wait(timeout=30)
         wanted = ("evt-00", "evt-10", "evt-19", "POST-FRESH")
         deadline = _time.time() + 15.0
         while _time.time() < deadline:
