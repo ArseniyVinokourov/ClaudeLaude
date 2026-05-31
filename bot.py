@@ -16,6 +16,8 @@ from config import (OWNER_ID, AUTO_UPDATE, AUTO_UPDATE_POLICY,
                     UNLOCK_WORD,
                     get_forum_chat_id, is_killed, activate_kill, deactivate_kill)
 import audit
+import frames
+import stt
 import telegram as tg
 from botui import BotUI, CLOSE_ROW
 from commands import Commands
@@ -591,6 +593,82 @@ def _flush_media_group(gid):
                                grp["first_msg_id"], thread_id)
 
 
+# ── voice transcription (#83) ───────────────────────────────────────
+# A voice note (TG `voice`/`audio`, ogg/opus) is downloaded, transcribed
+# locally by faster-whisper (in its own venv via stt.transcribe), and the
+# text is fed to Claude as a normal turn. Run on a daemon thread so the
+# single poll loop is never blocked by the seconds-long transcription.
+
+def _handle_voice(session, file_id, caption, chat_id, msg_id, thread_id):
+    dest = os.path.join(_UPLOAD_DIR, f"{int(time.time())}_voice.oga")
+    if not tg.download_file(file_id, dest):
+        tg.send("❌ Download failed", chat_id, thread_id=thread_id)
+        return
+    tg.send_chat_action(chat_id, "typing", thread_id=thread_id)
+    result = stt.transcribe(dest)
+    if not result or not result.get("text"):
+        ui.ephemeral(chat_id, "🎙 Could not transcribe the audio",
+                     thread_id=thread_id, seconds=8)
+        return
+    transcript = result["text"]
+    body = f"[Voice message transcript]: {transcript}"
+    user_text = f"{caption}\n{body}" if caption else body
+    audit.log("user_message", f"[voice] {transcript[:200]}", sid=session.sid)
+    turnctl.enqueue_user_input(session, user_text, chat_id, msg_id, thread_id)
+
+
+# ── video transcription + frame sampling (#84) ──────────────────────
+# A video / video-note → its audio is transcribed (faster-whisper reads the
+# video container's audio stream directly via PyAV) AND scene-change frames
+# are sampled (frames.extract, also PyAV — no system ffmpeg). Claude gets ONE
+# turn: transcript with timecodes + the frames as attachments, each tagged
+# with its timecode so words and visuals line up. Runs on a daemon thread.
+
+def _mmss(seconds) -> str:
+    s = int(seconds or 0)
+    return f"{s // 60:02d}:{s % 60:02d}"
+
+
+def _handle_video(session, file_id, caption, chat_id, msg_id, thread_id):
+    ts = int(time.time())
+    dest = os.path.join(_UPLOAD_DIR, f"{ts}_video.mp4")
+    if not tg.download_file(file_id, dest):
+        tg.send("❌ Download failed", chat_id, thread_id=thread_id)
+        return
+    tg.send_chat_action(chat_id, "typing", thread_id=thread_id)
+    # Audio transcript (None if the video has no audio track).
+    result = stt.transcribe(dest)
+    transcript = (result or {}).get("text", "")
+    segments = (result or {}).get("segments") or []
+    # Scene-change frames.
+    shots = frames.extract(dest, os.path.join(_UPLOAD_DIR, f"frames_{ts}"))
+
+    parts = []
+    if transcript:
+        if segments:
+            lines = "\n".join(f"[{_mmss(s['start'])}] {s['text']}"
+                              for s in segments)
+            parts.append(f"[Video transcript]\n{lines}")
+        else:
+            parts.append(f"[Video transcript]: {transcript}")
+    if shots:
+        flines = "\n".join(f"[Attached file: {s['path']}] (t={_mmss(s['t'])})"
+                           for s in shots)
+        parts.append(f"[Video frames at scene changes]\n{flines}")
+    if not parts:
+        ui.ephemeral(chat_id,
+                     "🎬 Could not read the video (no audio track, no frames)",
+                     thread_id=thread_id, seconds=8)
+        return
+    if caption:
+        parts.insert(0, caption)
+    user_text = "\n\n".join(parts)
+    audit.log("user_message",
+              f"[video] {len(shots)} frames, transcript {len(transcript)} chars",
+              sid=session.sid)
+    turnctl.enqueue_user_input(session, user_text, chat_id, msg_id, thread_id)
+
+
 def _handle_update(u):
     global bot_running
 
@@ -733,6 +811,46 @@ def _handle_update(u):
             descr = "[Sticker]"
         audit.log("user_message", descr, sid=session.sid)
         turnctl.enqueue_user_input(session, descr, chat_id, msg_id, thread_id)
+        return
+
+    # Voice / audio messages → transcribe (off the poll thread).
+    voice = msg.get("voice") or msg.get("audio")
+    if voice:
+        if not (session and session.is_bot_spawned and session.alive):
+            tg.send("Send voice in an active session",
+                    chat_id, thread_id=thread_id)
+            return
+        if not stt.available():
+            ui.ephemeral(chat_id,
+                       "🎙 Voice recognition is not configured "
+                       "(run setup.sh to install it)",
+                       thread_id=thread_id, seconds=8)
+            return
+        threading.Thread(
+            target=_handle_voice,
+            args=(session, voice["file_id"], caption, chat_id, msg_id, thread_id),
+            daemon=True,
+        ).start()
+        return
+
+    # Video / video-note → transcribe audio + sample scene frames.
+    video = msg.get("video") or msg.get("video_note")
+    if video:
+        if not (session and session.is_bot_spawned and session.alive):
+            tg.send("Send video in an active session",
+                    chat_id, thread_id=thread_id)
+            return
+        if not frames.available():
+            ui.ephemeral(chat_id,
+                       "🎬 Media recognition is not configured "
+                       "(run setup.sh to install it)",
+                       thread_id=thread_id, seconds=8)
+            return
+        threading.Thread(
+            target=_handle_video,
+            args=(session, video["file_id"], caption, chat_id, msg_id, thread_id),
+            daemon=True,
+        ).start()
         return
 
     if not text:

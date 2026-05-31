@@ -6,6 +6,7 @@
 
 # Python
 .venv/
+.venv-stt/
 __pycache__/
 *.pyc
 *.egg-info/

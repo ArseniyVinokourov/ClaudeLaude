@@ -130,6 +130,31 @@ fi
 .venv/bin/pip install -q -r requirements.txt
 ok "Dependencies installed"
 
+# ── speech-to-text (voice & video input) ─────────────────────────────
+bold "\nSetting up speech-to-text (voice/video messages)..."
+echo "Voice notes and videos are transcribed locally with faster-whisper."
+echo "It lives in a SEPARATE venv (.venv-stt) so the bot's own venv stays"
+echo "light. The model (~460MB for 'small') is downloaded once."
+echo ""
+if [ ! -d .venv-stt ]; then
+    python3 -m venv .venv-stt
+    ok "STT virtual environment created"
+else
+    ok "STT virtual environment exists"
+fi
+.venv-stt/bin/pip install -q --upgrade pip
+# faster-whisper (speech→text) + pillow (saving sampled video frames). PyAV
+# ships with faster-whisper and bundles its own codecs, so NO system ffmpeg
+# is needed — voice and video both decode in-process.
+.venv-stt/bin/pip install -q faster-whisper pillow
+ok "faster-whisper + pillow installed (PyAV bundled — no system ffmpeg needed)"
+# Pre-fetch the model so the first voice/video message isn't slow.
+WHISPER_MODEL="${WHISPER_MODEL:-small}"
+echo "Downloading whisper model '${WHISPER_MODEL}' (one-time)..."
+.venv-stt/bin/python -c "from faster_whisper import WhisperModel; WhisperModel('${WHISPER_MODEL}', device='cpu', compute_type='int8')" \
+    && ok "Model '${WHISPER_MODEL}' ready" \
+    || warn "Model pre-download failed; it will download on first use."
+
 # ── Claude Code hooks ────────────────────────────────────────────────
 bold "\nClaude Code hooks (optional)"
 echo "Hooks let the bot receive notifications and permission requests"

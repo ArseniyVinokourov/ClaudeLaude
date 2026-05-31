@@ -1467,6 +1467,103 @@ def test_media_group_album_combines_into_one_turn(bot, tmp_path, monkeypatch):
     assert len(set(paths)) == 3, paths
 
 
+def test_voice_message_transcribed_into_turn(bot, tmp_path, monkeypatch):
+    """A voice note → transcribed text fed to Claude as one turn."""
+    import telegram as tg_mod
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+
+    monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
+    monkeypatch.setattr(bot.mod.stt, "available", lambda: True)
+    monkeypatch.setattr(bot.mod.stt, "transcribe",
+                        lambda path: {"text": "привет бот как дела",
+                                      "segments": [], "language": "ru"})
+
+    bot.mod._handle_voice(sess, "voice-fid", "", bot.forum_chat_id,
+                          777, sess.topic_id)
+
+    users = [h for h in sess.history if h.kind == "user"]
+    assert len(users) == 1, users
+    assert "привет бот как дела" in users[0].text
+    assert "Voice message transcript" in users[0].text
+
+
+def test_voice_message_unconfigured_is_rejected(bot, tmp_path, monkeypatch):
+    """When STT isn't installed, a voice note gets a polite notice and
+    never starts a Claude turn."""
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    monkeypatch.setattr(bot.mod.stt, "available", lambda: False)
+    bot.tg.reset()
+
+    msg = {
+        "message_id": 6001,
+        "from": {"id": bot.owner_id},
+        "chat": {"id": bot.forum_chat_id, "type": "supergroup"},
+        "date": 1,
+        "message_thread_id": sess.topic_id,
+        "voice": {"file_id": "v1", "duration": 3},
+    }
+    bot.tg.inject_update({"update_id": 7001, "message": msg})
+    _drain_updates(bot)
+
+    assert [h for h in sess.history if h.kind == "user"] == []
+    sends = bot.tg.calls_of("sendMessage")
+    assert any("not configured" in (c.get("text") or "") for c in sends), sends
+
+
+def test_video_transcript_and_frames_in_one_turn(bot, tmp_path, monkeypatch):
+    """A video → ONE turn with the audio transcript (timecoded) AND the
+    sampled scene frames as attachments."""
+    import telegram as tg_mod
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+
+    monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
+    monkeypatch.setattr(bot.mod.stt, "transcribe", lambda path: {
+        "text": "intro then demo",
+        "segments": [{"start": 0.0, "end": 2.0, "text": "intro"},
+                     {"start": 6.0, "end": 8.0, "text": "then demo"}],
+        "language": "en"})
+    monkeypatch.setattr(bot.mod.frames, "extract", lambda v, d: [
+        {"path": "/tmp/f0.jpg", "t": 0.0},
+        {"path": "/tmp/f1.jpg", "t": 6.0}])
+
+    bot.mod._handle_video(sess, "vid-fid", "", bot.forum_chat_id,
+                          888, sess.topic_id)
+
+    users = [h for h in sess.history if h.kind == "user"]
+    assert len(users) == 1, users
+    txt = users[0].text
+    assert "Video transcript" in txt and "then demo" in txt
+    assert txt.count("[Attached file:") == 2, txt
+    assert "[06:00]" not in txt          # seconds, not minutes
+    assert "(t=00:06)" in txt            # frame timecode in M:SS
+
+
+def test_video_unconfigured_is_rejected(bot, tmp_path, monkeypatch):
+    """No STT venv → video gets a notice, no Claude turn."""
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    monkeypatch.setattr(bot.mod.frames, "available", lambda: False)
+    bot.tg.reset()
+
+    msg = {
+        "message_id": 6101,
+        "from": {"id": bot.owner_id},
+        "chat": {"id": bot.forum_chat_id, "type": "supergroup"},
+        "date": 1,
+        "message_thread_id": sess.topic_id,
+        "video": {"file_id": "vid1", "duration": 5},
+    }
+    bot.tg.inject_update({"update_id": 7101, "message": msg})
+    _drain_updates(bot)
+
+    assert [h for h in sess.history if h.kind == "user"] == []
+    sends = bot.tg.calls_of("sendMessage")
+    assert any("not configured" in (c.get("text") or "") for c in sends), sends
+
+
 # ── copyMessages backfill on /fork (Batch A #14) ─────────────────────
 
 def test_fork_backfills_recent_messages(bot, tmp_path):
