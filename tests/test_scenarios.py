@@ -1407,6 +1407,163 @@ def test_single_image_uses_send_photo(bot, tmp_path, monkeypatch):
     assert photo_calls == [str(p)], photo_calls
 
 
+def test_media_group_album_combines_into_one_turn(bot, tmp_path, monkeypatch):
+    """An incoming album (N messages sharing media_group_id) → ONE Claude
+    turn whose prompt carries every attachment path, not N separate turns."""
+    import os
+    import telegram as tg_mod
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    tid = sess.topic_id
+
+    # Fake the TG download: create the dest file, report success.
+    def _fake_dl(file_id, dest):
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "wb") as f:
+            f.write(b"img")
+        return True
+    monkeypatch.setattr(tg_mod, "download_file", _fake_dl)
+
+    gid = "album-1"
+
+    def _album_part(file_id, n, caption=None):
+        msg = {
+            "message_id": 5000 + n,
+            "from": {"id": bot.owner_id},
+            "chat": {"id": bot.forum_chat_id, "type": "supergroup"},
+            "date": int(time.time()),
+            "message_thread_id": tid,
+            "photo": [{"file_id": file_id}],
+            "media_group_id": gid,
+        }
+        if caption:
+            msg["caption"] = caption
+        return {"update_id": 9000 + n, "message": msg}
+
+    bot.tg.inject_update(_album_part("f1", 1, caption="my album"))
+    bot.tg.inject_update(_album_part("f2", 2))
+    bot.tg.inject_update(_album_part("f3", 3))
+    _drain_updates(bot)
+
+    # Parts are buffered, NOT yet turned into a turn (no premature send).
+    assert [h for h in sess.history if h.kind == "user"] == []
+
+    # Cancel the real flush timer and flush deterministically.
+    with bot.mod._media_group_lock:
+        grp = bot.mod._media_groups.get(gid)
+        assert grp is not None and len(grp["items"]) == 3
+        grp["timer"].cancel()
+    bot.mod._flush_media_group(gid)
+
+    users = [h for h in sess.history if h.kind == "user"]
+    assert len(users) == 1, users
+    combined = users[0].text
+    assert combined.count("[Attached file:") == 3, combined
+    assert "my album" in combined
+    # Each part must land at a DISTINCT path — a shared timestamp+filename
+    # would collide and overwrite, leaving Claude 3 copies of one image.
+    import re as _re
+    paths = _re.findall(r"\[Attached file: (.+?)\]", combined)
+    assert len(set(paths)) == 3, paths
+
+
+def test_voice_message_transcribed_into_turn(bot, tmp_path, monkeypatch):
+    """A voice note → transcribed text fed to Claude as one turn."""
+    import telegram as tg_mod
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+
+    monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
+    monkeypatch.setattr(bot.mod.stt, "available", lambda: True)
+    monkeypatch.setattr(bot.mod.stt, "transcribe",
+                        lambda path: {"text": "привет бот как дела",
+                                      "segments": [], "language": "ru"})
+
+    bot.mod._handle_voice(sess, "voice-fid", "", bot.forum_chat_id,
+                          777, sess.topic_id)
+
+    users = [h for h in sess.history if h.kind == "user"]
+    assert len(users) == 1, users
+    assert "привет бот как дела" in users[0].text
+    assert "Voice message transcript" in users[0].text
+
+
+def test_voice_message_unconfigured_is_rejected(bot, tmp_path, monkeypatch):
+    """When STT isn't installed, a voice note gets a polite notice and
+    never starts a Claude turn."""
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    monkeypatch.setattr(bot.mod.stt, "available", lambda: False)
+    bot.tg.reset()
+
+    msg = {
+        "message_id": 6001,
+        "from": {"id": bot.owner_id},
+        "chat": {"id": bot.forum_chat_id, "type": "supergroup"},
+        "date": 1,
+        "message_thread_id": sess.topic_id,
+        "voice": {"file_id": "v1", "duration": 3},
+    }
+    bot.tg.inject_update({"update_id": 7001, "message": msg})
+    _drain_updates(bot)
+
+    assert [h for h in sess.history if h.kind == "user"] == []
+    sends = bot.tg.calls_of("sendMessage")
+    assert any("not configured" in (c.get("text") or "") for c in sends), sends
+
+
+def test_video_transcript_and_frames_in_one_turn(bot, tmp_path, monkeypatch):
+    """A video → ONE turn with the audio transcript (timecoded) AND the
+    sampled scene frames as attachments."""
+    import telegram as tg_mod
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+
+    monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
+    monkeypatch.setattr(bot.mod.stt, "transcribe", lambda path: {
+        "text": "intro then demo",
+        "segments": [{"start": 0.0, "end": 2.0, "text": "intro"},
+                     {"start": 6.0, "end": 8.0, "text": "then demo"}],
+        "language": "en"})
+    monkeypatch.setattr(bot.mod.frames, "extract", lambda v, d: [
+        {"path": "/tmp/f0.jpg", "t": 0.0},
+        {"path": "/tmp/f1.jpg", "t": 6.0}])
+
+    bot.mod._handle_video(sess, "vid-fid", "", bot.forum_chat_id,
+                          888, sess.topic_id)
+
+    users = [h for h in sess.history if h.kind == "user"]
+    assert len(users) == 1, users
+    txt = users[0].text
+    assert "Video transcript" in txt and "then demo" in txt
+    assert txt.count("[Attached file:") == 2, txt
+    assert "[06:00]" not in txt          # seconds, not minutes
+    assert "(t=00:06)" in txt            # frame timecode in M:SS
+
+
+def test_video_unconfigured_is_rejected(bot, tmp_path, monkeypatch):
+    """No STT venv → video gets a notice, no Claude turn."""
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    monkeypatch.setattr(bot.mod.frames, "available", lambda: False)
+    bot.tg.reset()
+
+    msg = {
+        "message_id": 6101,
+        "from": {"id": bot.owner_id},
+        "chat": {"id": bot.forum_chat_id, "type": "supergroup"},
+        "date": 1,
+        "message_thread_id": sess.topic_id,
+        "video": {"file_id": "vid1", "duration": 5},
+    }
+    bot.tg.inject_update({"update_id": 7101, "message": msg})
+    _drain_updates(bot)
+
+    assert [h for h in sess.history if h.kind == "user"] == []
+    sends = bot.tg.calls_of("sendMessage")
+    assert any("not configured" in (c.get("text") or "") for c in sends), sends
+
+
 # ── copyMessages backfill on /fork (Batch A #14) ─────────────────────
 
 def test_fork_backfills_recent_messages(bot, tmp_path):
