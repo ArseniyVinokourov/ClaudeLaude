@@ -26,7 +26,8 @@ import telegram as tg
 from botui import CLOSE_ROW
 from config import (HOOK_PORT, get_forum_chat_id,
                     set_forum_chat_id)
-from formatting import _format_age, _short_cwd, _strip_md
+from formatting import (_format_age, _short_cwd, _strip_md,
+                        topic_control_rows)
 from session_discovery import (_discover_projects, _live_claude_session_ids,
                                _resolve_session_cwd, _session_last_active)
 from sessions import MODE_PRESETS
@@ -298,7 +299,7 @@ class Commands:
             self.state.topic_labels[topic_id] = label
         s = self.mgr.resume(claude_session_id, topic_id, name, cwd)
         s.topic_label = label
-        self.ui.send_to_topic(topic_id, f"▶️ <code>{tg.esc(cwd)}</code>")
+        self.lifecycle.attach_controls(s)
         url = self.ui.topic_url(topic_id)
         if url:
             self.ui.ephemeral(fid, f"▶ {name}",
@@ -424,6 +425,9 @@ class Commands:
         with self.state.lock:
             self.state.topic_display_mode[thread_id] = mode
         icon = "\U0001f4f1" if mode == "mobile" else "\U0001f5a5"
+        session = self.mgr.by_topic(thread_id)
+        if session:
+            self.render_topic_controls(session)
         tg.send(f"{icon} Display: <b>{mode}</b>", chat_id, thread_id=thread_id)
 
     def cmd_stop(self, session, chat_id, thread_id):
@@ -448,6 +452,7 @@ class Commands:
                 self.state.topic_labels[session.topic_id] = stop_label
             session.topic_label = stop_label
             tg.close_forum_topic(fid, session.topic_id)
+        self.render_topic_controls(session)
         tg.send("⏹ Stopped", chat_id, thread_id=thread_id)
 
     def cmd_interrupt(self, session, chat_id, thread_id):
@@ -510,6 +515,7 @@ class Commands:
                 with self.state.lock:
                     self.state.topic_labels[session.topic_id] = session.name
                 session.topic_label = session.name
+            self.render_topic_controls(session)
             tg.send("▶️ Restarted", chat_id,
                     thread_id=thread_id)
         else:
@@ -660,6 +666,45 @@ class Commands:
             self.ui.ephemeral(chat_id, _HELP_TEXT, seconds=_PICKER_TTL)
         else:
             tg.send(_HELP_TEXT, chat_id, thread_id=thread_id)
+
+    # ── per-topic control panel (pinned opening message) ─────────────
+
+    def render_topic_controls(self, session):
+        """Repaint the pinned control panel after a state change.
+
+        Stop/restart flips the button set (alive ↔ Restart); display/mode
+        only changes a label. Text stays the cwd banner so the pin reads
+        the same. `editMessageText` drops the keyboard unless reply_markup
+        is re-passed, so the rows go on every edit (tg-edit-buttons).
+        """
+        if not session or not session.controls_msg_id:
+            return
+        fid = get_forum_chat_id()
+        if not fid:
+            return
+        with self.state.lock:
+            display = self.state.topic_display_mode.get(
+                session.topic_id, self._default_display)
+        rows = topic_control_rows(session.alive, display)
+        try:
+            tg.edit(session.controls_msg_id,
+                    f"▶️ <code>{tg.esc(session.cwd)}</code>",
+                    fid, buttons=rows)
+        except Exception as e:
+            print(f"[controls] repaint failed: {e}", file=sys.stderr, flush=True)
+
+    def show_mode_picker(self, session, chat_id):
+        """Expand the control panel into a mode-preset picker in place."""
+        if not session or not session.controls_msg_id:
+            return
+        rows = []
+        for key, preset in MODE_PRESETS.items():
+            marker = "• " if key == session.mode else ""
+            rows.append([{"text": f"{marker}{key} — {preset['label']}",
+                          "callback_data": f"m:mode:{key}"}])
+        rows.append([{"text": "↩ Back", "callback_data": "m:controls"}])
+        tg.edit(session.controls_msg_id, "🎯 <b>Choose mode:</b>",
+                chat_id, buttons=rows)
 
     def cmd_menu(self, chat_id, thread_id=None, session=None):
         rows = [

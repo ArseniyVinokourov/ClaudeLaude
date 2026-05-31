@@ -205,11 +205,11 @@ class Dashboard:
                 set_dashboard_id(None)
                 set_pinned_help_id(None)
         if old_id:
+            # Deleting the previous dashboard message also drops its pin, so
+            # the fresh pin below becomes General's only pin. Do NOT use
+            # unpinAllChatMessages here — it is chat-wide and would wipe every
+            # session topic's pinned control panel too (#85).
             tg.delete(old_id, fid)
-        try:
-            tg._req("unpinAllChatMessages", {"chat_id": fid})
-        except Exception:
-            pass
         msg_id = tg.send(text, fid, buttons=_MENU_ROWS)
         if msg_id:
             tg.pin(msg_id, fid)

@@ -423,7 +423,9 @@ def _device_monitor_loop():
                 audit.log("device_alert",
                           f"{d.get('device_model', '?')} "
                           f"{d.get('country', '?')} {ip_masked}")
-                tg.send(text, fid, buttons=buttons)
+                # Security alert — persists in General until the user acts
+                # (Trust self-deletes after 5s; Kill leaves a "killed" notice).
+                ui.send_general(text, buttons=buttons, persist=True)
         except Exception as e:
             print(f"[device_monitor] error: {e}",
                   file=sys.stderr, flush=True)
@@ -669,6 +671,19 @@ def _handle_video(session, file_id, caption, chat_id, msg_id, thread_id):
     turnctl.enqueue_user_input(session, user_text, chat_id, msg_id, thread_id)
 
 
+def _reject_no_session(chat_id, thread_id, what):
+    """Notice for media/stickers dropped without an active bot session.
+
+    In a session topic it persists; in General it self-cleans so the chat
+    stays tidy (General must stay clean — only the pinned dashboard stays).
+    """
+    text = f"Send {what} in an active session"
+    if thread_id:
+        tg.send(text, chat_id, thread_id=thread_id)
+    else:
+        ui.ephemeral(chat_id, text, seconds=6)
+
+
 def _handle_update(u):
     global bot_running
 
@@ -768,8 +783,7 @@ def _handle_update(u):
     document = msg.get("document")
     if photos or document:
         if not (session and session.is_bot_spawned and session.alive):
-            tg.send("Send files in an active session",
-                    chat_id, thread_id=thread_id)
+            _reject_no_session(chat_id, thread_id, "files")
             return
         file_id = photos[-1]["file_id"] if photos else document["file_id"]
         filename = ("photo.jpg" if photos
@@ -798,8 +812,7 @@ def _handle_update(u):
     sticker = msg.get("sticker")
     if sticker:
         if not (session and session.is_bot_spawned and session.alive):
-            tg.send("Send stickers in an active session",
-                    chat_id, thread_id=thread_id)
+            _reject_no_session(chat_id, thread_id, "stickers")
             return
         emoji = sticker.get("emoji") or ""
         set_name = sticker.get("set_name") or ""
@@ -817,8 +830,7 @@ def _handle_update(u):
     voice = msg.get("voice") or msg.get("audio")
     if voice:
         if not (session and session.is_bot_spawned and session.alive):
-            tg.send("Send voice in an active session",
-                    chat_id, thread_id=thread_id)
+            _reject_no_session(chat_id, thread_id, "voice")
             return
         if not stt.available():
             ui.ephemeral(chat_id,
@@ -837,8 +849,7 @@ def _handle_update(u):
     video = msg.get("video") or msg.get("video_note")
     if video:
         if not (session and session.is_bot_spawned and session.alive):
-            tg.send("Send video in an active session",
-                    chat_id, thread_id=thread_id)
+            _reject_no_session(chat_id, thread_id, "video")
             return
         if not frames.available():
             ui.ephemeral(chat_id,
@@ -1082,8 +1093,9 @@ def _handle_callback(cb, data):
                     session = mgr.fork(parent, topic_id, parent.name)
                     if session:
                         session.topic_label = label
-                        ui.send_to_topic(topic_id,
-                                      f"\U0001f500 Fork of <b>{tg.esc(parent.name)}</b>")
+                        lifecycle.attach_controls(
+                            session,
+                            text=f"\U0001f500 Fork of <b>{tg.esc(parent.name)}</b>")
                         # Copy the last few messages from the parent topic
                         # so the fork doesn't open empty — the user sees
                         # the point they branched from.
@@ -1225,7 +1237,14 @@ def _handle_callback(cb, data):
         action = data[2:]
         session = mgr.by_topic(cb_thread) if cb_thread else None
         # Don't delete the source message — it may be the dashboard pin
-        if action == "new":
+        if action == "mode" and session:
+            commands.show_mode_picker(session, cb_chat)
+        elif action == "controls" and session:
+            commands.render_topic_controls(session)
+        elif action.startswith("mode:") and session:
+            mgr.set_mode(session.sid, action.split(":", 1)[1])
+            commands.render_topic_controls(session)
+        elif action == "new":
             commands.cmd_new("", chat_id=cb_chat, thread_id=cb_thread)
         elif action == "sessions":
             commands.cmd_sessions(cb_chat, cb_thread)

@@ -176,12 +176,18 @@ class TurnController:
         turn._last_status_text = text
 
     def _finish_status(self, session, turn: TurnState):
-        """Remove status message (timer thread keeps running)."""
+        """Remove status message (timer thread keeps running).
+
+        P1, not the default P3: this is part of the live turn UX (the
+        "⏳ Думаю…" indicator must vanish the moment the reply lands), so the
+        throughput budget must not drop it the way it can a housekeeping
+        delete.
+        """
         fid = get_forum_chat_id()
         if not fid:
             return
         if turn.status_msg_id:
-            tg.delete(turn.status_msg_id, fid)
+            tg.delete(turn.status_msg_id, fid, prio=tg.P1)
             turn.status_msg_id = None
 
     def end_turn(self, turn: TurnState):
@@ -205,7 +211,7 @@ class TurnController:
                     pass
                 self.ui.delete_after(mid, fid, 3)
             else:
-                tg.delete(mid, fid)
+                tg.delete(mid, fid, prio=tg.P1)
             turn.status_msg_id = None
         self._react_for_turn(turn, "completed")
 
@@ -321,17 +327,17 @@ class TurnController:
             text = _md_table_to_list(text)
         fid = get_forum_chat_id()
         if fid:
+            # Drop the "⏳ Думаю…"/⚙️ status right before the reply lands so
+            # the working indicator never sits next to the finished answer.
+            # If more work follows (a tool after this text), on_tool_use
+            # recreates the status; end_turn is the final fallback.
+            self._finish_status(session, turn)
             ids = tg.send_long(text, fid, thread_id=session.topic_id,
                                markdown=True)
             turn.msg_ids.extend(ids)
             turn.msg_texts.append(text)
             for mid in ids:
                 self._record_topic_msg(session.topic_id, mid)
-            # The status message keeps its position in the chronology — we
-            # used to delete-and-resend on every assistant text (2 budget
-            # units per chunk) just to keep it visually at the bottom. With
-            # the budget tight, the status stays put; users glance at it
-            # in place. End-of-turn cleanup is handled by end_turn.
 
     def on_result(self, session, result_text, summary):
         if not session.topic_id:

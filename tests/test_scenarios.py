@@ -360,7 +360,8 @@ def test_hook_routing_skips_bot_session_by_cwd(bot, tmp_path):
     """Regression for project_bot_cwd_routing_bug.md: a hook from the
     terminal must NOT route into a bot-spawned session that happens to
     share its cwd. Bot session at /a + terminal hook with cwd /a should
-    create a NEW (terminal) topic, not steal the bot session.
+    resolve to nothing (so the caller routes to the terminal aggregator),
+    never steal the bot session.
     """
     bot_cwd = tmp_path / "shared"
     bot_cwd.mkdir()
@@ -379,16 +380,48 @@ def test_hook_routing_skips_bot_session_by_cwd(bot, tmp_path):
         "terminal-claude-id",
         {"cwd": str(bot_cwd)},
     )
-    assert resolved is not None
-    assert resolved.sid != bot_session.sid, \
+    assert resolved is None, \
         "terminal hook stole the bot session — cwd routing bug regressed"
-    assert resolved.is_bot_spawned is False
     # Bot session is intact.
-    assert bot.mod.mgr.by_cwd(str(bot_cwd)).sid == bot_session.sid \
-        or bot.mod.mgr._sessions[bot_session.sid].alive
+    assert bot.mod.mgr.by_cwd(str(bot_cwd)).sid == bot_session.sid
+    assert bot.mod.mgr._sessions[bot_session.sid].alive
 
 
 # ── 9. /stop then /restart ──────────────────────────────────────────
+
+def test_topic_controls_pinned_and_flip_on_stop(bot, tmp_path):
+    """#85: a spawned session's opening message carries the control panel,
+    is pinned, and flips Stop→Restart when the session stops."""
+    cwd = tmp_path / "ctrlproj"
+    cwd.mkdir(exist_ok=True)
+    bot.tg.inject_update(text_update(
+        f"/new {cwd}",
+        owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
+    ))
+    _drain_updates(bot)
+    sess = bot.mod.mgr.by_cwd(str(cwd))
+    assert sess.controls_msg_id is not None
+    assert sess.controls_msg_id in bot.tg.pinned_messages
+
+    # Opening message sent with the alive control set (Stop present).
+    opening = next(p for p in bot.tg.calls_of("sendMessage")
+                   if p.get("message_thread_id") == sess.topic_id
+                   and "▶️" in p.get("text", ""))
+    markup = str(opening.get("reply_markup", {}))
+    assert "m:stop" in markup and "m:mode" in markup
+    assert "m:restart" not in markup
+
+    # Stop → control panel repainted to the stopped (Restart) set.
+    bot.tg.inject_update(text_update(
+        "/stop", owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
+        thread_id=sess.topic_id,
+    ))
+    _drain_updates(bot)
+    repaint = [p for p in bot.tg.calls_of("editMessageText")
+               if p.get("message_id") == sess.controls_msg_id]
+    assert repaint, "control panel was not repainted on stop"
+    assert "m:restart" in str(repaint[-1].get("reply_markup", {}))
+
 
 def test_stop_then_restart(bot, tmp_path):
     cwd = tmp_path / "demo"
@@ -878,6 +911,57 @@ def test_terminal_watcher_offset_init(bot, tmp_path, monkeypatch):
         assert csid in bot.mod.state.pending_terminal_msgs
 
 
+# ── #81 terminal aggregator topic ───────────────────────────────────
+
+def test_terminal_notification_routes_to_aggregator(bot, tmp_path):
+    """Terminal-session notifications land in one shared 'Terminals' topic,
+    tagged with the project, instead of spawning a per-cwd topic. A second
+    event from another project reuses the same topic."""
+    from config import get_terminal_topic_id
+
+    n_before = len(bot.tg.calls_of("createForumTopic"))
+    bot.mod.hooks.on_hook_notification(
+        "Claude needs your input", "agg-csid-1",
+        {"cwd": "/home/me/alphaproj"})
+    tid = get_terminal_topic_id()
+    assert tid is not None
+    assert len(bot.tg.calls_of("createForumTopic")) == n_before + 1
+    assert any("[alphaproj]" in m["text"]
+               for m in bot.tg.messages_in_topic(tid))
+
+    # Second notification from a different project reuses the same topic.
+    bot.mod.hooks.on_hook_notification(
+        "Another wait", "agg-csid-2", {"cwd": "/srv/betaproj"})
+    assert get_terminal_topic_id() == tid
+    assert len(bot.tg.calls_of("createForumTopic")) == n_before + 1
+    assert any("[betaproj]" in m["text"]
+               for m in bot.tg.messages_in_topic(tid))
+
+
+def test_terminal_permission_routes_to_aggregator(bot, tmp_path):
+    """A terminal permission request lands in the aggregator topic with the
+    project tag and Allow/Deny buttons, and is tracked for watcher cleanup."""
+    from config import get_terminal_topic_id
+
+    bot.mod.hooks.on_hook_permission("req-agg-perm", {
+        "session_id": "agg-perm-csid",
+        "cwd": "/work/gammaproj",
+        "tool_name": "Bash",
+        "tool_input": {"command": "ls -la"},
+    })
+    tid = get_terminal_topic_id()
+    assert tid is not None
+    hits = [p for p in bot.tg.calls_of("sendMessage")
+            if p.get("message_thread_id") == tid
+            and "[gammaproj]" in p.get("text", "")
+            and "ls -la" in p.get("text", "")]
+    assert hits, "permission must land in aggregator topic, project-tagged"
+    markup = str(hits[0].get("reply_markup", {}))
+    assert "✅ Allow" in markup and "❌ Deny" in markup
+    with bot.mod.state.lock:
+        assert "agg-perm-csid" in bot.mod.state.pending_terminal_msgs
+
+
 # ── session-quality: context injection + /mode ──────────────────────
 
 def _start_bot_session(bot, tmp_path, name="demo"):
@@ -1167,6 +1251,23 @@ def test_status_text_is_time_free(bot):
     assert "⚙" in text and "ls" in text
     assert ":" not in text  # no "0:05"-style timer
     assert "—" not in text  # no separator that used to precede seconds
+
+
+def test_status_cleared_when_reply_sent(bot, tmp_path):
+    """The '⏳ Думаю…' status must be removed the moment the assistant reply
+    is sent, not linger next to the finished answer."""
+    _start_bot_session(bot, tmp_path)
+    session = next(iter(bot.mod.mgr._sessions.values()))
+    turn = bot.mod.turnctl._get_turn(session)
+    turn.status_msg_id = 7777
+    bot.tg.reset()
+    bot.mod.turnctl.on_assistant(session, "Привет! Чем помочь")
+    assert 7777 in bot.tg.deleted_messages, \
+        "thinking status must be deleted when the reply is sent"
+    assert turn.status_msg_id is None
+    sends = [c for c in bot.tg.calls_of("sendMessage")
+             if c.get("message_thread_id") == session.topic_id]
+    assert any("Чем помочь" in (c.get("text") or "") for c in sends)
 
 
 # ── tool_use parsing: Claude Code 2.1.143 nested-content format ──────
@@ -1564,6 +1665,77 @@ def test_video_unconfigured_is_rejected(bot, tmp_path, monkeypatch):
     assert any("not configured" in (c.get("text") or "") for c in sends), sends
 
 
+def test_general_media_rejection_is_ephemeral(bot, tmp_path, monkeypatch):
+    """Media dropped in General without an active session → the 'Send X in an
+    active session' notice self-cleans (ephemeral). The same in a topic
+    persists. Keeps General free of leftover rejection notices."""
+    scheduled = []
+    monkeypatch.setattr(
+        bot.mod.ui, "delete_after",
+        lambda mid, chat_id, secs, **kw: scheduled.append((mid, secs)))
+
+    # 1) Video in General (no thread) with no session → ephemeral rejection.
+    bot.tg.reset()
+    bot.tg.inject_update({"update_id": 9301, "message": {
+        "message_id": 9300,
+        "from": {"id": bot.owner_id},
+        "chat": {"id": bot.forum_chat_id, "type": "supergroup"},
+        "date": 1,
+        "video": {"file_id": "gvid", "duration": 2},
+    }})
+    _drain_updates(bot)
+    rej = [c for c in bot.tg.calls_of("sendMessage")
+           if "active session" in (c.get("text") or "")]
+    assert rej, "expected a rejection notice in General"
+    assert rej[0].get("message_thread_id") is None
+    assert scheduled, "General rejection must be scheduled for auto-delete"
+
+    # 2) Same video in a (stopped) session topic → rejection persists.
+    cwd = tmp_path / "vidtopic"
+    cwd.mkdir()
+    bot.tg.inject_update(text_update(
+        f"/new {cwd}", owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id))
+    _drain_updates(bot)
+    sess = bot.mod.mgr.by_cwd(str(cwd))
+    bot.mod.mgr.stop(sess.sid)
+    scheduled.clear()
+    bot.tg.reset()
+    bot.tg.inject_update({"update_id": 9303, "message": {
+        "message_id": 9302,
+        "from": {"id": bot.owner_id},
+        "chat": {"id": bot.forum_chat_id, "type": "supergroup"},
+        "date": 1,
+        "message_thread_id": sess.topic_id,
+        "video": {"file_id": "tvid", "duration": 2},
+    }})
+    _drain_updates(bot)
+    rej2 = [c for c in bot.tg.calls_of("sendMessage")
+            if "active session" in (c.get("text") or "")]
+    assert rej2 and rej2[0].get("message_thread_id") == sess.topic_id
+    assert not scheduled, "topic rejection must NOT be auto-deleted"
+
+
+def test_send_general_transient_by_default(bot, monkeypatch):
+    """The generic General channel self-cleans: any notice that isn't a
+    security alert (persist=True) or the pin is scheduled for deletion, so
+    uncategorized messages never accumulate in General."""
+    scheduled = []
+    monkeypatch.setattr(
+        bot.mod.ui, "delete_after",
+        lambda mid, chat_id, secs, **kw: scheduled.append((mid, secs)))
+
+    bot.tg.reset()
+    mid1 = bot.mod.ui.send_general("a stray uncategorized notice")
+    assert mid1 is not None
+    assert any(m == mid1 for m, _ in scheduled), \
+        "generic General notice must be scheduled for auto-delete"
+
+    scheduled.clear()
+    mid2 = bot.mod.ui.send_general("⚠️ New TG session detected", persist=True)
+    assert mid2 is not None
+    assert not scheduled, "security alert (persist=True) must NOT auto-delete"
+
+
 # ── copyMessages backfill on /fork (Batch A #14) ─────────────────────
 
 def test_fork_backfills_recent_messages(bot, tmp_path):
@@ -1616,6 +1788,15 @@ def test_fork_backfills_recent_messages(bot, tmp_path):
     sent = list(last["message_ids"])
     assert sent, last
     assert all(mid in recent for mid in sent), (sent, recent)
+
+    # The fork's opening "Fork of …" message carries the pinned control panel.
+    fork_sess = bot.mod.mgr.by_topic(new_topic)
+    assert fork_sess and fork_sess.controls_msg_id is not None
+    assert fork_sess.controls_msg_id in bot.tg.pinned_messages
+    opening = next(p for p in bot.tg.calls_of("sendMessage")
+                   if p.get("message_thread_id") == new_topic
+                   and "Fork of" in (p.get("text") or ""))
+    assert "m:stop" in str(opening.get("reply_markup", {}))
 
 
 # ── my_chat_member + admin sanity (Batch A #16) ──────────────────────
