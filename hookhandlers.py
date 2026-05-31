@@ -19,13 +19,12 @@ import json
 import os
 import sys
 import time
-import uuid
 
 import telegram as tg
-from config import OWNER_ID, get_forum_chat_id
+from config import (OWNER_ID, get_forum_chat_id, get_terminal_topic_id,
+                    set_terminal_topic_id)
 from formatting import _normalize_tool_input
 from session_discovery import _session_jsonl_path
-from sessions import Session
 
 
 class HookHandlers:
@@ -45,28 +44,89 @@ class HookHandlers:
 
     def on_hook_notification(self, text, claude_session_id, data=None):
         try:
+            data = data or {}
             session = (self.mgr.by_claude_session_id(claude_session_id)
                        if claude_session_id else None)
-            if not (session and session.topic_id):
-                self._resolve_hook_session(claude_session_id, data or {})
-                session = (self.mgr.by_claude_session_id(claude_session_id)
-                           if claude_session_id else None)
+            if not session:
+                session = self._resolve_hook_session(claude_session_id, data)
 
-            if session and session.topic_id:
-                mid = self.ui.send_to_topic(session.topic_id,
-                                            f"\U0001f514 {tg.esc(text)}")
-                if mid and claude_session_id and not session.is_bot_spawned:
-                    self._track_terminal_msg(claude_session_id, mid,
-                                             get_forum_chat_id(), "notification")
-            else:
+            if session and session.is_bot_spawned and session.topic_id:
+                self.ui.send_to_topic(session.topic_id, f"\U0001f514 {tg.esc(text)}")
+                return
+
+            # Terminal / unknown session → shared aggregator topic, tagged
+            # with the project so several terminals don't blur together.
+            proj = self._proj_label(data)
+            mid, tid = self._send_terminal(
+                f"\U0001f514 <b>[{tg.esc(proj)}]</b> {tg.esc(text)}")
+            if mid and claude_session_id:
+                self._track_terminal_msg(claude_session_id, mid,
+                                         get_forum_chat_id(), "notification")
+            elif mid is None:
                 tg.send(f"\U0001f514 {tg.esc(text)}", OWNER_ID)
         except Exception as e:
             print(f"hook notification error: {e}", file=sys.stderr, flush=True)
 
-    def _resolve_hook_session(self, claude_session_id, data):
-        _log = lambda m: print(f"[resolve] {m}", file=sys.stderr, flush=True)
-        _log(f"keys={list(data.keys())} sid={claude_session_id!r}")
+    def _proj_label(self, data) -> str:
+        cwd = data.get("cwd", "")
+        return os.path.basename(cwd.rstrip("/")) if cwd else "terminal"
 
+    def _terminal_topic(self) -> int | None:
+        """Persistent aggregator topic for terminal-session events.
+
+        Created lazily on the first terminal notification/permission and
+        reused forever (id persisted in .state.json). Replaces the old
+        per-cwd "terminal — HH:MM" topics that cluttered the forum.
+        """
+        tid = get_terminal_topic_id()
+        if tid:
+            return tid
+        fid = get_forum_chat_id()
+        if not fid:
+            return None
+        try:
+            tid = tg.create_forum_topic(
+                fid, "Terminals", icon_color=0x6FB9F0,
+                icon_custom_emoji_id=self._icon_terminal)
+        except Exception as e:
+            print(f"[terminal] create topic failed: {e}",
+                  file=sys.stderr, flush=True)
+            return None
+        if not tid:
+            return None
+        set_terminal_topic_id(tid)
+        with self.state.lock:
+            self.state.topic_labels[tid] = "Terminals"
+        return tid
+
+    def _send_terminal(self, text, buttons=None):
+        """Send into the aggregator topic; recreate it once if it was deleted.
+
+        Returns (msg_id, topic_id) — msg_id is None if the forum or topic
+        could not be reached even after one recreate attempt.
+        """
+        fid = get_forum_chat_id()
+        tid = self._terminal_topic()
+        if not fid or not tid:
+            return None, None
+        mid = tg.send(text, fid, thread_id=tid, buttons=buttons)
+        if mid is None:
+            set_terminal_topic_id(None)
+            tid = self._terminal_topic()
+            if tid:
+                mid = tg.send(text, fid, thread_id=tid, buttons=buttons)
+        return mid, tid
+
+    def _resolve_hook_session(self, claude_session_id, data):
+        """Find an existing *bot-spawned* session for this hook, or None.
+
+        Terminal sessions no longer get their own topic — they route to the
+        shared aggregator — so this never creates anything. A terminal hook
+        that happens to share a cwd with a bot session must not steal it
+        (project_bot_cwd_routing_bug.md), so bot sessions matched by cwd are
+        skipped here.
+        """
+        _log = lambda m: print(f"[resolve] {m}", file=sys.stderr, flush=True)
         if claude_session_id:
             session = self.mgr.by_claude_session_id(claude_session_id)
             if session and session.topic_id:
@@ -77,63 +137,12 @@ class HookHandlers:
         if cwd:
             existing = self.mgr.by_cwd(cwd)
             if existing and existing.topic_id and not existing.is_bot_spawned:
-                _log(f"found by cwd → topic {existing.topic_id}")
                 if claude_session_id:
                     self.mgr.link_claude_id(claude_session_id, existing)
                 return existing
             if existing and existing.is_bot_spawned:
                 _log(f"skipping bot-spawned session for cwd={cwd}")
-
-        # DoS guard: with neither a session_id nor a cwd we have nothing to
-        # anchor a topic to — refuse rather than spawning a "terminal — HH:MM"
-        # topic for every malformed POST that slipped past hooks.py.
-        if not claude_session_id and not cwd:
-            _log("refuse: no session_id and no cwd, not creating topic")
-            return None
-
-        fid = get_forum_chat_id()
-        if not fid:
-            _log("no forum chat configured")
-            return None
-
-        dirname = os.path.basename(cwd) if cwd else "terminal"
-        with self.state.lock:
-            self.state.topic_counter[dirname] = (
-                self.state.topic_counter.get(dirname, 0) + 1)
-            n = self.state.topic_counter[dirname]
-        ts = time.strftime("%H:%M")
-        label = (f"{dirname} #{n} — {ts}" if n > 1
-                 else f"{dirname} — {ts}")
-        try:
-            topic_id = tg.create_forum_topic(fid, label, icon_color=0x6FB9F0,
-                                             icon_custom_emoji_id=self._icon_terminal)
-            _log(f"created topic {topic_id}")
-        except Exception as e:
-            _log(f"create_forum_topic FAILED: {e}")
-            return None
-        if not topic_id:
-            _log("create_forum_topic returned None")
-            return None
-        with self.state.lock:
-            self.state.topic_labels[topic_id] = label
-        if claude_session_id:
-            s = self.mgr.register_terminal(claude_session_id, topic_id, cwd=cwd)
-            s.topic_label = label
-            self.mgr._persist()
-            return s
-        _log(f"registered topic {topic_id} (no claude session_id)")
-        sid = uuid.uuid4().hex[:8]
-        session = Session(
-            sid=sid, topic_id=topic_id, cwd=cwd,
-            name=dirname, is_bot_spawned=False,
-            topic_label=label,
-        )
-        self.mgr._sessions[sid] = session
-        self.mgr._topic_map[topic_id] = sid
-        if cwd:
-            self.mgr._cwd_map[cwd] = sid
-        self.mgr._persist()
-        return session
+        return None
 
     def on_hook_permission(self, req_id, data):
         try:
@@ -171,6 +180,7 @@ class HookHandlers:
                 {"text": "❌ Deny", "callback_data": f"p:{short_id}:d"},
             ]]
 
+            terminal_csid = None
             if mirror:
                 topic_id = mirror.topic_id
                 chat_id = get_forum_chat_id()
@@ -180,25 +190,29 @@ class HookHandlers:
                 # filtered from mirror projection (avoids duplicate signal
                 # of "permission asked + tool ran" both projected).
                 mirror.pending_perm_tool = (tool, _normalize_tool_input(tool, ti))
-            else:
+            elif session and session.is_bot_spawned \
+                    and self.lifecycle.valid_topic_id(session):
                 topic_id = self.lifecycle.valid_topic_id(session)
-                msg_id = None
-                chat_id = None
-                if topic_id:
-                    chat_id = get_forum_chat_id()
-                    msg_id = tg.send(body, chat_id, thread_id=topic_id,
-                                     buttons=buttons)
-
-                if msg_id is None and session and topic_id:
-                    print(f"[resolve] stale topic {topic_id}, recreating",
+                chat_id = get_forum_chat_id()
+                msg_id = tg.send(body, chat_id, thread_id=topic_id,
+                                 buttons=buttons)
+                if msg_id is None:
+                    # Bot session's topic was deleted — let it die; the DM
+                    # fallback below still lets the owner decide.
+                    print(f"[resolve] stale topic {topic_id}, invalidating",
                           file=sys.stderr, flush=True)
                     self.lifecycle.invalidate_and_stop(session, "topic gone")
-                    session = self._resolve_hook_session(claude_session_id, data)
-                    topic_id = self.lifecycle.valid_topic_id(session)
-                    if topic_id:
-                        chat_id = get_forum_chat_id()
-                        msg_id = tg.send(body, chat_id, thread_id=topic_id,
-                                         buttons=buttons)
+                    session = None
+                    topic_id = None
+            else:
+                # Terminal / unknown session → aggregator topic, tagged with
+                # the project. The watcher cleans the Allow/Deny line once the
+                # terminal claude advances (same as before, keyed by csid).
+                proj = self._proj_label(data)
+                msg_id, topic_id = self._send_terminal(
+                    f"\U0001f6e0 <b>[{tg.esc(proj)}]</b>\n{body}", buttons)
+                chat_id = get_forum_chat_id()
+                terminal_csid = claude_session_id or None
 
             if msg_id is None:
                 # No valid topic anywhere — fall back to OWNER DM so the user
@@ -227,9 +241,8 @@ class HookHandlers:
                 self.state.perm_key_map[short_id] = req_id
                 self.state.pending_permissions[short_id] = (msg_id, chat_id, sid)
 
-            if (session and not session.is_bot_spawned
-                    and claude_session_id and msg_id and chat_id):
-                self._track_terminal_msg(claude_session_id, msg_id, chat_id,
+            if terminal_csid and msg_id and chat_id:
+                self._track_terminal_msg(terminal_csid, msg_id, chat_id,
                                          f"perm:{short_id}")
 
             self.bridge.set_perm_context(req_id, chat_id=chat_id, topic_id=topic_id)

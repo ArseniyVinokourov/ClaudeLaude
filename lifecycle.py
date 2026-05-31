@@ -16,6 +16,7 @@ import time
 import audit
 import telegram as tg
 from config import get_forum_chat_id
+from formatting import topic_control_rows
 
 
 class SessionLifecycle:
@@ -54,14 +55,39 @@ class SessionLifecycle:
             self.state.topic_labels[topic_id] = label
         s = self.mgr.create(cwd=cwd, name=name, topic_id=topic_id)
         s.topic_label = label
+        self.attach_controls(s)
         self.mgr._persist()
         audit.log("session_start", cwd, sid=s.sid)
-        self.ui.send_to_topic(topic_id, f"▶️ <code>{tg.esc(cwd)}</code>")
         url = self.ui.topic_url(topic_id)
         if url:
             self.ui.ephemeral(fid, f"▶ {name}",
                               buttons=[[{"text": "Open", "url": url}]],
                               seconds=5)
+
+    def attach_controls(self, session, text=None):
+        """Send the pinned control panel as the topic's opening bot message.
+
+        The first bot/service message in a fresh topic — the one we hang the
+        per-topic buttons on — gets pinned so a long history is one tap away.
+        Shared by every topic-creating path (/new, /resume, /fork) so the
+        panel + pin never drift between them. Sets controls_msg_id.
+        """
+        fid = get_forum_chat_id()
+        if not fid or not session or not session.topic_id:
+            return None
+        with self.state.lock:
+            display = self.state.topic_display_mode.get(
+                session.topic_id, self.turnctl._default_display)
+        rows = topic_control_rows(session.alive, display)
+        body = text or f"▶️ <code>{tg.esc(session.cwd)}</code>"
+        mid = self.ui.send_to_topic(session.topic_id, body, buttons=rows)
+        if mid:
+            session.controls_msg_id = mid
+            # P1, not the default P2: a one-shot per-topic setup pin that the
+            # throughput budget must not drop under load (else the panel ends
+            # up unpinned, which is the whole point of the feature).
+            tg.pin(mid, fid, prio=tg.P1)
+        return mid
 
     def _invalidate_session(self, session):
         """Remove a session with a stale/deleted topic."""

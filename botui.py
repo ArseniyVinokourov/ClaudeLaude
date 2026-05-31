@@ -26,10 +26,26 @@ class BotUI:
             return tg.send(text, fid, thread_id=topic_id, buttons=buttons)
         return None
 
-    def send_general(self, text, buttons=None):
+    def send_general(self, text, buttons=None, persist=False, seconds=15):
+        """Write to General — the sanctioned channel for any notice that
+        doesn't belong to a specific category.
+
+        Transient by default: General must stay clean (only the pinned
+        dashboard lives there permanently), so a generic message self-deletes
+        after `seconds`. Pass persist=True only for security alerts, which
+        must stay until the user acts on them. Falls back to the owner DM
+        when no forum is configured (no auto-delete there).
+
+        Anything that needs a different lifetime has its own category:
+        ui.ephemeral (custom TTL), pickers (delete_after), the dashboard pin.
+        Raw tg.send(text, forum_id) is reserved for the pin alone.
+        """
         fid = get_forum_chat_id()
         if fid:
-            return tg.send(text, fid, buttons=buttons)
+            mid = tg.send(text, fid, buttons=buttons)
+            if mid and not persist:
+                self.delete_after(mid, fid, seconds)
+            return mid
         return tg.send(text, OWNER_ID, buttons=buttons)
 
     def reply(self, chat_id, thread_id, text, buttons=None):

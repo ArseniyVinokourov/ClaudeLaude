@@ -192,3 +192,25 @@ def _format_age(seconds: float) -> str:
     if seconds < 86400:
         return f"{int(seconds/3600)}h ago"
     return f"{int(seconds/86400)}d ago"
+
+
+# ── per-topic control panel ──────────────────────────────────────────
+
+def topic_control_rows(alive: bool, display_mode: str) -> list:
+    """Inline-keyboard rows for a session topic's control panel.
+
+    Pinned to the topic's opening message so a long history is one tap
+    away. Callbacks route through the `m:` dispatcher, which resolves the
+    session by topic id at click time — no per-button session id needed.
+    """
+    mode_label = ("\U0001f4f1 → \U0001f5a5" if display_mode == "mobile"
+                  else "\U0001f5a5 → \U0001f4f1")
+    if alive:
+        return [
+            [{"text": "\U0001f3af Mode", "callback_data": "m:mode"},
+             {"text": f"{mode_label} Display", "callback_data": "m:display"}],
+            [{"text": "\U0001f4ca Usage", "callback_data": "m:usage"},
+             {"text": "\U0001f4dc History", "callback_data": "m:history"}],
+            [{"text": "⏹ Stop", "callback_data": "m:stop"}],
+        ]
+    return [[{"text": "▶️ Restart", "callback_data": "m:restart"}]]

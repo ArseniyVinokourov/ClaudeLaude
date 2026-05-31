@@ -64,6 +64,16 @@ def set_dashboard_id(msg_id: int | None):
     _save_state(state)
 
 
+def get_terminal_topic_id() -> int | None:
+    return _load_state().get("terminal_topic_id")
+
+
+def set_terminal_topic_id(topic_id: int | None):
+    state = _load_state()
+    state["terminal_topic_id"] = topic_id
+    _save_state(state)
+
+
 def is_killed() -> bool:
     return os.path.exists(_KILL_FILE)
 

@@ -149,6 +149,7 @@ class Session:
     total_cost_usd: float = 0.0
     topic_label: str = ""
     mode: str = "default"
+    controls_msg_id: int | None = None
     turn_input_tokens: int = 0
     turn_output_tokens: int = 0
     pending_images: list[str] = field(default_factory=list)
@@ -392,6 +393,7 @@ class SessionManager:
                     "total_cache_create": s.total_cache_create,
                     "total_cost_usd": s.total_cost_usd,
                     "mode": s.mode,
+                    "controls_msg_id": s.controls_msg_id,
                     "history": history_tail,
                 })
             try:
@@ -444,6 +446,7 @@ class SessionManager:
                 total_cost_usd=r.get("total_cost_usd", 0.0),
                 topic_label=r.get("topic_label", ""),
                 mode=r.get("mode", "default") if valid_mode(r.get("mode", "default")) else "default",
+                controls_msg_id=r.get("controls_msg_id"),
                 history=history,
             )
             self._sessions[sid] = session
