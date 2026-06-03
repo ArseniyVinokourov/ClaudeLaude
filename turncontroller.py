@@ -391,18 +391,26 @@ class TurnController:
             session.topic_label = stop_label
         elif (session.topic_id not in self.state.renamed_topics
               and result_text.strip()):
-            with self.state.lock:
-                self.state.renamed_topics.add(session.topic_id)
-            self._auto_rename_topic(session, result_text, fid)
+            # The first user message is often a greeting or one-word request
+            # that yields a poor title; the second carries the real intent.
+            # Rename provisionally after turn 1 (so single-turn sessions still
+            # get named), then re-rename from the second message and lock it.
+            user_turns = sum(1 for h in session.history if h.kind == "user")
+            if user_turns >= 2:
+                with self.state.lock:
+                    self.state.renamed_topics.add(session.topic_id)
+            self._auto_rename_topic(session, result_text, fid, user_turns)
 
-    def _auto_rename_topic(self, session, result_text, fid):
-        user_msg = None
-        for h in session.history:
-            if h.kind == "user":
-                user_msg = h.text.strip()
-                break
-        if not user_msg:
+    def _auto_rename_topic(self, session, result_text, fid, turn_no=1):
+        # Name from the theme of the conversation, not a single message: the
+        # first message is often a greeting and the second carries the intent,
+        # so feed both. Turn 1 → msg 1 only (provisional, so single-turn
+        # sessions still get named); turn 2 → msgs 1+2 (real theme, then locks).
+        user_msgs = [h.text.strip() for h in session.history
+                     if h.kind == "user" and h.text.strip()][:2]
+        if not user_msgs:
             return
+        user_msg = user_msgs[-1]  # for the keyword fallback below
 
         def _clean_title(raw):
             if not raw:
@@ -416,7 +424,9 @@ class TurnController:
             return t if t and len(t) <= 30 else None
 
         def _do_rename():
-            context = f'User message: {user_msg[:300]}'
+            context = "\n".join(
+                f'User message {i + 1}: {m[:300]}'
+                for i, m in enumerate(user_msgs))
             if result_text:
                 context += f'\nAssistant response (start): {result_text[:200]}'
             try:
@@ -446,9 +456,15 @@ class TurnController:
                     title = title[:17] + "…"
             if title:
                 label = title
-                tg.edit_forum_topic(fid, session.topic_id, label[:128])
                 with self.state.lock:
+                    # A later turn's name wins: don't let a slow turn-1 rename
+                    # (claude shell-out can take up to 20s) clobber the turn-2
+                    # name that carries the real context.
+                    if turn_no < getattr(session, "_rename_turn", 0):
+                        return
+                    session._rename_turn = turn_no
                     self.state.topic_labels[session.topic_id] = label[:128]
+                tg.edit_forum_topic(fid, session.topic_id, label[:128])
                 session.topic_label = label[:128]
                 session.name = title
                 self.mgr._persist()

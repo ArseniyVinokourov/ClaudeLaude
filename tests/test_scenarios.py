@@ -84,12 +84,16 @@ def test_user_message_streams_claude_reply(bot, tmp_path):
     bodies = [m["text"] for m in msgs]
     assert any("hello world" in t for t in bodies), bodies
 
-    # Claude was spawned with -p "say hi" in the right cwd.
+    # Bidirectional stream-json: the prompt is sent on stdin, not as -p; the
+    # control protocol is enabled via --input-format + --permission-prompt-tool.
     spawn = bot.claude.last_spawn()
     cmd = spawn["cmd"]
-    assert "-p" in cmd and "say hi" in cmd
+    assert "-p" not in cmd
+    assert "--input-format" in cmd and "--permission-prompt-tool" in cmd
     assert "stream-json" in cmd and "--verbose" in cmd
     assert spawn["cwd"] == str(cwd)
+    turns = spawn["proc"].user_turns()
+    assert turns and turns[-1]["message"]["content"] == "say hi"
 
     # The system event linked the claude session id — a follow-up turn
     # should pass --resume claude-sess-1.
@@ -201,17 +205,11 @@ def test_usage_persists(bot, tmp_path):
 # ── 5. permission hook produces Allow/Deny buttons; click → decision ─
 
 def test_permission_flow_allow(bot, tmp_path):
-    # Create a session so the hook has a route.
+    # The Allow/Deny relay is for TERMINAL sessions — bot-spawned sessions
+    # auto-allow (--permission-mode auto + the stdin control protocol).
     cwd = tmp_path / "demo"
     cwd.mkdir(exist_ok=True)
-    bot.tg.inject_update(text_update(
-        f"/new {cwd}",
-        owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
-    ))
-    _drain_updates(bot)
-    # Force-link claude_session_id so the hook routes to the topic.
-    sess = next(iter(bot.mod.mgr._sessions.values()))
-    bot.mod.mgr.link_claude_id("claude-sess-perm", sess)
+    bot.mod.mgr.register_terminal("claude-sess-perm", 100, str(cwd))
     bot.tg.reset()
 
     # Simulate hook arriving via the bridge callback.
@@ -318,13 +316,7 @@ def test_pre_turn_session_visible_and_persisted(bot, tmp_path):
 def test_permission_flow_deny(bot, tmp_path):
     cwd = tmp_path / "demo"
     cwd.mkdir(exist_ok=True)
-    bot.tg.inject_update(text_update(
-        f"/new {cwd}",
-        owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
-    ))
-    _drain_updates(bot)
-    sess = next(iter(bot.mod.mgr._sessions.values()))
-    bot.mod.mgr.link_claude_id("claude-sess-perm-d", sess)
+    bot.mod.mgr.register_terminal("claude-sess-perm-d", 100, str(cwd))
     bot.tg.reset()
 
     import threading
@@ -576,13 +568,7 @@ def test_permission_done_ephemeral(bot, tmp_path):
     scheduled for deletion (1s ephemeral instead of permanent)."""
     cwd = tmp_path / "demo"
     cwd.mkdir(exist_ok=True)
-    bot.tg.inject_update(text_update(
-        f"/new {cwd}",
-        owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
-    ))
-    _drain_updates(bot)
-    sess = next(iter(bot.mod.mgr._sessions.values()))
-    bot.mod.mgr.link_claude_id("claude-perm-eph", sess)
+    bot.mod.mgr.register_terminal("claude-perm-eph", 100, str(cwd))
     bot.tg.reset()
 
     import threading
@@ -3198,3 +3184,56 @@ def test_mirror_history_short_click_emits_summary(bot, tmp_path):
             jp.parent.rmdir()
         except OSError:
             pass
+
+
+# ── #88: auto-rename waits for the second message ───────────────────
+
+def test_auto_rename_locks_on_second_turn(bot, tmp_path, monkeypatch):
+    """The first user message often yields a poor title; the topic name must
+    stay refreshable until the second turn, then lock. Turn 1 renames
+    provisionally (single-turn sessions still get a name), turn 2 renames from
+    the real-context message and locks, turn 3+ no longer renames."""
+    cwd = tmp_path / "rn"
+    cwd.mkdir(exist_ok=True)
+
+    calls = []
+    monkeypatch.setattr(
+        bot.mod.turnctl, "_auto_rename_topic",
+        lambda session, result_text, fid, turn_no=1: calls.append(turn_no))
+
+    bot.tg.inject_update(text_update(
+        f"/new {cwd}",
+        owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
+    ))
+    _drain_updates(bot)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    tid = sess.topic_id
+
+    def _turn(text):
+        bot.claude.script([
+            {"type": "system", "session_id": "rn-sess"},
+            {"type": "assistant", "message": {"content": [
+                {"type": "text", "text": f"re: {text}"}]}},
+            {"type": "result", "session_id": "rn-sess",
+             "usage": {"input_tokens": 1, "output_tokens": 1}},
+        ])
+        bot.tg.inject_update(text_update(
+            text, owner_id=bot.owner_id,
+            forum_chat_id=bot.forum_chat_id, thread_id=tid,
+        ))
+        _drain_updates(bot)
+        bot.tg.wait_for_call("sendMessage", message_thread_id=tid, timeout=3)
+        time.sleep(0.05)  # let on_result finish in the worker thread
+
+    _turn("hi")
+    assert calls == [1], f"turn 1 should rename provisionally: {calls}"
+    assert tid not in bot.mod.state.renamed_topics, \
+        "topic must NOT be locked after the first turn"
+
+    _turn("actually refactor the auth module")
+    assert calls == [1, 2], f"turn 2 should re-rename: {calls}"
+    assert tid in bot.mod.state.renamed_topics, \
+        "topic must be locked after the second turn"
+
+    _turn("and add tests")
+    assert calls == [1, 2], f"turn 3 must not rename (locked): {calls}"
