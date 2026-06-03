@@ -2124,11 +2124,20 @@ def test_mirror_register_backfills_only_tail(bot, tmp_path):
 
         # Append a brand-new event after registration; follower waits
         # on backfill_done and then projects it after the backfill batch.
+        # NOTE: this is a *user* event, not assistant. read_logical_events
+        # merges consecutive same-turn assistant chunks into one logical
+        # event; an assistant POST-FRESH would merge with the 20 pre-snapshot
+        # assistant chunks into a single logical event whose byte_end lands
+        # *past* the snapshot, so the snapshot filter would drop the whole
+        # block — a real boundary edge, but here it just made the test
+        # non-deterministic (it depended on whether the backfill thread read
+        # the file before or after this append). A distinct event type sits
+        # cleanly on its own side of the snapshot, which is also how real
+        # transcripts look (a fresh turn after you attach the mirror).
         with open(jp, "a") as f:
             f.write(_json.dumps({
-                "type": "assistant",
-                "message": {"content": [{"type": "text",
-                                         "text": "POST-FRESH"}]},
+                "type": "user",
+                "message": {"role": "user", "content": "POST-FRESH"},
             }) + "\n")
 
         # Wait until the FULL expected set is projected, not just POST-FRESH.

@@ -4,7 +4,7 @@
 # Always exits 0 — the caller checks $ERRORS_FILE size to decide pass/fail.
 #
 # Required env: BRANCH TITLE BODY AUTHOR PR OWNER_LOGIN ERRORS_FILE
-# Required tools on PATH: python3, ruff, gh
+# Required tools on PATH: awk, sed, grep, gh
 
 set -uo pipefail
 
@@ -80,46 +80,10 @@ $files_list
   fi
 fi
 
-# 5. Python syntax
-py_err_file="${RUNNER_TEMP:-/tmp}/py_err.txt"
-if ! python3 -m py_compile *.py 2>"$py_err_file"; then
-  append "❌ **Python syntax error.**
-
-\`\`\`
-$(cat "$py_err_file")
-\`\`\`
-
-   Run locally: \`python3 -m py_compile *.py\`"
-fi
-
-# 6. Bash syntax
-bash_errs=""
-for f in *.sh; do
-  [ -f "$f" ] || continue
-  if ! err=$(bash -n "$f" 2>&1); then
-    bash_errs+="${f}: ${err}"$'\n'
-  fi
-done
-if [ -n "$bash_errs" ]; then
-  append "❌ **Bash syntax error.**
-
-\`\`\`
-$bash_errs
-\`\`\`
-
-   Run locally: \`for f in *.sh; do bash -n \"\$f\"; done\`"
-fi
-
-# 7. Ruff lint
-if ! ruff_out=$(ruff check . 2>&1); then
-  append "❌ **Ruff lint failed.**
-
-\`\`\`
-$ruff_out
-\`\`\`
-
-   Run locally: \`pip install ruff==0.6.9 && ruff check .\`
-   Many issues auto-fix: \`ruff check --fix .\`"
-fi
+# Code-quality gates (Python syntax, shell lint, ruff) live in the `tests`
+# workflow's `lint` job — it runs on every push to main too, and covers ALL
+# tracked files (not just the repo root, which the old `*.py`/`*.sh` globs
+# here missed). This script stays focused on PR-metadata governance so its
+# friendly comment is about what a contributor must edit on the PR itself.
 
 exit 0
