@@ -365,7 +365,11 @@ def _edit_impl(msg_id, text, chat_id, buttons):
             except Exception:
                 pass
         _check_topic_dead(chat_id, None, body)
-        _log(f"edit error: {e}")
+        # A no-op edit (same text + markup) is benign — Telegram rejects it
+        # with "message is not modified". The status indicator re-paints with
+        # identical content sometimes; don't treat that as an error.
+        if "not modified" not in body.lower():
+            _log(f"edit error: {e} :: {body[:200]}")
     except Exception as e:
         _log(f"edit error: {e}")
 

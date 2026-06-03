@@ -155,6 +155,9 @@ class Session:
     pending_images: list[str] = field(default_factory=list)
     _queue: queue.Queue = field(default_factory=queue.Queue)
     _proc: subprocess.Popen | None = field(default=None, repr=False)
+    # Holds the in-flight AskUserQuestion entry while a turn waits on the
+    # owner; stop()/interrupt() cancel it. Set by QuestionAsker.ask.
+    _pending_q: dict | None = field(default=None, repr=False)
 
 
 _PERSIST_PATH = os.environ.get(
@@ -171,13 +174,17 @@ class SessionManager:
                  on_tool_use: Callable,
                  on_thinking: Callable,
                  on_session_stop: Callable | None = None,
-                 on_session_context: Callable[["Session"], str] | None = None):
+                 on_session_context: Callable[["Session"], str] | None = None,
+                 on_ask_question: Callable | None = None):
         self._on_assistant = on_assistant_message
         self._on_result = on_result
         self._on_tool_use = on_tool_use
         self._on_thinking = on_thinking
         self._on_session_stop = on_session_stop
         self._on_session_context = on_session_context
+        # Called from the worker thread when Claude invokes AskUserQuestion:
+        # (session, questions:list) -> {question_text: answer} | None.
+        self._on_ask_question = on_ask_question
         self._sessions: dict[str, Session] = {}
         self._topic_map: dict[int, str] = {}
         self._cwd_map: dict[str, str] = {}
@@ -216,6 +223,7 @@ class SessionManager:
         session.alive = False
         session.stopped_at = time.time()
         session._queue.put(None)
+        self._cancel_pending_question(session, reason)
         if session._proc and session._proc.poll() is None:
             session._proc.terminate()
         self._persist()
@@ -238,11 +246,21 @@ class SessionManager:
         proc = session._proc
         if not proc or proc.poll() is not None:
             return False
+        self._cancel_pending_question(session, "interrupted")
         try:
             proc.terminate()
         except Exception:
             return False
         return True
+
+    @staticmethod
+    def _cancel_pending_question(session, reason: str):
+        """Unblock a turn that is waiting on AskUserQuestion (stop/interrupt)."""
+        pq = session._pending_q
+        if pq and not pq["event"].is_set():
+            pq["cancelled"] = True
+            pq["reason"] = reason
+            pq["event"].set()
 
     def restart(self, sid: str) -> bool:
         session = self._sessions.get(sid)
@@ -498,9 +516,16 @@ class SessionManager:
             text_for_claude = f"[mode: {session.mode}] {text}"
         else:
             text_for_claude = text
-        cmd = [_CLAUDE_BIN, "-p", text_for_claude, "--output-format",
-               "stream-json", "--verbose", "--permission-mode",
-               preset["permission_mode"]]
+        # Bidirectional stream-json: the prompt is sent on stdin (not -p) so
+        # the CLI can route AskUserQuestion (and any permission prompt) back to
+        # us over the control protocol. `--permission-prompt-tool stdio` is the
+        # (undocumented) flag that enables that routing; without it
+        # AskUserQuestion auto-errors. `--permission-mode auto` still
+        # auto-allows ordinary tools, so only AskUserQuestion reaches us.
+        cmd = [_CLAUDE_BIN, "--output-format", "stream-json", "--verbose",
+               "--input-format", "stream-json",
+               "--permission-prompt-tool", "stdio",
+               "--permission-mode", preset["permission_mode"]]
         if preset.get("model"):
             cmd.extend(["--model", preset["model"]])
         if preset.get("effort"):
@@ -537,10 +562,13 @@ class SessionManager:
         try:
             proc = subprocess.Popen(
                 cmd,
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 cwd=session.cwd,
                 env={**os.environ},
+                text=True,
+                bufsize=1,
             )
         except Exception:
             self._on_result(session, "", "")
@@ -549,24 +577,45 @@ class SessionManager:
         session._proc = proc
         assistant_chunks: list[str] = []
 
+        # Control-protocol handshake, then the user turn — both on stdin.
+        self._send_line(proc, {"type": "control_request",
+                               "request_id": "req_init",
+                               "request": {"subtype": "initialize",
+                                           "hooks": None}})
+        self._send_line(proc, {"type": "user", "message": {
+            "role": "user", "content": text_for_claude}})
+
         try:
             for raw_line in proc.stdout:
                 if session._worker_generation != gen:
                     proc.terminate()
                     break
-                line = raw_line.decode("utf-8", errors="replace").strip()
+                line = raw_line.strip()
                 if not line:
                     continue
                 try:
                     event = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                etype = event.get("type")
+                if etype == "control_response":
+                    continue  # init ack — nothing to do
+                if etype == "control_request":
+                    self._handle_control(session, proc, event)
+                    continue
                 try:
                     self._dispatch(session, event, assistant_chunks, gen)
                 except Exception as e:
                     print(f"[session {session.sid}] dispatch error: {e}",
                           file=sys.stderr, flush=True)
+                if etype == "result":
+                    break  # turn done; close stdin so the CLI exits
         finally:
+            try:
+                if proc.stdin:
+                    proc.stdin.close()
+            except Exception:
+                pass
             proc.wait()
             session._proc = None
 
@@ -580,6 +629,54 @@ class SessionManager:
                 self._on_result(session, full_text, "")
             else:
                 self._on_result(session, "", "")
+
+    @staticmethod
+    def _send_line(proc, obj):
+        """Write one JSON line to claude's stdin (control msg or user turn)."""
+        try:
+            if proc.stdin:
+                proc.stdin.write(json.dumps(obj) + "\n")
+                proc.stdin.flush()
+        except Exception:
+            pass  # proc may have died (interrupt/stop) — read loop will end
+
+    def _handle_control(self, session: Session, proc, event: dict):
+        """Answer a `can_use_tool` control_request from the CLI.
+
+        Ordinary tools are auto-allowed (preserving --permission-mode auto).
+        AskUserQuestion is routed to the owner via `_on_ask_question`; the
+        chosen answers ride back inside `updatedInput.answers`.
+        """
+        req = event.get("request") or {}
+        if req.get("subtype") != "can_use_tool":
+            return
+        rid = event.get("request_id")
+        tool = req.get("tool_name")
+        inp = req.get("input") or {}
+
+        if tool == "AskUserQuestion" and self._on_ask_question:
+            answers = None
+            try:
+                answers = self._on_ask_question(session, inp.get("questions") or [])
+            except Exception as e:
+                print(f"[session {session.sid}] ask_question error: {e}",
+                      file=sys.stderr, flush=True)
+            if answers:
+                updated = dict(inp)
+                updated["answers"] = answers
+                self._send_line(proc, {"type": "control_response", "response": {
+                    "subtype": "success", "request_id": rid,
+                    "response": {"behavior": "allow", "updatedInput": updated}}})
+            else:
+                self._send_line(proc, {"type": "control_response", "response": {
+                    "subtype": "success", "request_id": rid,
+                    "response": {"behavior": "deny", "message": "No answer",
+                                 "interrupt": True}}})
+            return
+
+        self._send_line(proc, {"type": "control_response", "response": {
+            "subtype": "success", "request_id": rid,
+            "response": {"behavior": "allow", "updatedInput": inp}}})
 
     def _dispatch(self, session: Session, event: dict,
                   assistant_chunks: list[str], gen: int):

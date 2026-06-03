@@ -27,6 +27,7 @@ from lifecycle import SessionLifecycle
 from mirrorbridge import MirrorProjector
 from turncontroller import TurnController, TurnState
 from sessions import SessionManager
+from questions import QuestionAsker
 from updater import (
     _check_update, _has_local_changes, _restart_bot, _run_update,
 )
@@ -67,6 +68,9 @@ class BotState:
         self.perm_key_map: dict[str, str] = {}
         self.pending_project_picks: dict[str, list[str]] = {}
         self.pending_resume_picks: dict[str, list[tuple]] = {}
+        # AskUserQuestion: qid -> entry dict; sid -> qid (for stop/interrupt).
+        self.pending_questions: dict[str, dict] = {}
+        self.question_by_sid: dict[str, str] = {}
         self.topic_display_mode: dict[int, str] = {}
         self.turns: dict[str, TurnState] = {}
         self.topic_counter: dict[str, int] = {}
@@ -241,6 +245,7 @@ def _validate_help():
 # ── main loop ────────────────────────────────────────────────────────
 
 
+asker = QuestionAsker(state)
 mgr = SessionManager(
     on_assistant_message=turnctl.on_assistant,
     on_result=turnctl.on_result,
@@ -248,6 +253,7 @@ mgr = SessionManager(
     on_thinking=turnctl.on_thinking,
     on_session_stop=lifecycle.on_session_stop,
     on_session_context=turnctl.session_context,
+    on_ask_question=asker.ask,
 )
 turnctl.mgr = mgr
 lifecycle.mgr = mgr
@@ -956,6 +962,10 @@ def _handle_callback(cb, data):
         session = mgr._sessions.get(sid)
         if session:
             commands._do_interrupt(session, cb_chat, cb_thread)
+        return
+
+    if data.startswith("aq:"):
+        asker.handle_callback(data)
         return
 
     if data.startswith("p:"):

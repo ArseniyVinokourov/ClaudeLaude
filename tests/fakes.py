@@ -149,6 +149,22 @@ class _FakeResponse:
 
 # ── Claude subprocess fake ──────────────────────────────────────────
 
+class _FakeStdin:
+    """Captures everything the engine writes to claude's stdin."""
+
+    def __init__(self):
+        self.data: list[str] = []
+
+    def write(self, s):
+        self.data.append(s)
+
+    def flush(self):
+        pass
+
+    def close(self):
+        pass
+
+
 class FakeClaudeProcess:
     """Stand-in for subprocess.Popen of the claude CLI.
 
@@ -158,12 +174,28 @@ class FakeClaudeProcess:
     """
 
     def __init__(self, events: list[dict]):
-        lines = b"".join(
-            (json.dumps(e) + "\n").encode("utf-8") for e in events
-        )
-        self.stdout = io.BytesIO(lines)
-        self.stderr = io.BytesIO(b"")
+        # Bidirectional stream-json: the engine spawns with text=True and reads
+        # str lines; the prompt + control responses are written to stdin.
+        text = "".join(json.dumps(e) + "\n" for e in events)
+        self.stdout = io.StringIO(text)
+        self.stderr = io.StringIO("")
+        self.stdin = _FakeStdin()
         self._returncode: int | None = None
+
+    def user_turns(self) -> list[dict]:
+        """The {"type":"user",...} messages the engine wrote to stdin."""
+        out = []
+        for line in "".join(self.stdin.data).splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if obj.get("type") == "user":
+                out.append(obj)
+        return out
 
     def poll(self):
         return self._returncode
@@ -216,8 +248,10 @@ class FakeClaudeFactory:
     def __call__(self, cmd, **kwargs):
         with self._lock:
             events = self.scripts.pop(0) if self.scripts else list(self.default_events)
-            self.spawns.append({"cmd": list(cmd), "cwd": kwargs.get("cwd")})
-        return FakeClaudeProcess(events)
+            proc = FakeClaudeProcess(events)
+            self.spawns.append({"cmd": list(cmd), "cwd": kwargs.get("cwd"),
+                                "proc": proc})
+        return proc
 
     def last_spawn(self) -> dict:
         with self._lock:
