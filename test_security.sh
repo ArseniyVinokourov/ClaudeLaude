@@ -7,7 +7,7 @@ set -u
 sanitize() { tr -d '\r'; }
 
 BOT_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$BOT_DIR"
+cd "$BOT_DIR" || exit 1
 
 GREEN='\033[32m'
 RED='\033[31m'

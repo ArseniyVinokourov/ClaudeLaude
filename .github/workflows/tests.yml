@@ -9,10 +9,44 @@ on:
 permissions:
   contents: read
 
+# Cancel superseded runs on the same ref (a new push to a PR/branch) so CI
+# doesn't burn minutes on stale commits.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   pytest:
-    name: pytest
+    name: pytest (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # CLAUDE.md constraint: "Python 3.10+". Test the full supported range.
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run pytest
+        # --timeout: a hung test fails fast instead of hanging the runner.
+        # --durations: surface the slowest tests in the log.
+        run: pytest tests/ -v --timeout=120 --durations=10
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -21,10 +55,16 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
-          cache: pip
 
-      - name: Install dependencies
-        run: pip install -r requirements-dev.txt
+      - name: Install ruff
+        run: pip install ruff==0.6.9
 
-      - name: Run pytest
-        run: pytest tests/ -v
+      - name: Ruff lint
+        run: ruff check .
+
+      - name: Python syntax (all tracked .py)
+        run: git ls-files '*.py' -z | xargs -0 -r python3 -m py_compile
+
+      - name: Shellcheck (all tracked .sh)
+        # shellcheck is preinstalled on ubuntu-latest runners.
+        run: git ls-files '*.sh' -z | xargs -0 -r shellcheck --severity=warning
