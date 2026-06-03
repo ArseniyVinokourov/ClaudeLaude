@@ -84,12 +84,16 @@ def test_user_message_streams_claude_reply(bot, tmp_path):
     bodies = [m["text"] for m in msgs]
     assert any("hello world" in t for t in bodies), bodies
 
-    # Claude was spawned with -p "say hi" in the right cwd.
+    # Bidirectional stream-json: the prompt is sent on stdin, not as -p; the
+    # control protocol is enabled via --input-format + --permission-prompt-tool.
     spawn = bot.claude.last_spawn()
     cmd = spawn["cmd"]
-    assert "-p" in cmd and "say hi" in cmd
+    assert "-p" not in cmd
+    assert "--input-format" in cmd and "--permission-prompt-tool" in cmd
     assert "stream-json" in cmd and "--verbose" in cmd
     assert spawn["cwd"] == str(cwd)
+    turns = spawn["proc"].user_turns()
+    assert turns and turns[-1]["message"]["content"] == "say hi"
 
     # The system event linked the claude session id — a follow-up turn
     # should pass --resume claude-sess-1.
@@ -201,17 +205,11 @@ def test_usage_persists(bot, tmp_path):
 # ── 5. permission hook produces Allow/Deny buttons; click → decision ─
 
 def test_permission_flow_allow(bot, tmp_path):
-    # Create a session so the hook has a route.
+    # The Allow/Deny relay is for TERMINAL sessions — bot-spawned sessions
+    # auto-allow (--permission-mode auto + the stdin control protocol).
     cwd = tmp_path / "demo"
     cwd.mkdir(exist_ok=True)
-    bot.tg.inject_update(text_update(
-        f"/new {cwd}",
-        owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
-    ))
-    _drain_updates(bot)
-    # Force-link claude_session_id so the hook routes to the topic.
-    sess = next(iter(bot.mod.mgr._sessions.values()))
-    bot.mod.mgr.link_claude_id("claude-sess-perm", sess)
+    bot.mod.mgr.register_terminal("claude-sess-perm", 100, str(cwd))
     bot.tg.reset()
 
     # Simulate hook arriving via the bridge callback.
@@ -318,13 +316,7 @@ def test_pre_turn_session_visible_and_persisted(bot, tmp_path):
 def test_permission_flow_deny(bot, tmp_path):
     cwd = tmp_path / "demo"
     cwd.mkdir(exist_ok=True)
-    bot.tg.inject_update(text_update(
-        f"/new {cwd}",
-        owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
-    ))
-    _drain_updates(bot)
-    sess = next(iter(bot.mod.mgr._sessions.values()))
-    bot.mod.mgr.link_claude_id("claude-sess-perm-d", sess)
+    bot.mod.mgr.register_terminal("claude-sess-perm-d", 100, str(cwd))
     bot.tg.reset()
 
     import threading
@@ -576,13 +568,7 @@ def test_permission_done_ephemeral(bot, tmp_path):
     scheduled for deletion (1s ephemeral instead of permanent)."""
     cwd = tmp_path / "demo"
     cwd.mkdir(exist_ok=True)
-    bot.tg.inject_update(text_update(
-        f"/new {cwd}",
-        owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
-    ))
-    _drain_updates(bot)
-    sess = next(iter(bot.mod.mgr._sessions.values()))
-    bot.mod.mgr.link_claude_id("claude-perm-eph", sess)
+    bot.mod.mgr.register_terminal("claude-perm-eph", 100, str(cwd))
     bot.tg.reset()
 
     import threading
@@ -3207,3 +3193,176 @@ def test_mirror_history_short_click_emits_summary(bot, tmp_path):
             jp.parent.rmdir()
         except OSError:
             pass
+
+
+# ── #88: auto-rename waits for the second message ───────────────────
+
+def test_auto_rename_locks_on_second_turn(bot, tmp_path, monkeypatch):
+    """The first user message often yields a poor title; the topic name must
+    stay refreshable until the second turn, then lock. Turn 1 renames
+    provisionally (single-turn sessions still get a name), turn 2 renames from
+    the real-context message and locks, turn 3+ no longer renames."""
+    cwd = tmp_path / "rn"
+    cwd.mkdir(exist_ok=True)
+
+    calls = []
+    monkeypatch.setattr(
+        bot.mod.turnctl, "_auto_rename_topic",
+        lambda session, result_text, fid, turn_no=1: calls.append(turn_no))
+
+    bot.tg.inject_update(text_update(
+        f"/new {cwd}",
+        owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
+    ))
+    _drain_updates(bot)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    tid = sess.topic_id
+
+    def _turn(text):
+        bot.claude.script([
+            {"type": "system", "session_id": "rn-sess"},
+            {"type": "assistant", "message": {"content": [
+                {"type": "text", "text": f"re: {text}"}]}},
+            {"type": "result", "session_id": "rn-sess",
+             "usage": {"input_tokens": 1, "output_tokens": 1}},
+        ])
+        bot.tg.inject_update(text_update(
+            text, owner_id=bot.owner_id,
+            forum_chat_id=bot.forum_chat_id, thread_id=tid,
+        ))
+        _drain_updates(bot)
+        bot.tg.wait_for_call("sendMessage", message_thread_id=tid, timeout=3)
+        time.sleep(0.05)  # let on_result finish in the worker thread
+
+    _turn("hi")
+    assert calls == [1], f"turn 1 should rename provisionally: {calls}"
+    assert tid not in bot.mod.state.renamed_topics, \
+        "topic must NOT be locked after the first turn"
+
+    _turn("actually refactor the auth module")
+    assert calls == [1, 2], f"turn 2 should re-rename: {calls}"
+    assert tid in bot.mod.state.renamed_topics, \
+        "topic must be locked after the second turn"
+
+    _turn("and add tests")
+    assert calls == [1, 2], f"turn 3 must not rename (locked): {calls}"
+
+
+# ── #82: AskUserQuestion rendered as buttons, answer fed back ────────
+
+def test_ask_user_question_buttons_and_answer(bot, tmp_path):
+    """Claude's AskUserQuestion picker is projected as inline buttons; tapping
+    an option feeds the choice back over the control protocol as a
+    control_response with updatedInput.answers."""
+    import json as _json
+    cwd = tmp_path / "auq"
+    cwd.mkdir(exist_ok=True)
+
+    bot.tg.inject_update(text_update(
+        f"/new {cwd}", owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id))
+    _drain_updates(bot)
+    sess = next(s for s in bot.mod.mgr._sessions.values()
+                if s.cwd == str(cwd))
+    tid = sess.topic_id
+
+    # Script: a can_use_tool control_request for AskUserQuestion, then the
+    # turn's normal tail (assistant + result) which only plays once we answer.
+    bot.claude.script([
+        {"type": "system", "session_id": "auq-sess"},
+        {"type": "control_request", "request_id": "rid-1", "request": {
+            "subtype": "can_use_tool", "tool_name": "AskUserQuestion",
+            "tool_use_id": "tu1", "input": {"questions": [{
+                "question": "Which one?", "header": "Pick", "multiSelect": False,
+                "options": [{"label": "Alpha", "description": "a"},
+                            {"label": "Beta", "description": "b"}]}]}}},
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "picked"}]}},
+        {"type": "result", "session_id": "auq-sess",
+         "usage": {"input_tokens": 1, "output_tokens": 1}},
+    ])
+    bot.tg.inject_update(text_update(
+        "choose", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, thread_id=tid))
+    _drain_updates(bot)
+
+    # The worker blocks in ask() waiting for a tap — poll for the registry.
+    qid = None
+    for _ in range(60):
+        qids = list(bot.mod.state.pending_questions.keys())
+        if qids:
+            qid = qids[0]
+            break
+        time.sleep(0.05)
+    assert qid, "AskUserQuestion never registered a pending question"
+
+    # Question + option buttons posted into the session topic.
+    qmsg = next((m for m in bot.tg.calls_of("sendMessage")
+                 if m.get("message_thread_id") == tid
+                 and "Which one?" in m.get("text", "")), None)
+    assert qmsg, f"no question message: {bot.tg.calls_of('sendMessage')}"
+    btn_labels = [b["text"] for row in qmsg["reply_markup"]["inline_keyboard"]
+                  for b in row]
+    assert any("Alpha" in b for b in btn_labels), btn_labels
+    assert any("Beta" in b for b in btn_labels), btn_labels
+
+    # Tap "Beta" (option index 1 of question 0).
+    bot.tg.inject_update(callback_update(
+        f"aq:{qid}:0:1", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, thread_id=tid))
+    _drain_updates(bot)
+
+    # Engine must send a control_response allow + answers{"Which one?":"Beta"}.
+    spawn = bot.claude.last_spawn()
+    resp = None
+    for _ in range(60):
+        for line in "".join(spawn["proc"].stdin.data).splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                obj = _json.loads(line)
+            except ValueError:
+                continue
+            if obj.get("type") == "control_response":
+                resp = obj
+        if resp:
+            break
+        time.sleep(0.05)
+    assert resp, "no control_response written to claude stdin"
+    inner = resp["response"]["response"]
+    assert inner["behavior"] == "allow", inner
+    assert inner["updatedInput"]["answers"] == {"Which one?": "Beta"}, inner
+
+    # Pending question cleared after answering.
+    assert qid not in bot.mod.state.pending_questions
+
+
+def test_bot_session_hook_auto_allows_no_prompt(bot, tmp_path):
+    """A bot-spawned session governs its own permissions (auto + control
+    protocol). The settings.json PreToolUse hook still fires in bidirectional
+    mode, but it must auto-allow silently — no Allow/Deny prompt."""
+    import threading
+    cwd = tmp_path / "demo"
+    cwd.mkdir(exist_ok=True)
+    bot.tg.inject_update(text_update(
+        f"/new {cwd}", owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id))
+    _drain_updates(bot)
+    sess = next(s for s in bot.mod.mgr._sessions.values()
+                if s.cwd == str(cwd))
+    bot.mod.mgr.link_claude_id("claude-bot-perm", sess)
+    bot.tg.reset()
+
+    req_id = "req-bot"
+    bot.mod.bridge._pending[req_id] = threading.Event()
+    bot.mod.hooks.on_hook_permission(req_id, {
+        "tool_name": "Bash",
+        "tool_input": {"command": "echo hi"},
+        "session_id": "claude-bot-perm",
+    })
+
+    # No Allow/Deny message, and the hook auto-allowed.
+    prompts = [m for m in bot.tg.calls_of("sendMessage") if "reply_markup" in m
+               and any("Allow" in b.get("text", "")
+                       for row in m["reply_markup"]["inline_keyboard"] for b in row)]
+    assert not prompts, f"bot session should not prompt: {prompts}"
+    assert bot.mod.bridge._decisions.get(req_id) == "allow"

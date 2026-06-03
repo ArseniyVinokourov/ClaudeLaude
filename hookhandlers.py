@@ -148,6 +148,25 @@ class HookHandlers:
         try:
             claude_session_id = (data.get("session_id")
                                  or data.get("sessionId") or "")
+            # A live bot-spawned session governs its own permissions:
+            # --permission-mode auto + the stdin control protocol
+            # (--permission-prompt-tool stdio) already decide every tool. The
+            # settings.json PreToolUse hook still fires (it no longer skips
+            # print mode), but routing it to an Allow/Deny prompt would
+            # duplicate the auto-allow and spam the topic — so silently allow.
+            own = (self.mgr.by_claude_session_id(claude_session_id)
+                   if claude_session_id else None)
+            if own and own.is_bot_spawned and own.alive:
+                # AskUserQuestion is answered over the control protocol (inline
+                # buttons → updatedInput.answers), NOT allow/deny. A hook allow
+                # here would tell Claude to proceed before the owner taps, so
+                # the answer arrives too late. Abandon the hook and let the
+                # control protocol drive it.
+                if data.get("tool_name") == "AskUserQuestion":
+                    self.bridge.abandon_permission(req_id)
+                    return
+                self.bridge.resolve_permission(req_id, "allow")
+                return
             # If the terminal claude that fired this hook is already
             # mirrored, route the permission Allow/Deny into the SAME
             # mirror topic instead of spawning a separate "terminal — HH:MM"
