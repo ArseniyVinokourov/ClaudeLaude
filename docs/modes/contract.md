@@ -184,9 +184,9 @@ The judge must return strict JSON matching this schema:
   "criteria": [
     {
       "id": "c1",
-      "verdict": "pass" | "fail",
+      "reason": "<short explanation, or null>",
       "evidence_quote": "<verbatim substring from the reply, or null>",
-      "reason": "<short explanation, or null>"
+      "verdict": "pass" | "fail"
     }
   ]
 }
@@ -196,6 +196,14 @@ Rules:
 
 - Exactly one entry per criterion in the rubric. Extra or missing entries
   → response invalid → retry once → mark `judge_invalid` if still wrong.
+- Field order is deliberate: `reason` comes BEFORE `verdict` so the
+  judge reasons first and the verdict follows from the reasoning
+  (verdict-first lets the model commit before thinking and produces
+  fail-verdicts whose own reason text concludes "pass").
+- **Vacuous satisfaction is a pass**: if a criterion constrains items
+  that do not occur in the reply at all (e.g. "every term used from
+  this list is defined" and none of the listed terms appear), the
+  criterion is satisfied.
 - **Presence-of-bad-content fail** (criterion forbids X, X is present):
   `evidence_quote` MUST be a verbatim substring of the reply showing X.
   `reason` may be null.

@@ -40,9 +40,11 @@ Universal rules and section structure: see `contract.md`.
   > 'Applications:', no 'How it works:' unless the question explicitly
   > requests them). Do NOT use `## ` or `### ` markdown headers anywhere in
   > your reply. Stay in one prose block. If the question is 'what is X',
-  > answer in 1-3 sentences without expanding. No preambles, no recap of
-  > the question, no trailing summary. Lists only when items are genuinely
-  > distinct entities.
+  > answer in 1-3 sentences without expanding. If the question is 'how do
+  > I X', give the single canonical command or procedure — do NOT
+  > enumerate flag variants, options, or alternative commands. No
+  > preambles, no recap of the question, no trailing summary. Lists only
+  > when items are genuinely distinct entities.
 - Help label: `1-3 sentence answers`.
 
 ## 6. Acceptance probes

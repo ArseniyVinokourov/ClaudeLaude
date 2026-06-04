@@ -36,9 +36,12 @@ MODE_PRESETS: dict[str, dict] = {
             "works:' unless the question explicitly requests them). Do "
             "NOT use `## ` or `### ` markdown headers anywhere in your "
             "reply. Stay in one prose block. If the question is 'what "
-            "is X', answer in 1-3 sentences without expanding. No "
-            "preambles, no recap of the question, no trailing summary. "
-            "Lists only when items are genuinely distinct entities."
+            "is X', answer in 1-3 sentences without expanding. If the "
+            "question is 'how do I X', give the single canonical "
+            "command or procedure — do NOT enumerate flag variants, "
+            "options, or alternative commands. No preambles, no recap "
+            "of the question, no trailing summary. Lists only when "
+            "items are genuinely distinct entities."
         ),
         "permission_mode": "auto",
         "label": "1-3 sentence answers",
