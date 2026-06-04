@@ -99,7 +99,8 @@ readable by that person.
   - every technical term used (hash function, bucket, collision, O(1),
     index) has a plain-language definition somewhere in this reply on
     its first appearance (subsequent bare uses in the same reply are
-    fine);
+    fine; words appearing only as code keywords or identifiers inside
+    code blocks do not count as prose usage);
   - the reply does not stack three or more undefined technical terms in
     one sentence;
   severity: must.
@@ -121,10 +122,11 @@ readable by that person.
     stack overflow, memoization);
   - reply contains at least one concrete example (code snippet or worked
     walkthrough of one call);
-  - every technical term used (base case, stack, frame, return value,
-    call stack, TCO) has a plain-language definition somewhere in this
-    reply on its first appearance (subsequent bare uses in the same
-    reply are fine);
+  - every technical term used (base case, stack, frame, call stack,
+    TCO) has a plain-language definition somewhere in this reply on its
+    first appearance (subsequent bare uses in the same reply are fine;
+    words appearing only as code keywords or identifiers inside code
+    blocks do not count as prose usage);
   severity: must.
 - `beginner-followup-1` — multi-turn probe:
   - turn 1 prompt: "Что такое hash function?" — capture reply;
