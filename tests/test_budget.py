@@ -149,3 +149,82 @@ def test_snapshot_shape(fast_budget):
     snap = fast_budget.snapshot()
     assert set(snap.keys()) == {"writes_last_60s", "ceiling", "paused_for_s", "queued"}
     assert len(snap["queued"]) == 4
+
+
+def test_nested_submit_from_worker_does_not_deadlock(fast_budget):
+    """A job that issues another paid write from inside the worker thread
+    (e.g. the topic-dead callback doing cleanup edits during a failed send)
+    must not block on its own thread. The re-entrancy guard runs nested
+    calls directly (found live, #89)."""
+    bud = fast_budget
+    nested_ran = []
+
+    def nested_write():
+        # What telegram._via_budget does with the guard: detect we're on
+        # the worker and run directly instead of submit()+result().
+        if bud.is_worker_thread():
+            nested_ran.append(True)
+            return "direct"
+        return bud.submit(budget_mod.P3, lambda: "queued").result(timeout=5)
+
+    def outer_job():
+        return nested_write()
+
+    fut = bud.submit(budget_mod.P1, outer_job)
+    assert fut.result(timeout=5) == "direct"
+    assert nested_ran, "nested write must run directly on the worker thread"
+
+
+def test_via_budget_nested_write_from_callback_no_deadlock(monkeypatch):
+    """Integration: a send whose failure triggers the topic-dead callback,
+    which itself does a paid edit. Without the re-entrancy guard in
+    telegram._via_budget the budget worker waits on itself for 180s
+    (found live, #89). Must complete in seconds."""
+    import os
+    import threading
+
+    os.environ.setdefault("BOT_TOKEN", "fake-token")
+    os.environ.setdefault("OWNER_ID", "42")
+    budget_mod.reset_for_tests()
+    import telegram as tg
+
+    calls = []
+
+    def fake_req(method, params=None):
+        calls.append((method, params or {}))
+        if method == "sendMessage":
+            import requests
+
+            class _R:
+                status_code = 400
+                text = '{"ok":false,"description":"Bad Request: message thread not found"}'
+            raise requests.HTTPError("400", response=_R())
+        return {"ok": True, "result": True}
+
+    monkeypatch.setattr(tg, "_req", fake_req)
+    tg.set_forum_chat_id(777)
+
+    def on_dead(chat_id, thread_id):
+        # What bot.py's handler does: paid cleanup writes from inside
+        # the failing send's worker context.
+        tg.edit(123, "cleanup", chat_id)
+
+    tg.set_on_topic_dead(on_dead)
+
+    result = {}
+
+    def run():
+        result["mid"] = tg.send("hello", 777, thread_id=99)
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout=10)
+    try:
+        assert not t.is_alive(), "send deadlocked on nested paid write"
+        assert result["mid"] is None  # the send itself failed (dead topic)
+        assert any(m == "editMessageText" for m, _ in calls), \
+            "nested cleanup edit must have executed"
+    finally:
+        tg.set_on_topic_dead(None)
+        tg.set_forum_chat_id(None)
+        budget_mod.reset_for_tests()

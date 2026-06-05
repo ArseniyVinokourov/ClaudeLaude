@@ -3366,3 +3366,157 @@ def test_bot_session_hook_auto_allows_no_prompt(bot, tmp_path):
                        for row in m["reply_markup"]["inline_keyboard"] for b in row)]
     assert not prompts, f"bot session should not prompt: {prompts}"
     assert bot.mod.bridge._decisions.get(req_id) == "allow"
+
+
+# ── #98: General stale-message registry ──────────────────────────────
+
+
+def _state(bot_env):
+    import json as _json
+    return _json.loads(bot_env.state_file.read_text())
+
+
+def _pending_ids(bot_env):
+    return [e[0] for e in _state(bot_env).get("pending_delete_ids", [])]
+
+
+def test_general_ephemeral_leftover_swept_at_startup(bot, bot_env):
+    """A transient forum message whose delete timer never fired (bot died)
+    is registered in .state.json at scheduling time and swept by
+    cleanup_general at startup."""
+    mid = bot.mod.ui.send_general("transient notice")
+    assert mid is not None
+    # The fixture stubs the instance's delete_after; drive the REAL method
+    # via the class to exercise scheduling-time registration. TTL is long
+    # enough that the timer thread never fires within the suite — exactly
+    # the "bot died before the timer" case.
+    type(bot.mod.ui).delete_after(bot.mod.ui, mid, bot.forum_chat_id, 3600)
+    assert mid in _pending_ids(bot_env)
+
+    bot.mod.dashboard.cleanup_general()
+
+    assert mid in bot.tg.deleted_messages
+    assert mid not in _pending_ids(bot_env)
+
+
+def test_dashboard_replace_failed_delete_retried_at_cleanup(bot, bot_env):
+    """Dashboard replacement whose delete of the old pin fails must not
+    orphan the old message: the id stays registered and the startup sweep
+    removes it once Telegram lets the delete through (todo #98)."""
+    import config
+    config.set_dashboard_id(999)
+    bot.tg.fail_edits.add(999)    # edit fails → replace path
+    bot.tg.fail_deletes.add(999)  # delete of the old pin fails too
+
+    bot.mod.dashboard.sync()
+
+    # New dashboard sent + pinned despite the failed delete.
+    pins = bot.tg.pinned_messages
+    assert pins, "new dashboard must be pinned"
+    new_id = pins[-1]
+    assert bot.tg.messages[new_id]["thread_id"] is None
+    assert "ClaudeLaude" in bot.tg.messages[new_id]["text"]
+    # The orphan is tracked for a later sweep, not lost.
+    assert 999 in _pending_ids(bot_env)
+
+    bot.tg.fail_deletes.clear()
+    bot.mod.dashboard.cleanup_general()
+
+    assert 999 in bot.tg.deleted_messages
+    assert 999 not in _pending_ids(bot_env)
+
+
+def test_cleanup_general_does_not_range_sweep(bot, bot_env):
+    """cleanup_general deletes only tracked ids. The old pinned-50 range
+    sweep is gone — message ids are chat-global, a blind range hits
+    session-topic messages (feedback_no_aggressive_sweep)."""
+    import config
+    config.set_pinned_help_id(500)
+    bot.tg.reset()
+
+    bot.mod.dashboard.cleanup_general()
+
+    assert bot.tg.calls_of("deleteMessage") == []
+
+
+# ── #89: Terminals aggregator topic deleted while bot runs ───────────
+
+
+def test_terminals_topic_deleted_recreates_and_abandons_perms(bot, bot_env):
+    """Deleting the Terminals aggregator must (a) abandon pending perm
+    prompts — their buttons died with the topic, the terminal claude falls
+    back to its local prompt — and (b) recreate the topic for the next
+    terminal event."""
+    import threading
+    import config
+    import telegram as tg_mod
+
+    # main() wires these at startup; tests drive handlers directly.
+    tg_mod.set_forum_chat_id(bot.forum_chat_id)
+    tg_mod.set_on_topic_dead(bot.mod._on_topic_dead)
+
+    req_id = "req-term-89"
+    bot.mod.bridge._pending[req_id] = threading.Event()
+    bot.mod.hooks.on_hook_permission(req_id, {
+        "tool_name": "Bash",
+        "tool_input": {"command": "rm -rf /tmp/x"},
+        "session_id": "csid-terminal-89",
+        "cwd": "/tmp/proj",
+    })
+    old_tid = config.get_terminal_topic_id()
+    assert old_tid, "perm should have created the aggregator topic"
+    assert bot.mod.state.pending_permissions
+
+    # User deletes the Terminals topic → next write there 400s.
+    bot.tg.dead_topics.add(old_tid)
+    bot.mod.hooks.on_hook_notification(
+        "claude finished", "csid-terminal-89b", {"cwd": "/tmp/proj"})
+
+    new_tid = config.get_terminal_topic_id()
+    assert new_tid and new_tid != old_tid, "aggregator must be recreated"
+    assert req_id in bot.mod.bridge._abandoned, \
+        "pending perm must be abandoned so terminal claude prompts locally"
+    assert not bot.mod.state.pending_permissions
+    # The notification landed in the fresh topic.
+    assert any("claude finished" in m["text"]
+               for m in bot.tg.messages_in_topic(new_tid))
+
+
+# ── #90: whole forum group unreachable → owner DM recovery hint ──────
+
+
+def test_group_dead_dms_owner_recovery_hint(bot, bot_env):
+    """When every group write fails with 'chat not found' (group deleted or
+    bot kicked), the owner gets ONE DM with a recovery path — not a silent
+    error log, not a DM per failed write."""
+    import telegram as tg_mod
+    tg_mod.set_forum_chat_id(bot.forum_chat_id)
+    tg_mod.set_on_chat_dead(bot.mod._on_chat_dead)
+    bot.tg.dead_chats.add(bot.forum_chat_id)
+
+    bot.mod.dashboard.sync()
+    bot.mod.dashboard.sync()  # second tick — must not duplicate the DM
+
+    dms = [m for m in bot.tg.messages.values()
+           if m["chat_id"] == bot.owner_id
+           and "Forum group unreachable" in m["text"]]
+    assert len(dms) == 1, f"expected exactly one recovery DM, got {len(dms)}"
+
+
+def test_overdue_sweep_heals_without_restart(bot, bot_env):
+    """The periodic tick retries only OVERDUE entries (live timer fired and
+    its delete failed) and never touches entries still inside their TTL —
+    a picker the user is about to click must survive (#98 follow-up)."""
+    import time as _time
+    import config
+
+    overdue, live = 701, 702
+    config.add_pending_delete(overdue, _time.time() - 100)
+    config.add_pending_delete(live, _time.time() + 3600)
+
+    bot.mod.dashboard.cleanup_general(overdue_only=True)
+
+    assert overdue in bot.tg.deleted_messages
+    assert live not in bot.tg.deleted_messages
+    assert overdue not in _pending_ids(bot_env)
+    assert live in _pending_ids(bot_env)

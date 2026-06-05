@@ -58,6 +58,36 @@ def set_on_topic_dead(callback) -> None:
     _on_topic_dead_callback = callback
 
 
+_on_chat_dead_callback = None
+
+# Error descriptions Telegram returns when the whole group is gone or the
+# bot was removed from it. "chat not found" is live-confirmed (2026-06-06);
+# the rest are documented Bot API strings, not yet observed live (#90).
+_CHAT_DEAD_MARKERS = ("chat not found", "bot was kicked",
+                      "group chat was deactivated", "bot is not a member")
+
+
+def set_on_chat_dead(callback) -> None:
+    """Install a hook called when a forum-group write fails because the
+    group itself is unreachable (deleted / bot kicked), as opposed to a
+    single dead topic. Signature: callback(chat_id: int) -> None."""
+    global _on_chat_dead_callback
+    _on_chat_dead_callback = callback
+
+
+def _check_chat_dead(chat_id, exc_body: str) -> None:
+    if not _on_chat_dead_callback or _forum_chat_id is None:
+        return
+    if chat_id != _forum_chat_id:
+        return
+    low = exc_body.lower()
+    if any(m in low for m in _CHAT_DEAD_MARKERS):
+        try:
+            _on_chat_dead_callback(chat_id)
+        except Exception as e:
+            _log(f"on_chat_dead error: {e}")
+
+
 def _check_topic_dead(chat_id, thread_id, exc_body: str) -> None:
     """If the failure body contains TOPIC_ID_INVALID and we have a
     forum-group write, notify bot.py so it can stop the session."""
@@ -84,7 +114,14 @@ def _via_budget(chat_id, prio: int, fn, *args, **kwargs):
     forum group; otherwise run direct."""
     if (_forum_chat_id is not None and chat_id == _forum_chat_id
             and prio is not None):
-        fut = _budget_mod.instance().submit(prio, fn, *args, **kwargs)
+        bud = _budget_mod.instance()
+        # Re-entrancy guard: a paid write issued from INSIDE another paid
+        # write (e.g. the topic-dead callback firing during a failed send
+        # does cleanup edits) must run directly — submit()+result() from
+        # the worker thread waits on itself and deadlocks (found live, #89).
+        if bud.is_worker_thread():
+            return fn(*args, **kwargs)
+        fut = bud.submit(prio, fn, *args, **kwargs)
         try:
             return fut.result(timeout=180)
         except Exception:
@@ -260,12 +297,16 @@ def _send_impl(text, chat_id, thread_id, buttons, markdown) -> int | None:
         r = _req("sendMessage", params)
         return r.get("result", {}).get("message_id")
     except requests.HTTPError as e:
-        if e.response is not None and e.response.status_code == 400:
-            body = ""
+        body = ""
+        if e.response is not None:
             try:
                 body = e.response.text
             except Exception:
                 pass
+        # Group-level failure (chat deleted / bot kicked) can come back as
+        # 400 or 403 — check the body regardless of status code (#90).
+        _check_chat_dead(chat_id, body)
+        if e.response is not None and e.response.status_code == 400:
             _log(f"send 400: {body}")
             _check_topic_dead(chat_id, thread_id, body)
             params.pop("parse_mode", None)
@@ -301,15 +342,32 @@ def send_long(text: str, chat_id: int, thread_id: int | None = None,
     return ids
 
 
-def delete(msg_id: int, chat_id: int, prio: int = P3):
-    _via_budget(chat_id, prio, _delete_impl, msg_id, chat_id)
-
-
-def _delete_impl(msg_id, chat_id):
+def delete(msg_id: int, chat_id: int, prio: int = P3) -> bool:
+    """Delete a message. True means the message is gone (deleted now or
+    already absent); False means it may still be there (network/429/4xx)."""
     try:
-        _req("deleteMessage", {"chat_id": chat_id, "message_id": msg_id})
+        return bool(_via_budget(chat_id, prio, _delete_impl, msg_id, chat_id))
     except Exception as e:
         _log(f"delete error: {e}")
+        return False
+
+
+def _delete_impl(msg_id, chat_id) -> bool:
+    try:
+        _req("deleteMessage", {"chat_id": chat_id, "message_id": msg_id})
+        return True
+    except Exception as e:
+        body = ""
+        resp = getattr(e, "response", None)
+        if resp is not None:
+            try:
+                body = resp.text
+            except Exception:
+                pass
+        if "message to delete not found" in body.lower():
+            return True
+        _log(f"delete error: {e}")
+        return False
 
 
 def pin(msg_id: int, chat_id: int, silent: bool = True, prio: int = P2):

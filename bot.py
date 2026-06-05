@@ -13,7 +13,7 @@ import time
 sys.path.insert(0, os.path.dirname(__file__))
 
 from config import (OWNER_ID, AUTO_UPDATE, AUTO_UPDATE_POLICY,
-                    UNLOCK_WORD,
+                    UNLOCK_WORD, add_pending_delete,
                     get_forum_chat_id, is_killed, activate_kill, deactivate_kill)
 import audit
 import frames
@@ -298,6 +298,9 @@ def _on_topic_dead(chat_id: int, thread_id: int) -> None:
     fails, telegram.py calls us here, we stop the session/mirror behind
     the dead topic.
     """
+    # Terminals aggregator? (resets its id + abandons pending perms)
+    if hooks.handle_topic_dead(thread_id):
+        return
     # Bot session?
     sess = None
     for s in mgr.list_sessions():
@@ -324,6 +327,29 @@ def _on_topic_dead(chat_id: int, thread_id: int) -> None:
                 print(f"[topic_dead] unregister error: {e}",
                       file=sys.stderr, flush=True)
             return
+
+
+_chat_dead_notice_ts = 0.0
+
+
+def _on_chat_dead(chat_id: int) -> None:
+    """Callback fired by telegram.py when a forum-group write failed with a
+    group-level error (group deleted / bot kicked). The bot can't fix this
+    itself — DM the owner a recovery path, throttled to once an hour so the
+    60s dashboard tick doesn't turn it into spam. State is kept: if the bot
+    is simply re-added to the group, everything resumes untouched.
+    """
+    global _chat_dead_notice_ts
+    now = time.time()
+    if now - _chat_dead_notice_ts < 3600:
+        return
+    _chat_dead_notice_ts = now
+    print(f"[chat_dead] forum group {chat_id} unreachable — DMing owner",
+          file=sys.stderr, flush=True)
+    tg.send("⚠️ Forum group unreachable — deleted, or the bot was removed.\n"
+            "If the group still exists: add the bot back as admin.\n"
+            "Otherwise: create a new group, enable Topics, add the bot "
+            "as admin, and send /setup there.", OWNER_ID)
 
 
 # ── 429 user-facing notice (owner DM) ───────────────────────────────
@@ -448,6 +474,7 @@ def main():
         tg.set_forum_chat_id(fid)
     tg.set_on_429(_on_429_notify)
     tg.set_on_topic_dead(_on_topic_dead)
+    tg.set_on_chat_dead(_on_chat_dead)
 
     for s in mgr.list_sessions():
         if s.topic_id and s.topic_label:
@@ -722,8 +749,8 @@ def _handle_update(u):
         fid = forum()
         if fid and chat_id == fid:
             mid = msg.get("message_id")
-            if mid:
-                tg.delete(mid, chat_id)
+            if mid and not tg.delete(mid, chat_id):
+                add_pending_delete(mid, time.time())  # due now — sweep retries
         return
 
     if from_user != OWNER_ID:
@@ -743,7 +770,8 @@ def _handle_update(u):
 
     fid = forum()
     if not thread_id and fid and chat_id == fid and msg_id:
-        tg.delete(msg_id, chat_id)
+        if not tg.delete(msg_id, chat_id):
+            add_pending_delete(msg_id, time.time())  # due now — sweep retries
 
     # ── Terminal-mirror topic: forward text into the terminal claude
     # via the dtach socket, or politely reject if input isn't bridged.

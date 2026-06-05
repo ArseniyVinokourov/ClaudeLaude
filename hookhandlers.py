@@ -99,6 +99,26 @@ class HookHandlers:
             self.state.topic_labels[tid] = "Terminals"
         return tid
 
+    def handle_topic_dead(self, thread_id) -> bool:
+        """React to the Terminals aggregator topic being deleted (#89).
+
+        Forget its id — the next terminal event recreates the topic via
+        _send_terminal. Pending Allow/Deny prompts died with the topic, so
+        abandon them: the hook closes without a decision and each terminal
+        claude falls back to its local interactive prompt (constraint #12).
+        Returns True if thread_id was the aggregator.
+        """
+        if not thread_id or thread_id != get_terminal_topic_id():
+            return False
+        print("[topic_dead] Terminals aggregator deleted — resetting",
+              file=sys.stderr, flush=True)
+        set_terminal_topic_id(None)
+        with self.state.lock:
+            watched = list(self.state.pending_terminal_msgs.keys())
+        for csid in watched:
+            self._cleanup_terminal_pending(csid)
+        return True
+
     def _send_terminal(self, text, buttons=None):
         """Send into the aggregator topic; recreate it once if it was deleted.
 
