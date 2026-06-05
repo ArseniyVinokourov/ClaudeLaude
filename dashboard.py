@@ -16,11 +16,17 @@ import sys
 import time
 
 import telegram as tg
-from config import (get_dashboard_id, get_forum_chat_id, get_pinned_help_id,
-                    is_killed, set_dashboard_id, set_pinned_help_id)
+from config import (PENDING_DELETE_RETRY_BACKOFF_S, add_pending_delete,
+                    defer_pending_delete, get_dashboard_id,
+                    get_forum_chat_id, get_pending_deletes,
+                    get_pinned_help_id, is_killed, remove_pending_delete,
+                    set_dashboard_id, set_pinned_help_id)
 from version import get_version
 
 _USAGE_CACHE_TTL = 300
+# Periodic sweep touches an entry only this long past its due time — gives
+# the live delete_after timer first shot before the sweep retries.
+_OVERDUE_GRACE_S = 30.0
 
 _MENU_ROWS = [
     [{"text": "\U0001f195 New session", "callback_data": "m:new"},
@@ -152,21 +158,44 @@ class Dashboard:
             parts.append("\U0001f512 <b>KILLED</b>")
         return "\n".join(parts)
 
-    def cleanup_general(self):
-        """Delete stale messages in General (before the pinned help)."""
+    def cleanup_general(self, overdue_only: bool = False):
+        """Sweep leftover transient messages tracked in the pending-delete
+        registry (bot's own ephemerals, pickers, replaced dashboard pins).
+
+        Every scheduled forum-group delete is registered in .state.json
+        (BotUI.delete_after / dashboard replacement); normally its timer
+        removes it. This sweep catches what survives, in two modes:
+          - startup (overdue_only=False): everything — the timers died
+            with the process, nothing will fire for these entries;
+          - periodic tick (overdue_only=True): only entries past due +
+            grace, i.e. whose live timer fired and failed. Entries inside
+            their TTL belong to a running timer — deleting them early
+            would kill a picker the user is about to click.
+        No ranged sweeps: message ids are chat-global, a range would hit
+        session topics (feedback_no_aggressive_sweep). A delete that still
+        fails (e.g. message older than the bot-delete window) gets its due
+        pushed back so it doesn't burn one paid call per tick forever.
+        """
         fid = get_forum_chat_id()
-        pinned = get_pinned_help_id()
-        if not fid or not pinned:
+        if not fid:
             return
+        now = time.time()
+        keep = {get_dashboard_id(), get_pinned_help_id()}
         count = 0
-        for msg_id in range(pinned - 1, max(pinned - 50, 0), -1):
-            try:
-                tg._req("deleteMessage", {"chat_id": fid, "message_id": msg_id})
+        for msg_id, due_ts in get_pending_deletes():
+            if msg_id in keep:
+                remove_pending_delete(msg_id)
+                continue
+            if overdue_only and now < due_ts + _OVERDUE_GRACE_S:
+                continue
+            if tg.delete(msg_id, fid):
+                remove_pending_delete(msg_id)
                 count += 1
-            except Exception:
-                pass
+            else:
+                defer_pending_delete(
+                    msg_id, now + PENDING_DELETE_RETRY_BACKOFF_S)
         if count:
-            print(f"[cleanup] deleted {count} stale General messages",
+            print(f"[cleanup] deleted {count} stale transient messages",
                   file=sys.stderr, flush=True)
 
     def sync(self):
@@ -208,19 +237,31 @@ class Dashboard:
             # Deleting the previous dashboard message also drops its pin, so
             # the fresh pin below becomes General's only pin. Do NOT use
             # unpinAllChatMessages here — it is chat-wide and would wipe every
-            # session topic's pinned control panel too (#85).
-            tg.delete(old_id, fid)
+            # session topic's pinned control panel too (#85). Register the id
+            # first: if this delete fails, the orphan is swept by
+            # cleanup_general at next startup instead of leaking forever
+            # (todo #98 — that's exactly how the stale dashboards piled up).
+            add_pending_delete(old_id, time.time())  # due now
+            if tg.delete(old_id, fid):
+                remove_pending_delete(old_id)
         msg_id = tg.send(text, fid, buttons=_MENU_ROWS)
         if msg_id:
             tg.pin(msg_id, fid)
             set_dashboard_id(msg_id)
 
     def tick(self):
-        """One background cycle: refresh usage if stale, then push the pin."""
+        """One background cycle: refresh usage if stale, push the pin,
+        retry overdue transient deletes (so General heals without a
+        restart when a timer's delete failed)."""
         if time.time() - self._usage_cache_ts > _USAGE_CACHE_TTL:
             self.refresh_usage()
         try:
             self.sync()
         except Exception as e:
             print(f"[dashboard] update error: {e}",
+                  file=sys.stderr, flush=True)
+        try:
+            self.cleanup_general(overdue_only=True)
+        except Exception as e:
+            print(f"[cleanup] sweep error: {e}",
                   file=sys.stderr, flush=True)

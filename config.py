@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 import time
 
 from dotenv import load_dotenv
@@ -72,6 +73,65 @@ def set_terminal_topic_id(topic_id: int | None):
     state = _load_state()
     state["terminal_topic_id"] = topic_id
     _save_state(state)
+
+
+# Pending-delete registry: transient bot messages in the forum group
+# (ephemerals, pickers, replaced dashboard pins) that must not outlive their
+# TTL. Each entry is [msg_id, due_ts] — registered when the delete is
+# scheduled, removed once it succeeds. Leftovers are swept two ways:
+#   - startup (cleanup_general): everything — the timers died with the
+#     process, nothing will fire for these entries;
+#   - periodic (dashboard tick): only entries PAST due (+ grace) — their
+#     live timer should have fired and didn't (failed delete), so retry.
+#     Entries still inside their TTL belong to a running timer; touching
+#     them early would kill a picker the user is about to click.
+# Targeted ids only — never ranged sweeps (message ids are chat-global,
+# a range would hit session topics).
+_pending_delete_lock = threading.Lock()
+_PENDING_DELETE_CAP = 200
+# A failed retry pushes due forward so an undeletable message (e.g. past
+# Telegram's bot-delete window) doesn't burn one paid call per tick forever.
+PENDING_DELETE_RETRY_BACKOFF_S = 600.0
+
+
+def get_pending_deletes() -> list[list]:
+    """[[msg_id, due_ts], ...] — entries whose delete is scheduled/overdue."""
+    return _load_state().get("pending_delete_ids", [])
+
+
+def add_pending_delete(msg_id: int, due_ts: float):
+    if not msg_id:
+        return
+    with _pending_delete_lock:
+        state = _load_state()
+        entries = state.get("pending_delete_ids", [])
+        if all(e[0] != msg_id for e in entries):
+            entries.append([msg_id, due_ts])
+            state["pending_delete_ids"] = entries[-_PENDING_DELETE_CAP:]
+            _save_state(state)
+
+
+def remove_pending_delete(msg_id: int):
+    with _pending_delete_lock:
+        state = _load_state()
+        entries = state.get("pending_delete_ids", [])
+        kept = [e for e in entries if e[0] != msg_id]
+        if len(kept) != len(entries):
+            state["pending_delete_ids"] = kept
+            _save_state(state)
+
+
+def defer_pending_delete(msg_id: int, due_ts: float):
+    """Push an entry's due forward after a failed retry."""
+    with _pending_delete_lock:
+        state = _load_state()
+        entries = state.get("pending_delete_ids", [])
+        for e in entries:
+            if e[0] == msg_id:
+                e[1] = due_ts
+                state["pending_delete_ids"] = entries
+                _save_state(state)
+                return
 
 
 def is_killed() -> bool:

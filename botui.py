@@ -12,7 +12,8 @@ import threading
 import time
 
 import telegram as tg
-from config import OWNER_ID, get_forum_chat_id
+from config import (OWNER_ID, add_pending_delete, get_forum_chat_id,
+                    remove_pending_delete)
 
 # Shared inline-keyboard row used by every picker/menu (and the callback
 # dispatcher that handles its `close` action).
@@ -67,14 +68,24 @@ class BotUI:
         the fire-and-forget timer can be neutralised in tests at one point.
         `before_delete`, if given, runs just before the delete (used to
         expire the matching pending-pick state).
+
+        Forum-group targets are registered in the pending-delete registry
+        at scheduling time: a daemon timer dies with the process, so if the
+        bot restarts before the delete fires (or the delete fails), startup
+        cleanup sweeps the leftover by its tracked id (#98).
         """
         if not mid:
             return
+        in_forum = chat_id == get_forum_chat_id()
+        if in_forum:
+            add_pending_delete(mid, time.time() + seconds)
         def _run():
             time.sleep(seconds)
             if before_delete is not None:
                 before_delete()
-            tg.delete(mid, chat_id)
+            ok = tg.delete(mid, chat_id)
+            if ok and in_forum:
+                remove_pending_delete(mid)
         threading.Thread(target=_run, daemon=True).start()
 
     def topic_url(self, topic_id):

@@ -93,6 +93,12 @@ class GroupBudget:
             self._last_429_at = now
             self._cv.notify_all()
 
+    def is_worker_thread(self) -> bool:
+        """True when called from the budget's own worker thread. Callers
+        use this to run nested paid writes directly instead of submitting —
+        submit()+result() from the worker would deadlock on itself."""
+        return threading.current_thread() is self._worker
+
     def headroom(self) -> int:
         with self._lock:
             self._decay_locked()

@@ -30,6 +30,13 @@ class FakeTelegram:
         # If True, sendMessage with a thread_id that is in `dead_topics`
         # raises 400 (mimics deleted-topic behavior).
         self.dead_topics: set[int] = set()
+        # Message ids whose editMessageText / deleteMessage raise 400
+        # (mimics "message to edit not found" / a failing delete).
+        self.fail_edits: set[int] = set()
+        self.fail_deletes: set[int] = set()
+        # Chat ids for which every write raises 400 "chat not found"
+        # (mimics a deleted group / kicked bot).
+        self.dead_chats: set[int] = set()
 
     # ── core request entry-point (replaces telegram._req) ───────────
 
@@ -44,6 +51,13 @@ class FakeTelegram:
                 self._update_queue.clear()
             return {"ok": True, "result": ups}
 
+        if method in ("sendMessage", "editMessageText", "deleteMessage",
+                      "pinChatMessage", "createForumTopic"):
+            if params.get("chat_id") in self.dead_chats:
+                import requests
+                resp = _FakeResponse(
+                    400, b'{"ok":false,"description":"Bad Request: chat not found"}')
+                raise requests.HTTPError("400", response=resp)
         if method in ("sendMessage", "editForumTopic"):
             tid = params.get("message_thread_id")
             if tid is not None and tid in self.dead_topics:
@@ -72,6 +86,11 @@ class FakeTelegram:
             return {"ok": True, "result": {"message_thread_id": tid, "name": params.get("name", "")}}
 
         if method == "deleteMessage":
+            if params.get("message_id") in self.fail_deletes:
+                import requests
+                resp = _FakeResponse(
+                    400, b'{"ok":false,"description":"Bad Request: message can\'t be deleted"}')
+                raise requests.HTTPError("400", response=resp)
             self.deleted_messages.add(params.get("message_id"))
             return {"ok": True, "result": True}
 
@@ -85,6 +104,11 @@ class FakeTelegram:
 
         if method == "editMessageText":
             mid = params.get("message_id")
+            if mid in self.fail_edits:
+                import requests
+                resp = _FakeResponse(
+                    400, b'{"ok":false,"description":"Bad Request: message to edit not found"}')
+                raise requests.HTTPError("400", response=resp)
             if mid in self.messages:
                 self.messages[mid]["text"] = params.get("text", "")
             return {"ok": True, "result": True}
