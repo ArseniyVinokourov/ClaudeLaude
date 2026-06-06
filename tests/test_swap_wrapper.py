@@ -89,9 +89,15 @@ def harness(tmp_path: Path):
     sh.chmod(0o755)
     work = tmp_path / "work"
     work.mkdir()
+    # Strip mirror state inherited from the developer's own shell — when
+    # this suite runs inside a mirrored claude session (under dtach),
+    # CLAUDELAUDE_DTACH_SOCKET is set and the wrapper under test would
+    # short-circuit to the already-wrapped branch.
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("CLAUDELAUDE_")}
     proc = subprocess.run(
         ["bash", str(sh), str(work), str(INSTALLER)],
-        capture_output=True, text=True, timeout=15,
+        capture_output=True, text=True, timeout=15, env=env,
     )
     yield proc, work
     shutil.rmtree(work, ignore_errors=True)

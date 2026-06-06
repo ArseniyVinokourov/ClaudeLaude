@@ -35,6 +35,7 @@ from hooks import HookBridge
 from terminal_mirror import (
     TerminalMirrorManager, push_to_dtach, dtach_socket_alive,
 )
+from session_discovery import _resolve_session_cwd
 
 # ── state ────────────────────────────────────────────────────────────
 
@@ -407,6 +408,13 @@ def _on_429_notify(retry_after_s: int) -> None:
 # ── mirror dtach-socket watcher ─────────────────────────────────────
 
 
+def _mirror_continue_buttons(csid: str) -> list:
+    """Inline button offering to continue a dead-terminal mirror as a
+    regular bot session in the same topic (callback mr:<csid>)."""
+    return [[{"text": "▶ Continue as bot session",
+              "callback_data": f"mr:{csid}"}]]
+
+
 def _mirror_socket_watcher():
     """Local-only watcher: flip mirrors to output-only when their dtach
     socket vanishes. Uses no Telegram budget — only a filesystem stat."""
@@ -419,7 +427,8 @@ def _mirror_socket_watcher():
                     not dtach_socket_alive(mirror.dtach_socket)):
                 ui.send_to_topic(
                     mirror.topic_id,
-                    "\U0001f50c Terminal closed — mirror is now output-only")
+                    "\U0001f50c Terminal closed — mirror is now output-only",
+                    buttons=_mirror_continue_buttons(mirror.csid))
                 mirror_mgr.set_dtach_socket(mirror.csid, None)
 
 
@@ -483,6 +492,15 @@ def main():
     bridge.start()
     dashboard.cleanup_general()
     mirror_mgr.start_all_followers()
+    # Mirrors whose terminal died while the bot was down were dropped at
+    # restore; offer to continue each one as a bot session in its topic.
+    for d in mirror_mgr.dropped_on_restore:
+        ui.send_to_topic(
+            d["topic_id"],
+            "\U0001f50c Terminal closed while the bot was down — "
+            "mirror dropped",
+            buttons=_mirror_continue_buttons(d["csid"]))
+    mirror_mgr.dropped_on_restore.clear()
     # No active topic healthcheck — dead topics are detected lazily via
     # TOPIC_ID_INVALID on the next send (set_on_topic_dead callback).
     # The dtach-socket watcher only does local filesystem checks.
@@ -795,12 +813,13 @@ def _handle_update(u):
         # Auto-reaction 👀 on mirror input removed for budget reasons.
         ok = push_to_dtach(mirror.dtach_socket, text)
         if not ok:
-            # On delivery failure surface an ephemeral notice — that
-            # is more visible than a small reaction and self-cleans.
-            ui.ephemeral(chat_id,
-                       "❌ Could not deliver to terminal "
-                       "(dtach socket missing or unresponsive)",
-                       thread_id=thread_id, seconds=8)
+            # Delivery failed → terminal is most likely gone. Persist the
+            # notice (not ephemeral) so the continue-button stays clickable;
+            # the user may have typed before the socket watcher fired.
+            ui.send_to_topic(thread_id,
+                             "❌ Could not deliver to terminal "
+                             "(dtach socket missing or unresponsive)",
+                             buttons=_mirror_continue_buttons(mirror.csid))
             mirror_mgr.set_dtach_socket(mirror.csid, None)
         else:
             # Track so the follower can clear pending state when claude
@@ -1250,6 +1269,49 @@ def _handle_callback(cb, data):
             elif cb_chat:
                 tg.send("⚠️ couldn't push Shift+Tab — dtach socket gone?",
                         cb_chat, thread_id=cb_thread)
+
+    elif data.startswith("mr:"):
+        # mr:<csid> — continue a dead-terminal mirror as a bot session
+        # in the same topic: drop the mirror, `claude --resume <csid>`.
+        csid = data[3:]
+        if not (cb_thread and cb_chat):
+            return
+        existing = mgr.by_topic(cb_thread)
+        if existing and existing.alive:
+            if cb_msg:
+                tg.edit(cb_msg, "ℹ️ Already a bot session — just type here",
+                        cb_chat)
+            return
+        m = mirror_mgr.by_csid(csid)
+        cwd = (m.cwd if m else None) or _resolve_session_cwd(csid)
+        if not cwd or not os.path.isdir(cwd):
+            if cb_msg:
+                tg.edit(cb_msg,
+                        "❌ Can't resolve the session's cwd — try /resume",
+                        cb_chat)
+            return
+        # Unregister the mirror FIRST — on_message routes mirror-topic
+        # input into the dead dtach socket until the topic stops
+        # resolving as a mirror.
+        if m:
+            mirror_mgr.unregister(csid)
+        old = mgr.by_claude_session_id(csid)
+        if old and not old.is_bot_spawned:
+            mgr.detach_terminal(old.sid)
+        name = os.path.basename(cwd.rstrip("/")) or "session"
+        s = mgr.resume(csid, cb_thread, name, cwd)
+        with state.lock:
+            label = state.topic_labels.get(cb_thread) or name
+        s.topic_label = label
+        lifecycle.attach_controls(s)
+        fid = forum()
+        if fid:
+            tg.edit_forum_topic(fid, cb_thread, label,
+                                icon_custom_emoji_id=_ICON_ACTIVE)
+        audit.log("mirror_to_session", f"{csid[:12]} → topic {cb_thread}")
+        if cb_msg:
+            tg.edit(cb_msg, "▶ Continued as bot session — just type here",
+                    cb_chat)
 
     elif data.startswith("mirror_history:"):
         # mirror_history:<mode>:<csid_prefix>

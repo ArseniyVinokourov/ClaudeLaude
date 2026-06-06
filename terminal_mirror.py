@@ -388,6 +388,10 @@ class TerminalMirrorManager:
         self._topic_map: dict[int, str] = {}
         self._lock = threading.Lock()
         self._persist_lock = threading.Lock()
+        # Mirrors whose terminal died while the bot was down (dead dtach
+        # socket at restore time). The bot offers a continue-as-session
+        # button for these on startup, then clears the list.
+        self.dropped_on_restore: list[dict] = []
         self._restore()
 
     def register(self, csid: str, cwd: str, topic_id: int,
@@ -669,6 +673,8 @@ class TerminalMirrorManager:
             # (dtach_socket=None from the start) survive.
             if dtach_socket and not dtach_socket_alive(dtach_socket):
                 dropped += 1
+                self.dropped_on_restore.append(
+                    {"csid": csid, "topic_id": topic_id, "cwd": cwd})
                 continue
             level = r.get("filter_level") or "lite"
             if level not in ("all", "lite"):

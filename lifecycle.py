@@ -15,7 +15,7 @@ import time
 
 import audit
 import telegram as tg
-from config import get_forum_chat_id
+from config import add_pending_delete, get_forum_chat_id
 from formatting import topic_control_rows
 
 
@@ -65,12 +65,19 @@ class SessionLifecycle:
                               seconds=5)
 
     def attach_controls(self, session, text=None):
-        """Send the pinned control panel as the topic's opening bot message.
+        """Open the topic with the control panel as its (visually) first
+        message, pinned.
 
-        The first bot/service message in a fresh topic — the one we hang the
-        per-topic buttons on — gets pinned so a long history is one tap away.
         Shared by every topic-creating path (/new, /resume, /fork) so the
-        panel + pin never drift between them. Sets controls_msg_id.
+        panel never drifts between them. Sets controls_msg_id.
+
+        The placeholder dance is load-bearing: Telegram renders NO pin bar
+        inside a topic when the pinned message is the topic's first content
+        message (the pin is accepted by the API but stays invisible). So we
+        send a throwaway first message, send the panel second, pin it, and
+        delete the placeholder — the panel ends up looking first AND shows
+        the pin bar. Live-verified 2026-06-06. Forum pins are topic-scoped:
+        they don't displace the dashboard pin in General.
         """
         fid = get_forum_chat_id()
         if not fid or not session or not session.topic_id:
@@ -80,13 +87,17 @@ class SessionLifecycle:
                 session.topic_id, self.turnctl._default_display)
         rows = topic_control_rows(session.alive, display)
         body = text or f"▶️ <code>{tg.esc(session.cwd)}</code>"
+        placeholder = self.ui.send_to_topic(session.topic_id, "…")
         mid = self.ui.send_to_topic(session.topic_id, body, buttons=rows)
         if mid:
             session.controls_msg_id = mid
-            # P1, not the default P2: a one-shot per-topic setup pin that the
-            # throughput budget must not drop under load (else the panel ends
-            # up unpinned, which is the whole point of the feature).
+            # P1, not the default P2: a one-shot per-topic setup pin that
+            # the throughput budget must not drop under load.
             tg.pin(mid, fid, prio=tg.P1)
+        if placeholder:
+            if not tg.delete(placeholder, fid):
+                # Sweep retries later — same registry as ephemerals (#98).
+                add_pending_delete(placeholder, time.time())
         return mid
 
     def _invalidate_session(self, session):
