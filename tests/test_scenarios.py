@@ -39,9 +39,10 @@ def test_new_creates_topic_and_greets(bot, tmp_path):
         or cwd.name in create["name"]
 
     bot.tg.wait_for_call("sendMessage", message_thread_id=100)
+    # First send is the pin-dance placeholder ("…"); the panel follows.
     greeting = next(
         p for p in bot.tg.calls_of("sendMessage")
-        if p.get("message_thread_id") == 100
+        if p.get("message_thread_id") == 100 and p.get("text") != "…"
     )
     assert str(cwd) in greeting["text"]
 
@@ -381,9 +382,12 @@ def test_hook_routing_skips_bot_session_by_cwd(bot, tmp_path):
 
 # ── 9. /stop then /restart ──────────────────────────────────────────
 
-def test_topic_controls_pinned_and_flip_on_stop(bot, tmp_path):
-    """#85: a spawned session's opening message carries the control panel,
-    is pinned, and flips Stop→Restart when the session stops."""
+def test_topic_controls_pinned_via_placeholder_and_flip_on_stop(bot, tmp_path):
+    """#85/#100: the control panel is pinned AND visually first. Telegram
+    never renders a pin bar for a topic's first content message
+    (live-verified 2026-06-06), so attach_controls sends a throwaway
+    placeholder, sends the panel second, pins it, deletes the placeholder.
+    The panel flips Stop→Restart when the session stops."""
     cwd = tmp_path / "ctrlproj"
     cwd.mkdir(exist_ok=True)
     bot.tg.inject_update(text_update(
@@ -395,12 +399,25 @@ def test_topic_controls_pinned_and_flip_on_stop(bot, tmp_path):
     assert sess.controls_msg_id is not None
     assert sess.controls_msg_id in bot.tg.pinned_messages
 
-    # Opening message sent with the alive control set (Stop present).
-    opening = next(p for p in bot.tg.calls_of("sendMessage")
-                   if p.get("message_thread_id") == sess.topic_id
-                   and "▶️" in p.get("text", ""))
-    markup = str(opening.get("reply_markup", {}))
-    assert "m:stop" in markup and "m:mode" in markup
+    # Placeholder first (so the panel isn't the topic's first message),
+    # then deleted — the panel ends up the only visible opener.
+    topic_msgs = [p for p in bot.tg.calls_of("sendMessage")
+                  if p.get("message_thread_id") == sess.topic_id]
+    assert len(topic_msgs) >= 2
+    assert topic_msgs[0].get("text") == "…"
+    placeholder_ids = [mid for mid, m in bot.tg.messages.items()
+                       if m.get("text") == "…"
+                       and m.get("thread_id") == sess.topic_id]
+    assert placeholder_ids and all(
+        mid in bot.tg.deleted_messages for mid in placeholder_ids), (
+        "placeholder must be deleted after the panel is pinned")
+
+    # Panel carries the cwd banner + alive control set (Stop present).
+    panel = next(p for p in topic_msgs
+                 if "m:stop" in str(p.get("reply_markup", "")))
+    assert "▶️" in panel.get("text", "")
+    markup = str(panel.get("reply_markup", {}))
+    assert "m:mode" in markup
     assert "m:restart" not in markup
 
     # Stop → control panel repainted to the stopped (Restart) set.
@@ -1775,14 +1792,15 @@ def test_fork_backfills_recent_messages(bot, tmp_path):
     assert sent, last
     assert all(mid in recent for mid in sent), (sent, recent)
 
-    # The fork's opening "Fork of …" message carries the pinned control panel.
+    # The fork's "Fork of …" panel is pinned (placeholder dance — see
+    # test_topic_controls_pinned_via_placeholder_and_flip_on_stop).
     fork_sess = bot.mod.mgr.by_topic(new_topic)
     assert fork_sess and fork_sess.controls_msg_id is not None
     assert fork_sess.controls_msg_id in bot.tg.pinned_messages
-    opening = next(p for p in bot.tg.calls_of("sendMessage")
-                   if p.get("message_thread_id") == new_topic
-                   and "Fork of" in (p.get("text") or ""))
-    assert "m:stop" in str(opening.get("reply_markup", {}))
+    panel = next(p for p in bot.tg.calls_of("sendMessage")
+                 if p.get("message_thread_id") == new_topic
+                 and "m:stop" in str(p.get("reply_markup", "")))
+    assert "Fork of" in panel.get("text", "")
 
 
 # ── my_chat_member + admin sanity (Batch A #16) ──────────────────────
@@ -2054,6 +2072,67 @@ def test_mirror_input_bridge_output_only_rejects(bot, tmp_path, monkeypatch):
         assert notices, "expected an Output-only ephemeral"
     finally:
         bot.mod.mirror_mgr.unregister(csid)
+
+
+def test_mirror_dead_terminal_continue_as_session(bot, tmp_path, monkeypatch):
+    """Terminal dies → push fails → topic gets a persistent notice with a
+    "continue as bot session" button. Clicking it unregisters the mirror,
+    resumes the claude session as bot-spawned in the SAME topic, and topic
+    input thereafter spawns `claude --resume <csid>` instead of routing
+    into the dead dtach socket."""
+    import json as _json
+    csid = "mirror-continue-1"
+    cwd = str(tmp_path / "mirror_continue")
+    sock = str(tmp_path / "dead.sock")
+    (tmp_path / "mirror_continue").mkdir()
+
+    # Bridged mirror whose dtach delivery fails (terminal gone).
+    monkeypatch.setattr(bot.mod, "push_to_dtach", lambda *a, **kw: False)
+    bot.mod.mirror.on_open_in_bot(csid, cwd, sock)
+    m = bot.mod.mirror_mgr.by_csid(csid)
+    assert m and m.dtach_socket == sock
+    topic_id = m.topic_id
+
+    bot.tg.inject_update(text_update(
+        "lost message", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, thread_id=topic_id,
+    ))
+    _drain_updates(bot)
+
+    # Failure notice carries the continue button (mr:<csid>).
+    offers = [
+        p for p in bot.tg.calls_of("sendMessage")
+        if p.get("message_thread_id") == topic_id
+        and f"mr:{csid}" in _json.dumps(p.get("reply_markup", ""))
+    ]
+    assert offers, "expected a notice with the continue-as-session button"
+
+    # Click the button.
+    bot.tg.inject_update(callback_update(
+        f"mr:{csid}", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id,
+        message_id=777, thread_id=topic_id,
+    ))
+    _drain_updates(bot)
+
+    assert bot.mod.mirror_mgr.by_csid(csid) is None, "mirror must be gone"
+    s = bot.mod.mgr.by_topic(topic_id)
+    assert s and s.alive and s.is_bot_spawned
+    assert s.claude_session_id == csid
+
+    # Topic input now drives a bot session resuming the same claude id.
+    bot.tg.inject_update(text_update(
+        "hello after continue", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, thread_id=topic_id,
+    ))
+    _drain_updates(bot)
+    spawns = bot.claude.wait_for_spawns(1)
+    cmd = spawns[-1]["cmd"]
+    assert "--resume" in cmd and csid in cmd, cmd
+    # Let the worker finish the fake turn inside this test's monkeypatch
+    # scope — the Compact-markup call is the turn's last TG write; without
+    # this the on_result tail can run after teardown and hit the real API.
+    bot.tg.wait_for_call("editMessageReplyMarkup")
 
 
 def test_mirror_persist_and_restore(bot_env, tmp_path, monkeypatch):
@@ -2875,6 +2954,13 @@ def test_mirror_restore_drops_dead_sockets(bot_env, tmp_path, monkeypatch):
     on_disk = _json.loads(persist.read_text())
     csids = {r["csid"] for r in on_disk}
     assert csids == {"mirror-alive", "mirror-output-only"}, csids
+
+    # The dead-socket drop (terminal died while the bot was down) is
+    # recorded so startup can offer "continue as bot session" in the
+    # topic. Legacy tmux records are NOT — their topics are long stale.
+    assert mgr.dropped_on_restore == [
+        {"csid": "mirror-dead", "topic_id": 2, "cwd": "/x"}
+    ], mgr.dropped_on_restore
 
 
 def test_mirror_drops_slash_command_body_via_is_meta(bot, tmp_path):
