@@ -18,8 +18,12 @@ _TIMEOUT = int(os.environ.get("FRAME_TIMEOUT", "180"))
 
 
 def available() -> bool:
-    """True if the side-venv and worker script are present."""
-    return os.path.isfile(_STT_PY) and os.path.isfile(_EXTRACT)
+    """True if the side-venv, worker script AND PyAV are present. The venv
+    may have been created whisper-only or be mid-install, so check the
+    actual decoder package (same rationale as stt.available)."""
+    import stt as _stt
+    return (os.path.isfile(_STT_PY) and os.path.isfile(_EXTRACT)
+            and _stt.pkg_present("av"))
 
 
 def extract(video_path: str, out_dir: str) -> list:

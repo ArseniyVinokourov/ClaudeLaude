@@ -134,6 +134,17 @@ def defer_pending_delete(msg_id: int, due_ts: float):
                 return
 
 
+def get_uploads_warned_at() -> float:
+    """Last time the owner was DM'd about upload-folder size (#87)."""
+    return _load_state().get("uploads_warned_at", 0.0)
+
+
+def set_uploads_warned_at(ts: float):
+    state = _load_state()
+    state["uploads_warned_at"] = ts
+    _save_state(state)
+
+
 def is_killed() -> bool:
     return os.path.exists(_KILL_FILE)
 

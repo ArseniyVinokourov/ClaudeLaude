@@ -130,30 +130,108 @@ fi
 .venv/bin/pip install -q -r requirements.txt
 ok "Dependencies installed"
 
-# ── speech-to-text (voice & video input) ─────────────────────────────
-bold "\nSetting up speech-to-text (voice/video messages)..."
-echo "Voice notes and videos are transcribed locally with faster-whisper."
-echo "It lives in a SEPARATE venv (.venv-stt) so the bot's own venv stays"
-echo "light. The model (~460MB for 'small') is downloaded once."
+# ── speech & video recognition (optional) ────────────────────────────
+# Two tiers, asked separately:
+#   speech (Whisper)  — transcribes voice notes AND speech in videos;
+#                       includes the video decoder as a dependency
+#   frames-only       — just the video decoder (PyAV): scene frames from
+#                       videos, no speech transcription
+# Skipping both is fine — the bot offers the install in-chat when a
+# voice/video message arrives.
+
+_env_set() {  # _env_set KEY VALUE — idempotent .env writer
+    if grep -q "^$1=" .env 2>/dev/null; then
+        sed -i.bak "s|^$1=.*|$1=$2|" .env && rm -f .env.bak
+    else
+        echo "$1=$2" >> .env
+    fi
+}
+
+bold "\nSpeech recognition (optional)"
+echo "Transcribes voice notes and speech in videos locally with Whisper."
+echo "Nothing leaves this machine. Costs ~450MB of libraries plus the"
+echo "model you pick. If you skip, the bot offers the install in-chat"
+echo "when a voice/video message arrives."
 echo ""
-if [ ! -d .venv-stt ]; then
-    python3 -m venv .venv-stt
-    ok "STT virtual environment created"
+read -rp "Install speech recognition? [Y/n]: " SETUP_STT
+SETUP_STT="${SETUP_STT:-Y}"
+
+if [[ "$SETUP_STT" =~ ^[Yy] ]]; then
+    echo ""
+    echo "Whisper model (accuracy vs size — pick for your hardware):"
+    echo "  1) base   — ~145MB, fastest, ok for weak/old machines"
+    echo "  2) small  — ~460MB, good accuracy (default)"
+    echo "  3) medium — ~1.5GB, best accuracy, slow without a beefy CPU"
+    read -rp "Model [1/2/3 or name, default small]: " WHISPER_CHOICE
+    case "${WHISPER_CHOICE:-2}" in
+        1) WHISPER_CHOICE=base ;;
+        2) WHISPER_CHOICE=small ;;
+        3) WHISPER_CHOICE=medium ;;
+        tiny|base|small|medium|large-v3) ;;
+        *) warn "Unknown model '$WHISPER_CHOICE' — using 'small'"; WHISPER_CHOICE=small ;;
+    esac
+    # Persist so stt.py picks it up (config.py loads .env into the environment).
+    _env_set WHISPER_MODEL "$WHISPER_CHOICE"
+
+    if [ ! -d .venv-stt ]; then
+        python3 -m venv .venv-stt
+        ok "STT virtual environment created"
+    else
+        ok "STT virtual environment exists"
+    fi
+    .venv-stt/bin/pip install -q --upgrade pip
+    # faster-whisper (speech→text) + pillow (saving sampled video frames). PyAV
+    # ships with faster-whisper and bundles its own codecs, so NO system ffmpeg
+    # is needed — voice and video both decode in-process.
+    .venv-stt/bin/pip install -q faster-whisper pillow
+    ok "faster-whisper + pillow installed (PyAV bundled — no system ffmpeg needed)"
+    # Pre-fetch the model so the first voice/video message isn't slow.
+    echo "Downloading whisper model '${WHISPER_CHOICE}' (one-time)..."
+    .venv-stt/bin/python -c "from faster_whisper import WhisperModel; WhisperModel('${WHISPER_CHOICE}', device='cpu', compute_type='int8')" \
+        && ok "Model '${WHISPER_CHOICE}' ready" \
+        || warn "Model pre-download failed; it will download on first use."
 else
-    ok "STT virtual environment exists"
+    ok "Skipped."
+    echo ""
+    bold "Video frames without speech (optional)"
+    echo "The video decoder alone (~250MB) lets the bot pull scene frames"
+    echo "out of videos and video stickers — speech stays untranscribed."
+    read -rp "Install the video decoder? [y/N]: " SETUP_DECODER
+    if [[ "${SETUP_DECODER:-N}" =~ ^[Yy] ]]; then
+        if [ ! -d .venv-stt ]; then
+            python3 -m venv .venv-stt
+            ok "STT virtual environment created"
+        fi
+        .venv-stt/bin/pip install -q --upgrade pip
+        .venv-stt/bin/pip install -q av pillow numpy
+        ok "Video decoder installed (frames-only tier)"
+    else
+        ok "Skipped — voice/video messages will offer the install in-chat."
+    fi
 fi
-.venv-stt/bin/pip install -q --upgrade pip
-# faster-whisper (speech→text) + pillow (saving sampled video frames). PyAV
-# ships with faster-whisper and bundles its own codecs, so NO system ffmpeg
-# is needed — voice and video both decode in-process.
-.venv-stt/bin/pip install -q faster-whisper pillow
-ok "faster-whisper + pillow installed (PyAV bundled — no system ffmpeg needed)"
-# Pre-fetch the model so the first voice/video message isn't slow.
-WHISPER_MODEL="${WHISPER_MODEL:-small}"
-echo "Downloading whisper model '${WHISPER_MODEL}' (one-time)..."
-.venv-stt/bin/python -c "from faster_whisper import WhisperModel; WhisperModel('${WHISPER_MODEL}', device='cpu', compute_type='int8')" \
-    && ok "Model '${WHISPER_MODEL}' ready" \
-    || warn "Model pre-download failed; it will download on first use."
+
+# ── temp media folder limits ─────────────────────────────────────────
+bold "\nMedia storage alerts"
+echo "Incoming photos/voice/videos land in /tmp/bot_uploads; files older"
+echo "than 48h are cleaned automatically (referenced ones are kept). The"
+echo "bot DMs you when the folder outgrows a threshold (max once a day)."
+echo ""
+echo "Alert threshold:"
+echo "  1) 100MB   — weak/old machine, tight disk"
+echo "  2) 250MB"
+echo "  3) 500MB   (default)"
+echo "  4) 1GB     — plenty of disk, fewer alerts"
+read -rp "Threshold [1/2/3/4 or MB number, default 500]: " WARN_CHOICE
+case "${WARN_CHOICE:-3}" in
+    1) WARN_MB=100 ;;
+    2) WARN_MB=250 ;;
+    3) WARN_MB=500 ;;
+    4) WARN_MB=1024 ;;
+    *) if [[ "$WARN_CHOICE" =~ ^[0-9]+$ ]]; then WARN_MB="$WARN_CHOICE";
+       else warn "Not a number — using 500"; WARN_MB=500; fi ;;
+esac
+_env_set UPLOAD_WARN_MB "$WARN_MB"
+ok "Alert threshold: ${WARN_MB}MB (UPLOAD_WARN_MB in .env; cleanup age via UPLOAD_TTL_S)"
 
 # ── Claude Code hooks ────────────────────────────────────────────────
 bold "\nClaude Code hooks (optional)"

@@ -103,6 +103,18 @@ setup.sh asks for:
  - OWNER_ID      — your Telegram user ID (ask @userinfobot)
  - PROJECTS_DIR  — where your projects live (default: ~/Projects)
  - HOOK_PORT     — local port for hooks (default: 9853)
+ - speech recognition (optional) — Whisper model base/small/medium,
+   or a frames-only video decoder; skip and the bot offers the
+   install in-chat on the first voice/video message
+ - media alert threshold — DM when /tmp/bot_uploads outgrows it
+
+Tunables in .env (all optional, setup.sh fills the first two):
+
+ - WHISPER_MODEL   — base | small | medium (default: small)
+ - UPLOAD_WARN_MB  — media folder size that triggers a daily DM (default: 500)
+ - UPLOAD_TTL_S    — age before an unreferenced media file is cleaned
+                     (default: 172800 = 48h)
+ - STT_TIMEOUT     — transcription timeout, seconds (default: 180)
 
 Run it:
 

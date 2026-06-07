@@ -14,10 +14,13 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from config import (OWNER_ID, AUTO_UPDATE, AUTO_UPDATE_POLICY,
                     UNLOCK_WORD, add_pending_delete,
-                    get_forum_chat_id, is_killed, activate_kill, deactivate_kill)
+                    get_forum_chat_id, get_uploads_warned_at,
+                    set_uploads_warned_at,
+                    is_killed, activate_kill, deactivate_kill)
 import audit
 import frames
 import stt
+import stt_install
 import telegram as tg
 from botui import BotUI, CLOSE_ROW
 from commands import Commands
@@ -36,7 +39,7 @@ from terminal_mirror import (
     TerminalMirrorManager, push_to_dtach, dtach_socket_alive,
     reap_if_abandoned,
 )
-from session_discovery import _resolve_session_cwd
+from session_discovery import _resolve_session_cwd, _session_jsonl_path
 
 # ── state ────────────────────────────────────────────────────────────
 
@@ -85,6 +88,9 @@ class BotState:
         # Rolling window of recent message_ids per session topic, used to
         # backfill context when a fork is created. Trimmed to _FORK_BACKFILL.
         self.recent_msgs: dict[int, list[int]] = {}
+        # Runtime STT install offers (#86): pick_id → parked media message
+        # (kind, file_id, caption, sid, chat/msg/thread ids, offer_mid).
+        self.pending_media_installs: dict[str, dict] = {}
 
 
 state = BotState()
@@ -286,11 +292,123 @@ commands = Commands(
 
 
 def _dashboard_loop():
-    """Background: update dashboard pin every 60s, refresh usage every 5m."""
+    """Background: update dashboard pin every 60s, refresh usage every 5m,
+    sweep stale media uploads every hour (first pass ~5s after start, which
+    doubles as the startup sweep)."""
     time.sleep(5)
     while bot_running:
         dashboard.tick()
+        if time.time() - _uploads_last_sweep > _UPLOAD_SWEEP_INTERVAL_S:
+            try:
+                _sweep_uploads()
+            except Exception as e:
+                print(f"[uploads] sweep error: {e}",
+                      file=sys.stderr, flush=True)
         time.sleep(60)
+
+
+# ── upload retention (#87) ──────────────────────────────────────────
+# Downloaded media and extracted frames in _UPLOAD_DIR were never deleted
+# (it's /tmp, so only a WSL restart cleaned it). Sweep: anything older than
+# _UPLOAD_TTL_S goes — unless its path still appears in the JSONL transcript
+# of a session the bot knows about (Claude may re-read a path it was given,
+# and a stopped session can be /resume'd). Size guard: past _UPLOAD_WARN_MB
+# the owner gets a DM, at most one a day. Claude itself is told the files
+# are temporary (_TEMP_NOTE) so anything long-lived gets copied out.
+
+_UPLOAD_TTL_S = int(os.environ.get("UPLOAD_TTL_S", str(48 * 3600)))
+_UPLOAD_SWEEP_INTERVAL_S = 3600
+_UPLOAD_WARN_BYTES = int(os.environ.get("UPLOAD_WARN_MB", "500")) * 1024 * 1024
+_UPLOAD_WARN_INTERVAL_S = 24 * 3600
+_uploads_last_sweep = 0.0
+
+# Appended to every turn that hands Claude an _UPLOAD_DIR path.
+_TEMP_NOTE = (f"(note: attached files under {_UPLOAD_DIR} are temporary — "
+              f"auto-deleted after ~{_UPLOAD_TTL_S // 3600}h; copy anything "
+              f"needed long-term into the project)")
+
+
+def _known_session_jsonls() -> list[str]:
+    """Transcript files of every session the bot knows about — alive AND
+    stopped (a stopped session can be /resume'd and re-read an upload path
+    it was given). Protection lapses only when the session ages out of the
+    manager (GC, ~24h after stop) or its JSONL disappears."""
+    paths = []
+    for s in mgr.list_sessions():
+        if s.claude_session_id:
+            p = _session_jsonl_path(s.claude_session_id)
+            if p:
+                paths.append(p)
+    for m in mirror_mgr.list():
+        jp = getattr(m, "jsonl_path", None)
+        if jp and os.path.isfile(jp):
+            paths.append(jp)
+    return paths
+
+
+def _sweep_uploads():
+    global _uploads_last_sweep
+    _uploads_last_sweep = time.time()
+    try:
+        entries = os.listdir(_UPLOAD_DIR)
+    except OSError:
+        return
+    now = time.time()
+    due = []
+    for name in entries:
+        path = os.path.join(_UPLOAD_DIR, name)
+        try:
+            if now - os.path.getmtime(path) > _UPLOAD_TTL_S:
+                due.append(path)
+        except OSError:
+            continue
+    if due:
+        # Transcripts are read only when something is actually due. A
+        # substring check is enough: every upload name embeds a timestamp,
+        # and a frames_<ts> dir shows up via its frame file paths.
+        blob_parts = []
+        for p in _known_session_jsonls():
+            try:
+                with open(p, encoding="utf-8", errors="replace") as f:
+                    blob_parts.append(f.read())
+            except OSError:
+                continue
+        blob = "\n".join(blob_parts)
+        removed = 0
+        for path in due:
+            if path in blob:
+                continue  # an alive session still references it
+            try:
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    os.remove(path)
+                removed += 1
+            except OSError:
+                pass
+        if removed:
+            print(f"[uploads] swept {removed} stale media files",
+                  file=sys.stderr, flush=True)
+    _warn_uploads_size()
+
+
+def _warn_uploads_size():
+    total = 0
+    for root, _dirs, files in os.walk(_UPLOAD_DIR):
+        for fn in files:
+            try:
+                total += os.path.getsize(os.path.join(root, fn))
+            except OSError:
+                pass
+    if total < _UPLOAD_WARN_BYTES:
+        return
+    if time.time() - get_uploads_warned_at() < _UPLOAD_WARN_INTERVAL_S:
+        return
+    set_uploads_warned_at(time.time())
+    mb = total // (1024 * 1024)
+    tg.send(f"📦 Media uploads folder reached {mb} MB ({_UPLOAD_DIR}).\n"
+            f"Files older than 48h are cleaned automatically; the rest "
+            f"is recent media still referenced by sessions.", OWNER_ID)
 
 
 def _on_topic_dead(chat_id: int, thread_id: int) -> None:
@@ -653,6 +771,7 @@ def _flush_media_group(gid):
     attach = "\n".join(f"[Attached file: {p}]" for p in paths)
     caption = grp["caption"]
     user_text = f"{caption}\n{attach}" if caption else attach
+    user_text += f"\n{_TEMP_NOTE}"
     audit.log("user_message", f"[album] {len(paths)} files", sid=session.sid)
     turnctl.enqueue_user_input(session, user_text, chat_id,
                                grp["first_msg_id"], thread_id)
@@ -719,7 +838,7 @@ def _handle_video(session, file_id, caption, chat_id, msg_id, thread_id):
     if shots:
         flines = "\n".join(f"[Attached file: {s['path']}] (t={_mmss(s['t'])})"
                            for s in shots)
-        parts.append(f"[Video frames at scene changes]\n{flines}")
+        parts.append(f"[Video frames at scene changes]\n{flines}\n{_TEMP_NOTE}")
     if not parts:
         ui.ephemeral(chat_id,
                      "🎬 Could not read the video (no audio track, no frames)",
@@ -727,6 +846,13 @@ def _handle_video(session, file_id, caption, chat_id, msg_id, thread_id):
         return
     if caption:
         parts.insert(0, caption)
+    # Decoder-only tier (#86): frames extracted, speech silently absent —
+    # tell the user once per video so the missing transcript isn't a mystery.
+    if shots and not transcript and not stt.available():
+        ui.ephemeral(chat_id,
+                     "🎬 Frames only — Whisper isn't installed, "
+                     "speech not transcribed",
+                     thread_id=thread_id, seconds=8)
     user_text = "\n\n".join(parts)
     audit.log("user_message",
               f"[video] {len(shots)} frames, transcript {len(transcript)} chars",
@@ -781,12 +907,109 @@ def _handle_video_sticker(session, file_id, descr, chat_id, msg_id, thread_id):
     shots = frames.extract(dest, os.path.join(_UPLOAD_DIR, f"frames_{ts}"))
     if shots:
         flines = "\n".join(f"[Attached file: {s['path']}]" for s in shots)
-        user_text = f"{descr}\n{flines}"
+        user_text = f"{descr}\n{flines}\n{_TEMP_NOTE}"
     else:
         user_text = descr
     audit.log("user_message", f"[sticker video] {len(shots)} frames",
               sid=session.sid)
     turnctl.enqueue_user_input(session, user_text, chat_id, msg_id, thread_id)
+
+
+# ── runtime STT install offers (#86) ────────────────────────────────
+# setup.sh makes the ~1GB transcription stack opt-in; a voice/video that
+# arrives without it gets an inline install offer instead of a dead end.
+# The message's file_id is parked in state.pending_media_installs and
+# replayed through the normal handler once the install finishes (Telegram
+# file_ids stay downloadable, so nothing is fetched until then).
+
+def _offer_media_install(session, kind, file_id, caption,
+                         chat_id, msg_id, thread_id):
+    pick_id = str(time.time_ns())[-10:]
+    model_rows = [
+        [{"text": f"base — fast, {stt_install.MODELS['base']}",
+          "callback_data": f"mi:{pick_id}:base"}],
+        [{"text": f"small — better, {stt_install.MODELS['small']}",
+          "callback_data": f"mi:{pick_id}:small"}],
+        [{"text": f"medium — best, {stt_install.MODELS['medium']}",
+          "callback_data": f"mi:{pick_id}:medium"}],
+    ]
+    frames_row = [{"text": "🎞 Frames only — ~250MB",
+                   "callback_data": f"mi:{pick_id}:frames"}]
+    cancel_row = [{"text": "✗ Not now", "callback_data": f"mi:{pick_id}:x"}]
+    if kind == "voice":
+        text = ("🎙 Voice transcription isn't installed.\n"
+                "Whisper runs fully on this machine — pick a model:")
+        rows = model_rows + [cancel_row]
+    elif kind == "video":
+        text = ("🎬 Video processing isn't installed.\n"
+                "Whisper transcribes speech (fully local); the decoder "
+                "alone extracts frames without transcription:")
+        rows = model_rows + [frames_row, cancel_row]
+    else:  # video sticker — decoder is all it needs
+        text = ("🎞 Video stickers need the video decoder (~250MB), "
+                "which isn't installed:")
+        rows = [[{"text": "Install decoder — ~250MB",
+                  "callback_data": f"mi:{pick_id}:frames"}], cancel_row]
+    offer_mid = tg.send(text, chat_id, thread_id=thread_id, buttons=rows)
+    with state.lock:
+        state.pending_media_installs[pick_id] = {
+            "kind": kind, "file_id": file_id, "caption": caption,
+            "sid": session.sid, "chat_id": chat_id, "msg_id": msg_id,
+            "thread_id": thread_id, "offer_mid": offer_mid,
+        }
+
+
+def _media_install_clicked(pick_id, choice):
+    with state.lock:
+        entry = state.pending_media_installs.get(pick_id)
+    if not entry:
+        return
+    if choice == "x":
+        with state.lock:
+            state.pending_media_installs.pop(pick_id, None)
+        if entry["offer_mid"]:
+            tg.delete(entry["offer_mid"], entry["chat_id"])
+        return
+    if choice not in ("frames", *stt_install.MODELS):
+        return
+    if stt_install.busy():
+        ui.ephemeral(entry["chat_id"], "⏳ Another install is already running",
+                     thread_id=entry["thread_id"], seconds=6)
+        return
+    with state.lock:
+        state.pending_media_installs.pop(pick_id, None)
+    threading.Thread(target=_run_media_install, args=(entry, choice),
+                     daemon=True).start()
+
+
+def _run_media_install(entry, choice):
+    chat_id, thread_id = entry["chat_id"], entry["thread_id"]
+    offer_mid = entry["offer_mid"]
+    if choice == "frames":
+        what = "video decoder (~250MB)"
+    else:
+        what = f"Whisper {choice} ({stt_install.MODELS[choice]})"
+    if offer_mid:
+        tg.edit(offer_mid,
+                f"⏳ Installing {what} — this can take a few minutes…",
+                chat_id)
+    ok = (stt_install.install_decoder() if choice == "frames"
+          else stt_install.install_whisper(choice))
+    audit.log("stt_install", f"{choice} {'ok' if ok else 'FAILED'}")
+    if not ok:
+        if offer_mid:
+            tg.edit(offer_mid, "✗ Install failed — see bot.log", chat_id)
+        return
+    if offer_mid:
+        tg.edit(offer_mid, f"✓ Installed {what}", chat_id)
+        ui.delete_after(offer_mid, chat_id, 8)
+    session = mgr._sessions.get(entry["sid"])
+    if not (session and session.alive):
+        return  # session died while pip ran; user can re-send the media
+    handler = {"voice": _handle_voice, "video": _handle_video,
+               "sticker": _handle_video_sticker}[entry["kind"]]
+    handler(session, entry["file_id"], entry["caption"],
+            chat_id, entry["msg_id"], thread_id)
 
 
 def _reject_no_session(chat_id, thread_id, what):
@@ -925,6 +1148,7 @@ def _handle_update(u):
         if tg.download_file(file_id, dest):
             user_text = (f"{caption}\n[Attached file: {dest}]" if caption
                          else f"[Attached file: {dest}]")
+            user_text += f"\n{_TEMP_NOTE}"
             audit.log("user_message", f"[file] {filename}",
                       sid=session.sid)
             turnctl.enqueue_user_input(session, user_text, chat_id, msg_id, thread_id)
@@ -949,7 +1173,11 @@ def _handle_update(u):
             descr = f"[Sticker: {emoji}]"
         else:
             descr = "[Sticker]"
-        if sticker.get("is_video") and frames.available():
+        if sticker.get("is_video"):
+            if not frames.available():
+                _offer_media_install(session, "sticker", sticker["file_id"],
+                                     descr, chat_id, msg_id, thread_id)
+                return
             threading.Thread(
                 target=_handle_video_sticker,
                 args=(session, sticker["file_id"], descr,
@@ -970,7 +1198,7 @@ def _handle_update(u):
             dest = os.path.join(_UPLOAD_DIR,
                                 f"{int(time.time())}_sticker.{ext}")
             if tg.download_file(image_id, dest):
-                descr += f"\n[Attached file: {dest}]"
+                descr += f"\n[Attached file: {dest}]\n{_TEMP_NOTE}"
         turnctl.enqueue_user_input(session, descr, chat_id, msg_id, thread_id)
         return
 
@@ -981,10 +1209,8 @@ def _handle_update(u):
             _reject_no_session(chat_id, thread_id, "voice")
             return
         if not stt.available():
-            ui.ephemeral(chat_id,
-                       "🎙 Voice recognition is not configured "
-                       "(run setup.sh to install it)",
-                       thread_id=thread_id, seconds=8)
+            _offer_media_install(session, "voice", voice["file_id"],
+                                 caption, chat_id, msg_id, thread_id)
             return
         threading.Thread(
             target=_handle_voice,
@@ -999,11 +1225,9 @@ def _handle_update(u):
         if not (session and session.is_bot_spawned and session.alive):
             _reject_no_session(chat_id, thread_id, "video")
             return
-        if not frames.available():
-            ui.ephemeral(chat_id,
-                       "🎬 Media recognition is not configured "
-                       "(run setup.sh to install it)",
-                       thread_id=thread_id, seconds=8)
+        if not (frames.available() or stt.available()):
+            _offer_media_install(session, "video", video["file_id"],
+                                 caption, chat_id, msg_id, thread_id)
             return
         threading.Thread(
             target=_handle_video,
@@ -1108,6 +1332,12 @@ def _handle_callback(cb, data):
 
     if data.startswith("aq:"):
         asker.handle_callback(data)
+        return
+
+    if data.startswith("mi:"):
+        parts = data.split(":")
+        if len(parts) == 3:
+            _media_install_clicked(parts[1], parts[2])
         return
 
     if data.startswith("p:"):

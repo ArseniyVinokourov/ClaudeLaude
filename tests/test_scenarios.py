@@ -21,6 +21,33 @@ def _drain_updates(bot):
         bot.mod._handle_update(u)
 
 
+def _wait_until(cond, timeout=5.0):
+    """Poll until cond() is truthy — for paths that hop a daemon thread."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if cond():
+            return
+        time.sleep(0.02)
+    raise AssertionError("condition not met within timeout")
+
+
+def _wait_turn_settled(bot, reply_text="ok", timeout=5.0):
+    """Wait until claude's reply (FakeClaude default: "ok") hits telegram
+    AND API traffic quiesces, so the session worker's trailing sends can't
+    leak past the fixture's fake telegram into the real API after teardown.
+    (state.turns can't signal this: on_result pops the entry, so the turn
+    object is unobservable both before the turn and after it.)"""
+    _wait_until(lambda: any((c.get("text") or "").strip() == reply_text
+                            for c in bot.tg.calls_of("sendMessage")), timeout)
+    last, stable_since = -1, time.time()
+    while time.time() - stable_since < 0.25:
+        with bot.tg._lock:
+            n = len(bot.tg.calls)
+        if n != last:
+            last, stable_since = n, time.time()
+        time.sleep(0.02)
+
+
 # ── 1. /new creates a forum topic and greets ────────────────────────
 
 def test_new_creates_topic_and_greets(bot, tmp_path):
@@ -1693,6 +1720,7 @@ def test_voice_message_transcribed_into_turn(bot, tmp_path, monkeypatch):
 
     bot.mod._handle_voice(sess, "voice-fid", "", bot.forum_chat_id,
                           777, sess.topic_id)
+    _wait_turn_settled(bot)
 
     users = [h for h in sess.history if h.kind == "user"]
     assert len(users) == 1, users
@@ -1700,9 +1728,10 @@ def test_voice_message_transcribed_into_turn(bot, tmp_path, monkeypatch):
     assert "Voice message transcript" in users[0].text
 
 
-def test_voice_message_unconfigured_is_rejected(bot, tmp_path, monkeypatch):
-    """When STT isn't installed, a voice note gets a polite notice and
-    never starts a Claude turn."""
+def test_voice_unconfigured_offers_install(bot, tmp_path, monkeypatch):
+    """When STT isn't installed, a voice note gets an inline install offer
+    (model-size buttons, no frames-only row) and never starts a Claude
+    turn; the message is parked for replay after the install (#86)."""
     _start_bot_session(bot, tmp_path)
     sess = next(iter(bot.mod.mgr._sessions.values()))
     monkeypatch.setattr(bot.mod.stt, "available", lambda: False)
@@ -1721,7 +1750,83 @@ def test_voice_message_unconfigured_is_rejected(bot, tmp_path, monkeypatch):
 
     assert [h for h in sess.history if h.kind == "user"] == []
     sends = bot.tg.calls_of("sendMessage")
-    assert any("not configured" in (c.get("text") or "") for c in sends), sends
+    offers = [c for c in sends if "isn't installed" in (c.get("text") or "")]
+    assert offers, sends
+    rows = offers[0]["reply_markup"]["inline_keyboard"]
+    datas = [b["callback_data"] for row in rows for b in row]
+    assert any(d.endswith(":small") for d in datas), datas
+    assert not any(d.endswith(":frames") for d in datas), datas  # voice → no frames-only
+    assert len(bot.mod.state.pending_media_installs) == 1
+
+
+def test_voice_install_click_installs_and_replays(bot, tmp_path, monkeypatch):
+    """Clicking a model button runs the installer and then replays the
+    parked voice message through the normal transcription path (#86)."""
+    import telegram as tg_mod
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    monkeypatch.setattr(bot.mod.stt, "available", lambda: False)
+    bot.tg.reset()
+
+    msg = {
+        "message_id": 6002,
+        "from": {"id": bot.owner_id},
+        "chat": {"id": bot.forum_chat_id, "type": "supergroup"},
+        "date": 1,
+        "message_thread_id": sess.topic_id,
+        "voice": {"file_id": "v2", "duration": 3},
+    }
+    bot.tg.inject_update({"update_id": 7002, "message": msg})
+    _drain_updates(bot)
+    (pick_id,) = bot.mod.state.pending_media_installs
+
+    installed = []
+    monkeypatch.setattr(bot.mod.stt_install, "install_whisper",
+                        lambda m: installed.append(m) or True)
+    monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
+    monkeypatch.setattr(bot.mod.stt, "transcribe",
+                        lambda path: {"text": "after install",
+                                      "segments": [], "language": "en"})
+    # The success path schedules an 8s delete of the "✓ Installed" notice;
+    # that timer would outlive the fixture and hit the real API. Stub it.
+    monkeypatch.setattr(bot.mod.ui, "delete_after", lambda *a, **kw: None)
+
+    bot.mod._media_install_clicked(pick_id, "small")
+    # The replay hops two threads (installer → session worker); wait for
+    # the turn to fully settle or its sends leak past the fake telegram.
+    _wait_until(lambda: [h for h in sess.history if h.kind == "user"])
+    _wait_turn_settled(bot)
+
+    assert installed == ["small"]
+    users = [h for h in sess.history if h.kind == "user"]
+    assert len(users) == 1 and "after install" in users[0].text
+    assert bot.mod.state.pending_media_installs == {}
+
+
+def test_media_install_cancel_removes_offer(bot, tmp_path, monkeypatch):
+    """✗ Not now deletes the offer message and drops the parked entry."""
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    monkeypatch.setattr(bot.mod.stt, "available", lambda: False)
+    bot.tg.reset()
+
+    msg = {
+        "message_id": 6003,
+        "from": {"id": bot.owner_id},
+        "chat": {"id": bot.forum_chat_id, "type": "supergroup"},
+        "date": 1,
+        "message_thread_id": sess.topic_id,
+        "voice": {"file_id": "v3", "duration": 3},
+    }
+    bot.tg.inject_update({"update_id": 7003, "message": msg})
+    _drain_updates(bot)
+    (pick_id,) = bot.mod.state.pending_media_installs
+
+    bot.mod._media_install_clicked(pick_id, "x")
+
+    assert bot.mod.state.pending_media_installs == {}
+    assert bot.tg.calls_of("deleteMessage"), "offer message was not deleted"
+    assert [h for h in sess.history if h.kind == "user"] == []
 
 
 def test_video_transcript_and_frames_in_one_turn(bot, tmp_path, monkeypatch):
@@ -1743,6 +1848,7 @@ def test_video_transcript_and_frames_in_one_turn(bot, tmp_path, monkeypatch):
 
     bot.mod._handle_video(sess, "vid-fid", "", bot.forum_chat_id,
                           888, sess.topic_id)
+    _wait_turn_settled(bot)
 
     users = [h for h in sess.history if h.kind == "user"]
     assert len(users) == 1, users
@@ -1753,11 +1859,14 @@ def test_video_transcript_and_frames_in_one_turn(bot, tmp_path, monkeypatch):
     assert "(t=00:06)" in txt            # frame timecode in M:SS
 
 
-def test_video_unconfigured_is_rejected(bot, tmp_path, monkeypatch):
-    """No STT venv → video gets a notice, no Claude turn."""
+def test_video_unconfigured_offers_install_with_frames_only(
+        bot, tmp_path, monkeypatch):
+    """No STT venv at all → video gets an install offer that includes the
+    frames-only (decoder) option; no Claude turn (#86)."""
     _start_bot_session(bot, tmp_path)
     sess = next(iter(bot.mod.mgr._sessions.values()))
     monkeypatch.setattr(bot.mod.frames, "available", lambda: False)
+    monkeypatch.setattr(bot.mod.stt, "available", lambda: False)
     bot.tg.reset()
 
     msg = {
@@ -1773,7 +1882,99 @@ def test_video_unconfigured_is_rejected(bot, tmp_path, monkeypatch):
 
     assert [h for h in sess.history if h.kind == "user"] == []
     sends = bot.tg.calls_of("sendMessage")
-    assert any("not configured" in (c.get("text") or "") for c in sends), sends
+    offers = [c for c in sends if "isn't installed" in (c.get("text") or "")]
+    assert offers, sends
+    rows = offers[0]["reply_markup"]["inline_keyboard"]
+    datas = [b["callback_data"] for row in rows for b in row]
+    assert any(d.endswith(":frames") for d in datas), datas
+    assert any(d.endswith(":medium") for d in datas), datas
+
+
+def test_video_frames_only_notes_missing_whisper(bot, tmp_path, monkeypatch):
+    """Decoder-only tier: video is processed (frames reach Claude), and the
+    user gets a one-off note that speech wasn't transcribed (#86)."""
+    import telegram as tg_mod
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+
+    monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
+    monkeypatch.setattr(bot.mod.stt, "available", lambda: False)
+    monkeypatch.setattr(bot.mod.stt, "transcribe", lambda path: None)
+    monkeypatch.setattr(bot.mod.frames, "extract", lambda v, d: [
+        {"path": "/tmp/f0.jpg", "t": 0.0}])
+    notes = []
+    monkeypatch.setattr(bot.mod.ui, "ephemeral",
+                        lambda cid, text, **kw: notes.append(text))
+
+    bot.mod._handle_video(sess, "vid-fid", "", bot.forum_chat_id,
+                          889, sess.topic_id)
+    _wait_turn_settled(bot)
+
+    users = [h for h in sess.history if h.kind == "user"]
+    assert len(users) == 1 and "[Attached file:" in users[0].text
+    assert any("Whisper isn't installed" in n for n in notes), notes
+
+
+# ── upload retention (#87) ──────────────────────────────────────────
+
+def _make_upload(updir, name, age_s, content=b"x"):
+    import os
+    p = updir / name
+    p.write_bytes(content)
+    old = time.time() - age_s
+    os.utime(p, (old, old))
+    return str(p)
+
+
+def test_upload_sweep_ttl_and_references(bot, tmp_path, monkeypatch):
+    """Sweep removes uploads older than the TTL, keeps fresh ones, and
+    keeps old ones still referenced in an alive session's JSONL (#87)."""
+    updir = tmp_path / "uploads"
+    updir.mkdir()
+    monkeypatch.setattr(bot.mod, "_UPLOAD_DIR", str(updir))
+
+    old_unref = _make_upload(updir, "100_voice.oga", age_s=60 * 3600)
+    old_ref = _make_upload(updir, "200_photo.jpg", age_s=60 * 3600)
+    fresh = _make_upload(updir, "300_video.mp4", age_s=3600)
+    # frames dir, old and unreferenced
+    fdir = updir / "frames_100"
+    fdir.mkdir()
+    (fdir / "frame_000.jpg").write_bytes(b"x")
+    import os
+    old_ts = time.time() - 60 * 3600
+    os.utime(fdir, (old_ts, old_ts))
+
+    jsonl = tmp_path / "sess.jsonl"
+    jsonl.write_text(f'{{"text": "[Attached file: {old_ref}]"}}\n')
+    monkeypatch.setattr(bot.mod, "_known_session_jsonls",
+                        lambda: [str(jsonl)])
+
+    bot.mod._sweep_uploads()
+
+    assert not os.path.exists(old_unref)
+    assert not fdir.exists()
+    assert os.path.exists(old_ref), "referenced upload must survive"
+    assert os.path.exists(fresh), "fresh upload must survive"
+
+
+def test_upload_size_warning_throttled(bot, tmp_path, monkeypatch):
+    """Folder over the size threshold → one DM to the owner; a second
+    sweep the same day stays silent (#87)."""
+    updir = tmp_path / "uploads"
+    updir.mkdir()
+    monkeypatch.setattr(bot.mod, "_UPLOAD_DIR", str(updir))
+    monkeypatch.setattr(bot.mod, "_UPLOAD_WARN_BYTES", 10)
+    monkeypatch.setattr(bot.mod, "_known_session_jsonls", lambda: [])
+    _make_upload(updir, "big.bin", age_s=60, content=b"y" * 100)
+    bot.tg.reset()
+
+    bot.mod._sweep_uploads()
+    bot.mod._sweep_uploads()
+
+    warns = [c for c in bot.tg.calls_of("sendMessage")
+             if "Media uploads folder" in (c.get("text") or "")]
+    assert len(warns) == 1, warns
+    assert warns[0]["chat_id"] == bot.owner_id
 
 
 def test_general_media_rejection_is_ephemeral(bot, tmp_path, monkeypatch):
