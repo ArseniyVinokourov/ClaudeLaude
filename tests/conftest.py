@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib
 import json
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -133,6 +134,42 @@ def bot(bot_env, monkeypatch: pytest.MonkeyPatch):
         sessions_file=bot_env.sessions_file,
     )
     yield ns
+    # Shut down every background thread the test spawned BEFORE monkeypatch
+    # unwinds the fake telegram. A session worker mid-_run_claude or a live
+    # mirror follower would otherwise keep sending after the fake reverts,
+    # landing "send error: 404" on the real API — a load-sensitive flake
+    # (~13% under a loaded/concurrent runner, ~0% idle). "Thread dead" isn't
+    # a usable idle signal (workers block on their queue, followers poll on
+    # a flag), so signal the loops to exit and join them deterministically
+    # ([[gate-thread-racing-tests-on-completion-signal]]):
+    #   - sessions: alive=False + a None sentinel wakes the queue.get; the
+    #     worker finishes any in-flight _run_claude, then sees the flag and
+    #     returns. We set the flag directly (not mgr.stop) to avoid firing
+    #     the on_session_stop callback, which itself sends.
+    #   - mirrors: alive=False; _follow_loop exits within its 0.5s poll.
+    # Then join the named worker/follower/backfill threads (cap 5s total).
+    import threading
+    for s in bot_mod.mgr.list_sessions():
+        s.alive = False
+        try:
+            s._queue.put_nowait(None)
+        except Exception:
+            pass
+    for m in bot_mod.mirror_mgr.list():
+        m.alive = False
+    deadline = time.time() + 5.0
+    for t in threading.enumerate():
+        if t is threading.current_thread() or not t.is_alive():
+            continue
+        # session-worker-* / mirror-* : the long-lived loop threads (stopped
+        # via the alive=False flags above). bot-bg-* : the short-lived
+        # daemon threads/timers the bot spawns to send off the poll loop
+        # (media handlers, runtime install, perm/ephemeral deletes, compact,
+        # update). Joining them all means no bot thread can send after the
+        # fake telegram is reverted ("send error: 404" flake).
+        if t.name.startswith(("session-worker", "mirror-follow",
+                              "mirror-backfill", "bot-bg")):
+            t.join(timeout=max(0.0, deadline - time.time()))
     # Stop the budget worker thread so it can't outlive the test and land
     # stray calls in the next test's fake.
     _budget.reset_for_tests()

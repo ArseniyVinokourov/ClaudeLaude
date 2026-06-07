@@ -7,6 +7,7 @@ locates the side venv, shells out to `transcribe.py`, and parses the JSON.
 
 Used for Telegram voice messages (#83) and the audio track of videos (#84).
 """
+import glob
 import json
 import os
 import subprocess
@@ -16,13 +17,28 @@ _BOT_DIR = os.path.dirname(os.path.abspath(__file__))
 _STT_VENV = os.environ.get("STT_VENV", os.path.join(_BOT_DIR, ".venv-stt"))
 _STT_PY = os.path.join(_STT_VENV, "bin", "python")
 _TRANSCRIBE = os.path.join(_BOT_DIR, "transcribe.py")
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 _TIMEOUT = int(os.environ.get("STT_TIMEOUT", "180"))
 
 
+def model_name() -> str:
+    """Read at call time — a runtime install (stt_install) may set it."""
+    return os.environ.get("WHISPER_MODEL", "small")
+
+
+def pkg_present(name: str) -> bool:
+    """True if a package dir exists in the side-venv's site-packages.
+    A directory check instead of a trial import: importing faster_whisper
+    spins up ctranslate2 and takes seconds."""
+    return bool(glob.glob(os.path.join(
+        _STT_VENV, "lib", "python*", "site-packages", name)))
+
+
 def available() -> bool:
-    """True if the STT side-venv and worker script are present."""
-    return os.path.isfile(_STT_PY) and os.path.isfile(_TRANSCRIBE)
+    """True if the STT side-venv, worker script AND faster-whisper are
+    present. The venv can exist decoder-only (frames without transcription),
+    so the package check is load-bearing."""
+    return (os.path.isfile(_STT_PY) and os.path.isfile(_TRANSCRIBE)
+            and pkg_present("faster_whisper"))
 
 
 def transcribe(audio_path: str) -> dict | None:
@@ -32,7 +48,7 @@ def transcribe(audio_path: str) -> dict | None:
         return None
     try:
         r = subprocess.run(
-            [_STT_PY, _TRANSCRIBE, audio_path, WHISPER_MODEL],
+            [_STT_PY, _TRANSCRIBE, audio_path, model_name()],
             capture_output=True, text=True, timeout=_TIMEOUT,
         )
     except subprocess.TimeoutExpired:

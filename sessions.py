@@ -204,6 +204,7 @@ class SessionManager:
         self._cwd_map[cwd] = sid
         threading.Thread(
             target=self._worker, args=(session, 0), daemon=True,
+            name=f"session-worker-{sid[:8]}",
         ).start()
         self._persist()
         return session
@@ -277,7 +278,7 @@ class SessionManager:
             threading.Thread(
                 target=self._worker,
                 args=(session, session._worker_generation),
-                daemon=True,
+                daemon=True, name=f"session-worker-{sid[:8]}",
             ).start()
         self._persist()
         return True
@@ -295,6 +296,7 @@ class SessionManager:
         self._topic_map[topic_id] = sid
         threading.Thread(
             target=self._worker, args=(session, 0), daemon=True,
+            name=f"session-worker-{sid[:8]}",
         ).start()
         self._persist()
         return session
@@ -313,6 +315,7 @@ class SessionManager:
             self._cwd_map[cwd] = sid
         threading.Thread(
             target=self._worker, args=(session, 0), daemon=True,
+            name=f"session-worker-{sid[:8]}",
         ).start()
         self._persist()
         return session
@@ -482,7 +485,7 @@ class SessionManager:
                 threading.Thread(
                     target=self._worker,
                     args=(session, session._worker_generation),
-                    daemon=True,
+                    daemon=True, name=f"session-worker-{sid[:8]}",
                 ).start()
         if records:
             print(f"[persist] restored {len(records)} session(s)", flush=True)
