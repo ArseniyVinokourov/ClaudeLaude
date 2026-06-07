@@ -522,7 +522,7 @@ def _on_429_notify(retry_after_s: int) -> None:
             with _RATE_NOTICE_LOCK:
                 globals()["_rate_notice_msg_id"] = None
 
-        threading.Thread(target=_delete_when_stale, daemon=True).start()
+        threading.Thread(target=_delete_when_stale, daemon=True, name="bot-bg-delstale").start()
 
 
 # ── mirror dtach-socket watcher ─────────────────────────────────────
@@ -743,6 +743,7 @@ def _buffer_media_group(gid, session, file_id, filename, caption,
         if grp["timer"] is not None:
             grp["timer"].cancel()
         t = threading.Timer(_MEDIA_GROUP_FLUSH_S, _flush_media_group, args=(gid,))
+        t.name = "bot-bg-album"
         t.daemon = True
         grp["timer"] = t
         t.start()
@@ -979,7 +980,7 @@ def _media_install_clicked(pick_id, choice):
     with state.lock:
         state.pending_media_installs.pop(pick_id, None)
     threading.Thread(target=_run_media_install, args=(entry, choice),
-                     daemon=True).start()
+                     daemon=True, name="bot-bg-install").start()
 
 
 def _run_media_install(entry, choice):
@@ -1182,7 +1183,7 @@ def _handle_update(u):
                 target=_handle_video_sticker,
                 args=(session, sticker["file_id"], descr,
                       chat_id, msg_id, thread_id),
-                daemon=True,
+                daemon=True, name="bot-bg-sticker",
             ).start()
             return
         # Static sticker → the file itself (webp); animated (tgs) → its
@@ -1215,7 +1216,7 @@ def _handle_update(u):
         threading.Thread(
             target=_handle_voice,
             args=(session, voice["file_id"], caption, chat_id, msg_id, thread_id),
-            daemon=True,
+            daemon=True, name="bot-bg-voice",
         ).start()
         return
 
@@ -1232,7 +1233,7 @@ def _handle_update(u):
         threading.Thread(
             target=_handle_video,
             args=(session, video["file_id"], caption, chat_id, msg_id, thread_id),
-            daemon=True,
+            daemon=True, name="bot-bg-video",
         ).start()
         return
 
@@ -1357,7 +1358,7 @@ def _handle_callback(cb, data):
                 def _del_perm(mid=msg_id, cid=perm_chat):
                     time.sleep(1)
                     tg.delete(mid, cid)
-                threading.Thread(target=_del_perm, daemon=True).start()
+                threading.Thread(target=_del_perm, daemon=True, name="bot-bg-delperm").start()
 
     elif data.startswith("na:"):
         pick_id = data.split(":")[1]
@@ -1429,7 +1430,7 @@ def _handle_callback(cb, data):
                 if cb_msg:
                     tg.edit(cb_msg, summary, cb_chat, buttons=btn)
 
-            threading.Thread(target=_do_compact, daemon=True).start()
+            threading.Thread(target=_do_compact, daemon=True, name="bot-bg-compact").start()
 
     elif data.startswith("uc:"):
         compact_id = data[3:]
@@ -1522,7 +1523,7 @@ def _handle_callback(cb, data):
                     if cb_chat:
                         tg.send(msg, cb_chat, thread_id=cb_thread)
 
-            threading.Thread(target=_do_update, daemon=True).start()
+            threading.Thread(target=_do_update, daemon=True, name="bot-bg-update").start()
         elif action == "no":
             if cb_msg and cb_chat:
                 tg.delete(cb_msg, cb_chat)
@@ -1537,7 +1538,7 @@ def _handle_callback(cb, data):
             def _del_dt(mid=cb_msg, cid=cb_chat):
                 time.sleep(5)
                 tg.delete(mid, cid)
-            threading.Thread(target=_del_dt, daemon=True).start()
+            threading.Thread(target=_del_dt, daemon=True, name="bot-bg-deldt").start()
 
     elif data == "dk:":
         _do_kill()

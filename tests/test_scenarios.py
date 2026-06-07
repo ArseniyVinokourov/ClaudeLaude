@@ -31,23 +31,6 @@ def _wait_until(cond, timeout=5.0):
     raise AssertionError("condition not met within timeout")
 
 
-def _wait_turn_settled(bot, reply_text="ok", timeout=5.0):
-    """Wait until claude's reply (FakeClaude default: "ok") hits telegram
-    AND API traffic quiesces, so the session worker's trailing sends can't
-    leak past the fixture's fake telegram into the real API after teardown.
-    (state.turns can't signal this: on_result pops the entry, so the turn
-    object is unobservable both before the turn and after it.)"""
-    _wait_until(lambda: any((c.get("text") or "").strip() == reply_text
-                            for c in bot.tg.calls_of("sendMessage")), timeout)
-    last, stable_since = -1, time.time()
-    while time.time() - stable_since < 0.25:
-        with bot.tg._lock:
-            n = len(bot.tg.calls)
-        if n != last:
-            last, stable_since = n, time.time()
-        time.sleep(0.02)
-
-
 # ── 1. /new creates a forum topic and greets ────────────────────────
 
 def test_new_creates_topic_and_greets(bot, tmp_path):
@@ -1720,7 +1703,6 @@ def test_voice_message_transcribed_into_turn(bot, tmp_path, monkeypatch):
 
     bot.mod._handle_voice(sess, "voice-fid", "", bot.forum_chat_id,
                           777, sess.topic_id)
-    _wait_turn_settled(bot)
 
     users = [h for h in sess.history if h.kind == "user"]
     assert len(users) == 1, users
@@ -1795,7 +1777,6 @@ def test_voice_install_click_installs_and_replays(bot, tmp_path, monkeypatch):
     # The replay hops two threads (installer → session worker); wait for
     # the turn to fully settle or its sends leak past the fake telegram.
     _wait_until(lambda: [h for h in sess.history if h.kind == "user"])
-    _wait_turn_settled(bot)
 
     assert installed == ["small"]
     users = [h for h in sess.history if h.kind == "user"]
@@ -1848,7 +1829,6 @@ def test_video_transcript_and_frames_in_one_turn(bot, tmp_path, monkeypatch):
 
     bot.mod._handle_video(sess, "vid-fid", "", bot.forum_chat_id,
                           888, sess.topic_id)
-    _wait_turn_settled(bot)
 
     users = [h for h in sess.history if h.kind == "user"]
     assert len(users) == 1, users
@@ -1908,7 +1888,6 @@ def test_video_frames_only_notes_missing_whisper(bot, tmp_path, monkeypatch):
 
     bot.mod._handle_video(sess, "vid-fid", "", bot.forum_chat_id,
                           889, sess.topic_id)
-    _wait_turn_settled(bot)
 
     users = [h for h in sess.history if h.kind == "user"]
     assert len(users) == 1 and "[Attached file:" in users[0].text
