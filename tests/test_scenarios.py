@@ -2146,6 +2146,36 @@ def test_mirror_input_bridge_pushes_to_dtach(bot, tmp_path, monkeypatch):
         bot.mod.mirror_mgr.unregister(csid)
 
 
+def test_push_to_dtach_separates_enter_from_text(monkeypatch):
+    """The Enter keystroke must go through its OWN dtach connection
+    after the text. Bundling text+\\r in one write trips Claude TUI
+    paste-grouping: the \\r becomes a newline in the input box instead
+    of a submit — flaky message loss (TODO #101, live repro 6/10
+    delivered single-write vs 10/10 split)."""
+    import terminal_mirror as tm
+
+    writes: list[bytes] = []
+
+    class _Proc:
+        returncode = 0
+
+    monkeypatch.setattr(tm, "_DTACH_BIN", "/usr/bin/dtach")
+    monkeypatch.setattr(tm, "dtach_socket_alive", lambda s: True)
+    monkeypatch.setattr(tm.time, "sleep", lambda s: None)
+    monkeypatch.setattr(
+        tm.subprocess, "run",
+        lambda cmd, input=b"", **kw: (writes.append(input) or _Proc()),
+    )
+
+    assert tm.push_to_dtach("/tmp/x.sock", "hello") is True
+    assert writes == [b"hello", b"\r"], writes
+
+    # Control keys (with_enter=False) stay a single write, no \r.
+    writes.clear()
+    assert tm.push_to_dtach("/tmp/x.sock", "\x1b[Z", with_enter=False) is True
+    assert writes == [b"\x1b[Z"], writes
+
+
 def test_mirror_input_bridge_output_only_rejects(bot, tmp_path, monkeypatch):
     """Mirror without dtach_socket should not call push_to_dtach; it
     should surface an output-only notice."""

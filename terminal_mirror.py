@@ -32,6 +32,14 @@ _PERSIST_PATH = os.environ.get(
 _DTACH_BIN = shutil.which("dtach")
 
 
+# Pause between pushing the text and pushing the Enter keystroke.
+# When the trailing \r arrives in the same input chunk as the text,
+# Claude's TUI paste-detection treats the whole chunk as pasted text
+# and the \r becomes a newline in the input box instead of a submit —
+# flaky message loss (TODO #101, repro: 6/10 delivered single-write).
+_ENTER_DELAY_S = 0.5
+
+
 def push_to_dtach(socket: str | None, text: str,
                   timeout: float = 3.0,
                   with_enter: bool = True) -> bool:
@@ -41,8 +49,12 @@ def push_to_dtach(socket: str | None, text: str,
     The bytes land on the wrapped program's stdin exactly as if typed
     at the keyboard. Claude's TUI runs in raw mode, so the Enter key
     is `\\r` (0x0D), not `\\n` (0x0A) — sending `\\n` leaves the text
-    in the input box without submitting it. This matches what tmux's
-    `send-keys ... Enter` produced in the previous bridge.
+    in the input box without submitting it.
+
+    The text and the Enter keystroke are pushed as two separate dtach
+    connections with `_ENTER_DELAY_S` between them: bundling them in
+    one write makes the TUI group them as a paste and swallow the
+    submit (see `_ENTER_DELAY_S` above).
 
     `with_enter=False` is for control keys like Shift+Tab (`\\e[Z`)
     where the trailing `\\r` would also be sent and submit a blank
@@ -55,7 +67,16 @@ def push_to_dtach(socket: str | None, text: str,
         return False
     if not dtach_socket_alive(socket):
         return False
-    payload = text + ("\r" if with_enter else "")
+    if not _dtach_write(socket, text, timeout):
+        return False
+    if with_enter:
+        time.sleep(_ENTER_DELAY_S)
+        return _dtach_write(socket, "\r", timeout)
+    return True
+
+
+def _dtach_write(socket: str, payload: str, timeout: float) -> bool:
+    """One `dtach -p` connection pushing `payload` into the PTY."""
     try:
         p = subprocess.run(
             [_DTACH_BIN, "-p", socket],
