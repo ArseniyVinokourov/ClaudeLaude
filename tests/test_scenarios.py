@@ -1212,6 +1212,114 @@ def test_sticker_routed_to_claude_as_text(bot, tmp_path):
     assert "RocketPack" in captured[0]
 
 
+def test_static_sticker_attaches_image(bot, tmp_path, monkeypatch):
+    """A static (webp) sticker is downloaded and attached so Claude can
+    actually see the image, not just the emoji descriptor (#77)."""
+    import telegram as tg_mod
+    _start_bot_session(bot, tmp_path)
+    monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
+    captured: list[str] = []
+    original = bot.mod.mgr.send_user_message
+    bot.mod.mgr.send_user_message = \
+        lambda _sid, text: (captured.append(text), True)[1]
+    try:
+        bot.tg.inject_update({
+            "update_id": 9002,
+            "message": {
+                "message_id": 4243,
+                "from": {"id": bot.owner_id},
+                "chat": {"id": bot.forum_chat_id, "type": "supergroup"},
+                "message_thread_id": 100,
+                "date": 0,
+                "sticker": {
+                    "file_id": "X", "file_unique_id": "Y",
+                    "width": 512, "height": 512, "is_animated": False,
+                    "is_video": False, "type": "regular",
+                    "emoji": "🚀", "set_name": "RocketPack",
+                },
+            },
+        })
+        _drain_updates(bot)
+    finally:
+        bot.mod.mgr.send_user_message = original
+    assert captured, "send_user_message never called for sticker"
+    assert "[Attached file:" in captured[0]
+    assert "_sticker.webp" in captured[0]
+
+
+# ── user reactions on bot messages (#77) ────────────────────────────
+
+def test_owner_reaction_on_bot_message_forwarded(bot, tmp_path):
+    """Owner reacting to a recent bot message feeds Claude a user-action
+    line with the emoji and an excerpt of the reacted-to message."""
+    import telegram as tg_mod
+    _start_bot_session(bot, tmp_path)
+    mid = tg_mod.send("The answer is 42", bot.forum_chat_id, thread_id=100)
+    assert mid
+    captured: list[str] = []
+    original = bot.mod.mgr.send_user_message
+    bot.mod.mgr.send_user_message = \
+        lambda _sid, text: (captured.append(text), True)[1]
+    try:
+        bot.tg.inject_update({
+            "update_id": 9100,
+            "message_reaction": {
+                "chat": {"id": bot.forum_chat_id, "type": "supergroup",
+                         "is_forum": True},
+                "message_id": mid,
+                "user": {"id": bot.owner_id, "is_bot": False},
+                "date": 0,
+                "old_reaction": [],
+                "new_reaction": [{"type": "emoji", "emoji": "👍"}],
+            },
+        })
+        _drain_updates(bot)
+    finally:
+        bot.mod.mgr.send_user_message = original
+    assert captured, "reaction never reached send_user_message"
+    assert "👍" in captured[0]
+    assert "The answer is 42" in captured[0]
+
+
+def test_reaction_removal_and_unknown_message_ignored(bot, tmp_path):
+    """Reaction removals and reactions on unknown (untracked) messages
+    are dropped silently — no Claude turn, no error message."""
+    import telegram as tg_mod
+    _start_bot_session(bot, tmp_path)
+    mid = tg_mod.send("tracked", bot.forum_chat_id, thread_id=100)
+    captured: list[str] = []
+    original = bot.mod.mgr.send_user_message
+    bot.mod.mgr.send_user_message = \
+        lambda _sid, text: (captured.append(text), True)[1]
+    try:
+        bot.tg.inject_update({
+            "update_id": 9101,
+            "message_reaction": {
+                "chat": {"id": bot.forum_chat_id, "type": "supergroup"},
+                "message_id": mid,
+                "user": {"id": bot.owner_id, "is_bot": False},
+                "date": 0,
+                "old_reaction": [{"type": "emoji", "emoji": "👍"}],
+                "new_reaction": [],
+            },
+        })
+        bot.tg.inject_update({
+            "update_id": 9102,
+            "message_reaction": {
+                "chat": {"id": bot.forum_chat_id, "type": "supergroup"},
+                "message_id": 999999,
+                "user": {"id": bot.owner_id, "is_bot": False},
+                "date": 0,
+                "old_reaction": [],
+                "new_reaction": [{"type": "emoji", "emoji": "🔥"}],
+            },
+        })
+        _drain_updates(bot)
+    finally:
+        bot.mod.mgr.send_user_message = original
+    assert not captured, f"dropped reactions still reached Claude: {captured}"
+
+
 # ── reactions on user messages ──────────────────────────────────────
 
 def test_user_text_no_auto_reaction(bot, tmp_path):
