@@ -140,9 +140,16 @@ claude() {
             >/dev/null 2>&1 \
             || echo "claudelaude: bot unreachable at 127.0.0.1:${_cl_port} — mirror topic may not open" >&2
         [ -e "$CLSWAP_SOCK" ] && rm -f "$CLSWAP_SOCK"
+        # Terminal-close detection: when this terminal dies the OS HUPs
+        # the shell. Tell the bot, so it can stop the now-detached
+        # claude and offer continuing the session from Telegram. The
+        # trap is cleared right after dtach returns on the normal path.
+        trap 'curl -sS --max-time 2 -X POST "http://127.0.0.1:${_cl_port}/hook/terminal_closed" -H "Content-Type: application/json" --data-raw "{\"hook_event_name\":\"terminal_closed\",\"session_id\":\"${CLSWAP_SID}\"}" >/dev/null 2>&1' HUP
         CLAUDELAUDE_DTACH_SOCKET="$CLSWAP_SOCK" \
             dtach -A "$CLSWAP_SOCK" -E -z -r winch claude --resume "$CLSWAP_SID"
-        return $?
+        local _cl_dec=$?
+        trap - HUP
+        return "$_cl_dec"
     fi
     return "$_cl_ec"
 }
@@ -218,9 +225,24 @@ function claude
             >/dev/null 2>&1
         or echo "claudelaude: bot unreachable at 127.0.0.1:$CLSWAP_PORT — mirror topic may not open" >&2
         test -e $CLSWAP_SOCK; and rm -f $CLSWAP_SOCK
+        # Terminal-close detection (see posix wrapper). Handler vars go
+        # through globals — fish event functions don't see locals.
+        set -g _clswap_hup_port $CLSWAP_PORT
+        set -g _clswap_hup_sid $CLSWAP_SID
+        function _claudelaude_on_hup --on-signal SIGHUP
+            curl -sS --max-time 2 -X POST \
+                "http://127.0.0.1:$_clswap_hup_port/hook/terminal_closed" \
+                -H 'Content-Type: application/json' \
+                --data-raw "{\"hook_event_name\":\"terminal_closed\",\"session_id\":\"$_clswap_hup_sid\"}" \
+                >/dev/null 2>&1
+        end
         set -lx CLAUDELAUDE_DTACH_SOCKET $CLSWAP_SOCK
         dtach -A $CLSWAP_SOCK -E -z -r winch claude --resume $CLSWAP_SID
-        return $status
+        set -l _cl_dec $status
+        functions -e _claudelaude_on_hup
+        set -e _clswap_hup_port
+        set -e _clswap_hup_sid
+        return $_cl_dec
     end
     return $_cl_ec
 end

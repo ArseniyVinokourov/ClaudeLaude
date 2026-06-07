@@ -34,6 +34,7 @@ from updater import (
 from hooks import HookBridge
 from terminal_mirror import (
     TerminalMirrorManager, push_to_dtach, dtach_socket_alive,
+    reap_if_abandoned,
 )
 from session_discovery import _resolve_session_cwd
 
@@ -272,6 +273,7 @@ bridge = HookBridge(
     on_notification=hooks.on_hook_notification,
     on_permission=hooks.on_hook_permission,
     on_open_in_bot=mirror.on_open_in_bot,
+    on_terminal_closed=mirror.on_terminal_closed,
 )
 lifecycle.bridge = bridge
 hooks.bridge = bridge
@@ -417,19 +419,29 @@ def _mirror_continue_buttons(csid: str) -> list:
 
 def _mirror_socket_watcher():
     """Local-only watcher: flip mirrors to output-only when their dtach
-    socket vanishes. Uses no Telegram budget — only a filesystem stat."""
+    socket vanishes, and reap claudes whose terminal closed (zero
+    attached clients + idle JSONL) so they don't run detached forever.
+    Uses no Telegram budget — only filesystem/proc stats."""
     while bot_running:
         time.sleep(30)
         for mirror in mirror_mgr.list():
-            if not mirror.alive:
+            if not mirror.alive or not mirror.dtach_socket:
                 continue
-            if (mirror.dtach_socket and
-                    not dtach_socket_alive(mirror.dtach_socket)):
+            if not dtach_socket_alive(mirror.dtach_socket):
                 ui.send_to_topic(
                     mirror.topic_id,
                     "\U0001f50c Terminal closed — mirror is now output-only",
                     buttons=_mirror_continue_buttons(mirror.csid))
                 mirror_mgr.set_dtach_socket(mirror.csid, None)
+                continue
+            # Terminal gone but claude still alive under dtach: SIGTERM
+            # it once nothing is in flight. dtach then removes the
+            # socket and the branch above posts the continue notice on
+            # the next tick.
+            if reap_if_abandoned(mirror.dtach_socket, mirror.jsonl_path):
+                print(f"[mirror] {mirror.csid[:8]} reaped detached claude "
+                      f"(terminal closed, session idle)",
+                      file=sys.stderr, flush=True)
 
 
 def _device_monitor_loop():

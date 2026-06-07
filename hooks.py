@@ -46,10 +46,12 @@ class HookBridge:
     def __init__(self,
                  on_notification: Callable,
                  on_permission: Callable,
-                 on_open_in_bot: Callable | None = None):
+                 on_open_in_bot: Callable | None = None,
+                 on_terminal_closed: Callable | None = None):
         self.on_notification = on_notification
         self.on_permission = on_permission
         self.on_open_in_bot = on_open_in_bot
+        self.on_terminal_closed = on_terminal_closed
         self._pending: dict[str, threading.Event] = {}
         self._decisions: dict[str, str] = {}
         self._abandoned: set[str] = set()
@@ -126,6 +128,8 @@ class HookBridge:
                     self._handle_permission(body)
                 elif path == "/hook/open_in_bot":
                     self._handle_open_in_bot(body)
+                elif path == "/hook/terminal_closed":
+                    self._handle_terminal_closed(body)
                 else:
                     self.send_response(404)
                     self.end_headers()
@@ -183,6 +187,40 @@ class HookBridge:
                     self.end_headers()
                     self.wfile.write(
                         json.dumps({"error": str(e)}).encode())
+                    return
+                payload = json.dumps(result or {"status": "ok"}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def _handle_terminal_closed(self, body):
+                """Terminal hosting a dtach-wrapped claude closed.
+
+                Fired by the shell wrapper's SIGHUP trap. Body:
+                {session_id}. The handler must answer fast — the
+                trapped shell is dying and curl runs with a short
+                --max-time.
+                """
+                csid = body.get("session_id") or body.get("sessionId") or ""
+                if not csid:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b'{"error":"missing session_id"}')
+                    return
+                if not bridge.on_terminal_closed:
+                    self.send_response(503)
+                    self.end_headers()
+                    self.wfile.write(b'{"error":"terminal_closed not wired"}')
+                    return
+                try:
+                    result = bridge.on_terminal_closed(csid)
+                except Exception as e:
+                    _log(f"terminal_closed error: {e}")
+                    self.send_response(500)
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": str(e)}).encode())
                     return
                 payload = json.dumps(result or {"status": "ok"}).encode()
                 self.send_response(200)

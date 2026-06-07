@@ -2176,6 +2176,66 @@ def test_push_to_dtach_separates_enter_from_text(monkeypatch):
     assert writes == [b"\x1b[Z"], writes
 
 
+def test_reap_if_abandoned_guards(monkeypatch, tmp_path):
+    """reap_if_abandoned must SIGTERM only when the terminal is gone
+    (0 attached clients) AND the JSONL is idle. Attached clients,
+    unknown client count, or a fresh JSONL must all block the kill
+    (TODO: detached claudes used to live forever after terminal close)."""
+    import terminal_mirror as tm
+
+    jsonl = tmp_path / "sess.jsonl"
+    jsonl.write_text("{}\n")
+    killed: list[int] = []
+    monkeypatch.setattr(tm, "_claude_child_of_master", lambda s: 4242)
+    monkeypatch.setattr(tm.os, "kill", lambda pid, sig: killed.append(pid))
+
+    # Client still attached → no kill.
+    monkeypatch.setattr(tm, "attached_clients", lambda s: 1)
+    assert tm.reap_if_abandoned("/tmp/x.sock", str(jsonl), idle_s=0) is False
+    # Unknown count (proc table unreadable) → no kill.
+    monkeypatch.setattr(tm, "attached_clients", lambda s: None)
+    assert tm.reap_if_abandoned("/tmp/x.sock", str(jsonl), idle_s=0) is False
+    # Detached but JSONL fresh (work in flight) → no kill.
+    monkeypatch.setattr(tm, "attached_clients", lambda s: 0)
+    assert tm.reap_if_abandoned("/tmp/x.sock", str(jsonl), idle_s=9999) is False
+    assert killed == []
+
+    # Detached + idle → SIGTERM the claude child.
+    assert tm.reap_if_abandoned("/tmp/x.sock", str(jsonl), idle_s=0) is True
+    assert killed == [4242]
+
+
+def test_terminal_closed_hook_reaps_detached_claude(bot, tmp_path, monkeypatch):
+    """POST /hook/terminal_closed (shell wrapper SIGHUP trap) must reap
+    the detached claude of the named mirror immediately — no idle wait —
+    and ignore unknown csids."""
+    import mirrorbridge
+
+    csid = "mirror-test-hup"
+    cwd = str(tmp_path / "mirror_project_hup")
+    (tmp_path / "mirror_project_hup").mkdir()
+    sock = str(tmp_path / "dtach.sock")
+
+    reaps: list[tuple] = []
+    monkeypatch.setattr(
+        mirrorbridge, "reap_if_abandoned",
+        lambda s, jsonl, **kw: (reaps.append((s, jsonl)) or True),
+    )
+
+    try:
+        bot.mod.mirror.on_open_in_bot(csid, cwd, sock)
+        res = bot.mod.mirror.on_terminal_closed(csid)
+        assert res == {"status": "reaped"}, res
+        # jsonl_path=None → no idle guard, kill is immediate.
+        assert reaps == [(sock, None)], reaps
+
+        assert bot.mod.mirror.on_terminal_closed("no-such-csid") == {
+            "status": "ignored"}
+        assert len(reaps) == 1
+    finally:
+        bot.mod.mirror_mgr.unregister(csid)
+
+
 def test_mirror_input_bridge_output_only_rejects(bot, tmp_path, monkeypatch):
     """Mirror without dtach_socket should not call push_to_dtach; it
     should surface an output-only notice."""
