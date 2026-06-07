@@ -5,6 +5,7 @@ import re
 import sys
 import threading
 import time
+from collections import OrderedDict
 
 import requests
 
@@ -272,6 +273,34 @@ def md_to_html(text: str) -> str:
     return text
 
 
+# ── recent-send registry (#77) ──────────────────────────────────────
+# message_reaction updates carry no message_thread_id, so a reaction can
+# be routed back to its topic only by remembering where the bot sent its
+# recent messages. Bounded LRU; reactions on evicted (old) messages are
+# simply unroutable and get dropped by the caller.
+
+_RECENT_SENDS_MAX = 500
+_recent_sends: OrderedDict = OrderedDict()  # (chat_id, msg_id) → (thread_id, excerpt)
+_recent_sends_lock = threading.Lock()
+
+
+def _remember_send(chat_id, msg_id, thread_id, text) -> None:
+    if not msg_id:
+        return
+    excerpt = re.sub(r'<[^>]+>', '', text or '')
+    excerpt = " ".join(excerpt.split())[:120]
+    with _recent_sends_lock:
+        _recent_sends[(chat_id, msg_id)] = (thread_id, excerpt)
+        while len(_recent_sends) > _RECENT_SENDS_MAX:
+            _recent_sends.popitem(last=False)
+
+
+def recent_send_info(chat_id: int, msg_id: int):
+    """(thread_id, text_excerpt) for a recently sent bot message, or None."""
+    with _recent_sends_lock:
+        return _recent_sends.get((chat_id, msg_id))
+
+
 # ── send / edit / delete ────────────────────────────────────────────
 
 def send(text: str, chat_id: int, thread_id: int | None = None,
@@ -295,7 +324,9 @@ def _send_impl(text, chat_id, thread_id, buttons, markdown) -> int | None:
         params["reply_markup"] = {"inline_keyboard": buttons}
     try:
         r = _req("sendMessage", params)
-        return r.get("result", {}).get("message_id")
+        mid = r.get("result", {}).get("message_id")
+        _remember_send(chat_id, mid, thread_id, text)
+        return mid
     except requests.HTTPError as e:
         body = ""
         if e.response is not None:
@@ -313,7 +344,9 @@ def _send_impl(text, chat_id, thread_id, buttons, markdown) -> int | None:
             params["text"] = re.sub(r'<[^>]+>', '', text)[:MAX_TEXT]
             try:
                 r = _req("sendMessage", params)
-                return r.get("result", {}).get("message_id")
+                mid = r.get("result", {}).get("message_id")
+                _remember_send(chat_id, mid, thread_id, text)
+                return mid
             except Exception as e2:
                 _log(f"plain fallback failed: {e2}")
         else:
@@ -657,7 +690,8 @@ def topic_alive(chat_id: int, thread_id: int, name: str | None = None) -> bool:
 def poll(offset: int | None = None, timeout: int = 30) -> list[dict]:
     params: dict = {"timeout": timeout,
                     "allowed_updates": ["message", "callback_query",
-                                        "my_chat_member"]}
+                                        "my_chat_member",
+                                        "message_reaction"]}
     if offset is not None:
         params["offset"] = offset
     try:

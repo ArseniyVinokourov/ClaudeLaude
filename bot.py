@@ -722,6 +722,61 @@ def _handle_video(session, file_id, caption, chat_id, msg_id, thread_id):
     turnctl.enqueue_user_input(session, user_text, chat_id, msg_id, thread_id)
 
 
+# ── user reactions on bot messages (#77) ───────────────────────────
+# A reaction the owner puts on a bot message is forwarded to Claude as a
+# plain user action — Claude decides what (if anything) it means. The
+# update carries no thread id, so routing goes through the recent-send
+# registry in telegram.py. Removals, reactions on unknown/old messages
+# and reactions outside a live bot session are dropped silently.
+
+def _handle_reaction(mr):
+    if mr.get("user", {}).get("id") != OWNER_ID:
+        return
+    new = mr.get("new_reaction") or []
+    if not new:
+        return  # reaction removed — nothing to forward
+    r0 = new[-1]
+    emoji = r0.get("emoji") if r0.get("type") == "emoji" else "(custom emoji)"
+    chat_id = mr.get("chat", {}).get("id")
+    info = tg.recent_send_info(chat_id, mr.get("message_id"))
+    if not info:
+        return
+    thread_id, excerpt = info
+    session = mgr.by_topic(thread_id) if thread_id else None
+    if not (session and session.is_bot_spawned and session.alive):
+        return
+    if excerpt:
+        text = f'[User reacted {emoji} to your message: "{excerpt}"]'
+    else:
+        text = f"[User reacted {emoji} to your message]"
+    audit.log("user_message", text[:200], sid=session.sid)
+    turnctl.enqueue_user_input(session, text, chat_id, None, thread_id)
+
+
+# ── sticker media (#77) ─────────────────────────────────────────────
+# Static stickers (webp) are downloaded and attached so Claude can see the
+# image. Video stickers (webm) get scene frames via frames.extract — same
+# PyAV path as #84, so it runs on a daemon thread. Animated tgs stickers
+# are Lottie vectors PyAV can't decode; their static thumbnail is attached
+# instead when available.
+
+def _handle_video_sticker(session, file_id, descr, chat_id, msg_id, thread_id):
+    ts = int(time.time())
+    dest = os.path.join(_UPLOAD_DIR, f"{ts}_sticker.webm")
+    if not tg.download_file(file_id, dest):
+        tg.send("❌ Download failed", chat_id, thread_id=thread_id)
+        return
+    shots = frames.extract(dest, os.path.join(_UPLOAD_DIR, f"frames_{ts}"))
+    if shots:
+        flines = "\n".join(f"[Attached file: {s['path']}]" for s in shots)
+        user_text = f"{descr}\n{flines}"
+    else:
+        user_text = descr
+    audit.log("user_message", f"[sticker video] {len(shots)} frames",
+              sid=session.sid)
+    turnctl.enqueue_user_input(session, user_text, chat_id, msg_id, thread_id)
+
+
 def _reject_no_session(chat_id, thread_id, what):
     """Notice for media/stickers dropped without an active bot session.
 
@@ -749,6 +804,11 @@ def _handle_update(u):
     mcm = u.get("my_chat_member")
     if mcm:
         _handle_my_chat_member(mcm)
+        return
+
+    mr = u.get("message_reaction")
+    if mr:
+        _handle_reaction(mr)
         return
 
     msg = u.get("message", {})
@@ -861,7 +921,9 @@ def _handle_update(u):
                     thread_id=thread_id)
         return
 
-    # Handle stickers: pass emoji + pack name as text so Claude has context.
+    # Handle stickers: emoji + pack name as text, plus the image itself —
+    # static webp directly, video webm as scene frames, animated tgs via
+    # its static thumbnail (Lottie vectors can't be decoded) (#77).
     sticker = msg.get("sticker")
     if sticker:
         if not (session and session.is_bot_spawned and session.alive):
@@ -875,7 +937,28 @@ def _handle_update(u):
             descr = f"[Sticker: {emoji}]"
         else:
             descr = "[Sticker]"
+        if sticker.get("is_video") and frames.available():
+            threading.Thread(
+                target=_handle_video_sticker,
+                args=(session, sticker["file_id"], descr,
+                      chat_id, msg_id, thread_id),
+                daemon=True,
+            ).start()
+            return
+        # Static sticker → the file itself (webp); animated (tgs) → its
+        # static thumbnail (jpeg).
+        if sticker.get("is_animated"):
+            image_id = (sticker.get("thumbnail") or {}).get("file_id")
+            ext = "jpg"
+        else:
+            image_id = sticker["file_id"]
+            ext = "webp"
         audit.log("user_message", descr, sid=session.sid)
+        if image_id:
+            dest = os.path.join(_UPLOAD_DIR,
+                                f"{int(time.time())}_sticker.{ext}")
+            if tg.download_file(image_id, dest):
+                descr += f"\n[Attached file: {dest}]"
         turnctl.enqueue_user_input(session, descr, chat_id, msg_id, thread_id)
         return
 
