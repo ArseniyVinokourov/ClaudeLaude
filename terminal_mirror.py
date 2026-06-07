@@ -15,6 +15,7 @@ stays external; healthcheck handles disappearance.
 import json
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -32,6 +33,14 @@ _PERSIST_PATH = os.environ.get(
 _DTACH_BIN = shutil.which("dtach")
 
 
+# Pause between pushing the text and pushing the Enter keystroke.
+# When the trailing \r arrives in the same input chunk as the text,
+# Claude's TUI paste-detection treats the whole chunk as pasted text
+# and the \r becomes a newline in the input box instead of a submit —
+# flaky message loss (TODO #101, repro: 6/10 delivered single-write).
+_ENTER_DELAY_S = 0.5
+
+
 def push_to_dtach(socket: str | None, text: str,
                   timeout: float = 3.0,
                   with_enter: bool = True) -> bool:
@@ -41,8 +50,12 @@ def push_to_dtach(socket: str | None, text: str,
     The bytes land on the wrapped program's stdin exactly as if typed
     at the keyboard. Claude's TUI runs in raw mode, so the Enter key
     is `\\r` (0x0D), not `\\n` (0x0A) — sending `\\n` leaves the text
-    in the input box without submitting it. This matches what tmux's
-    `send-keys ... Enter` produced in the previous bridge.
+    in the input box without submitting it.
+
+    The text and the Enter keystroke are pushed as two separate dtach
+    connections with `_ENTER_DELAY_S` between them: bundling them in
+    one write makes the TUI group them as a paste and swallow the
+    submit (see `_ENTER_DELAY_S` above).
 
     `with_enter=False` is for control keys like Shift+Tab (`\\e[Z`)
     where the trailing `\\r` would also be sent and submit a blank
@@ -55,7 +68,16 @@ def push_to_dtach(socket: str | None, text: str,
         return False
     if not dtach_socket_alive(socket):
         return False
-    payload = text + ("\r" if with_enter else "")
+    if not _dtach_write(socket, text, timeout):
+        return False
+    if with_enter:
+        time.sleep(_ENTER_DELAY_S)
+        return _dtach_write(socket, "\r", timeout)
+    return True
+
+
+def _dtach_write(socket: str, payload: str, timeout: float) -> bool:
+    """One `dtach -p` connection pushing `payload` into the PTY."""
     try:
         p = subprocess.run(
             [_DTACH_BIN, "-p", socket],
@@ -82,6 +104,101 @@ def dtach_socket_alive(socket: str | None) -> bool:
     except OSError:
         return False
     return stat.S_ISSOCK(st.st_mode)
+
+
+# A detached mirror (terminal closed, zero attached dtach clients) is
+# reaped — its claude gets SIGTERM — once the session JSONL has been
+# quiet this long. The idle guard protects in-flight work: a long task
+# keeps appending events, so it survives the terminal closing and can
+# be followed from the mirror topic until it finishes.
+_REAP_IDLE_S = 300
+
+
+def attached_clients(socket: str | None) -> int | None:
+    """Count dtach clients attached to `socket` via /proc/net/unix.
+
+    Each attached client shows up as one connected entry (state 03)
+    bearing the socket path; the listener itself is state 01. Returns
+    None when the socket path is absent from /proc/net/unix or the
+    table is unreadable — callers must treat None as "unknown", never
+    as "zero".
+    """
+    if not socket:
+        return None
+    try:
+        with open("/proc/net/unix") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    n = 0
+    seen = False
+    for ln in lines:
+        parts = ln.split()
+        # Num RefCount Protocol Flags Type St Inode Path
+        if len(parts) >= 8 and parts[-1] == socket:
+            seen = True
+            if parts[-3] == "03":
+                n += 1
+    return n if seen else None
+
+
+def _claude_child_of_master(socket: str) -> int | None:
+    """Find the pid of the claude process wrapped by the dtach master
+    serving `socket`. The master is the dtach process whose cmdline
+    contains the socket path and that has a `claude` child."""
+    try:
+        pids = [int(p) for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return None
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                argv = f.read().split(b"\0")
+            if not argv or os.path.basename(argv[0]).decode() != "dtach":
+                continue
+            if socket.encode() not in argv:
+                continue
+            with open(f"/proc/{pid}/task/{pid}/children") as f:
+                children = [int(c) for c in f.read().split()]
+            for child in children:
+                with open(f"/proc/{child}/cmdline", "rb") as f:
+                    cargv = f.read().split(b"\0")
+                if cargv and os.path.basename(cargv[0]).decode() == "claude":
+                    return child
+        except (OSError, ValueError, UnicodeDecodeError):
+            continue
+    return None
+
+
+def reap_if_abandoned(socket: str | None, jsonl_path: str | None,
+                      idle_s: float = _REAP_IDLE_S) -> bool:
+    """SIGTERM the claude under `socket` when its terminal is gone.
+
+    Fires only when BOTH hold: zero dtach clients attached (terminal
+    closed — unknown counts as attached) AND the session JSONL has not
+    grown for `idle_s` (nothing in flight; missing JSONL counts as
+    idle). dtach reaps the socket file when claude exits, so the
+    socket-vanished watcher path then posts the continue-as-bot-session
+    notice. Returns True when SIGTERM was delivered.
+    """
+    if not socket:
+        return False
+    if attached_clients(socket) != 0:
+        return False
+    if jsonl_path:
+        try:
+            if time.time() - os.stat(jsonl_path).st_mtime < idle_s:
+                return False
+        except OSError:
+            pass
+    pid = _claude_child_of_master(socket)
+    if not pid:
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return False
+    return True
 
 
 def _tail_offset(path: str, max_events: int = 12) -> int:

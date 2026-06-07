@@ -25,7 +25,7 @@ import telegram as tg
 from config import get_forum_chat_id
 from formatting import (_compact_tool_msg, _is_mirror_noisy_tool,
                         _normalize_tool_input)
-from terminal_mirror import read_logical_events
+from terminal_mirror import read_logical_events, reap_if_abandoned
 
 _MIRROR_MODE_CYCLE = ("default", "acceptEdits", "plan", "auto")
 
@@ -405,3 +405,25 @@ class MirrorProjector:
         url = self._topic_url(topic_id)
         return {"status": "ok", "topic_url": url, "existing": False,
                 "input_bridge": bool(dtach_socket)}
+
+    # ── terminal closed (hook callback) ──────────────────────────────
+
+    def on_terminal_closed(self, csid):
+        """Bot-side handler for POST /hook/terminal_closed.
+
+        The shell wrapper's SIGHUP trap fires this the moment the
+        terminal hosting a dtach-wrapped claude closes. SIGTERM the
+        detached claude right away — the close was the owner's explicit
+        action, no idle wait needed. dtach then removes the socket and
+        the socket watcher posts the continue-as-bot-session notice on
+        its next tick. The zero-attached-clients check inside
+        reap_if_abandoned keeps a second attached terminal safe.
+        """
+        m = self.mgr.by_csid(csid) if self.mgr else None
+        if not m or not m.alive or not m.dtach_socket:
+            return {"status": "ignored"}
+        reaped = reap_if_abandoned(m.dtach_socket, None)
+        print(f"[mirror] {csid[:8]} terminal_closed hook → "
+              f"{'reaped claude' if reaped else 'skipped (client attached or no pid)'}",
+              file=sys.stderr, flush=True)
+        return {"status": "reaped" if reaped else "skipped"}
