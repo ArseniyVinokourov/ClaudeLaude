@@ -16,6 +16,28 @@ AUTO_UPDATE_POLICY = os.environ.get("AUTO_UPDATE_POLICY", "replace")
 UNLOCK_WORD = os.environ.get("UNLOCK_WORD", "")
 BOT_DIR = os.path.dirname(os.path.abspath(__file__))
 _KILL_FILE = os.path.join(BOT_DIR, ".kill")
+_ENV_FILE = os.path.join(BOT_DIR, ".env")
+
+
+def set_env(key: str, value: str):
+    """Upsert ``KEY=value`` in .env and update the live process env.
+
+    The change takes effect now (os.environ) and survives a restart (.env,
+    re-read by load_dotenv on next start). Best-effort on the file write —
+    the in-process var is always set. Comments and blank lines are kept.
+    """
+    os.environ[key] = value
+    try:
+        lines = []
+        if os.path.isfile(_ENV_FILE):
+            with open(_ENV_FILE) as f:
+                lines = [ln for ln in f.read().splitlines()
+                         if ln.split("=", 1)[0].strip() != key]
+        lines.append(f"{key}={value}")
+        with open(_ENV_FILE, "w") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError:
+        pass
 
 _STATE_FILE = os.environ.get(
     "BOT_STATE_FILE",

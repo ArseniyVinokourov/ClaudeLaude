@@ -3984,3 +3984,50 @@ def test_overdue_sweep_heals_without_restart(bot, bot_env):
     assert live not in bot.tg.deleted_messages
     assert overdue not in _pending_ids(bot_env)
     assert live in _pending_ids(bot_env)
+
+
+# ── 17. /settings runtime knobs (#102) ──────────────────────────────
+
+def test_settings_presets_apply_at_runtime_and_persist(bot):
+    """/settings exposes the three knobs; a preset click mutates the live
+    bot global AND writes .env (so it survives a restart). Whisper is not
+    exercised here — it shells out to install_whisper."""
+    bot.tg.inject_update(text_update(
+        "/settings",
+        owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
+    ))
+    _drain_updates(bot)
+
+    root = bot.tg.calls_of("sendMessage")[-1]
+    labels = [b["text"] for row in root["reply_markup"]["inline_keyboard"]
+              for b in row]
+    assert any("Whisper" in s for s in labels)
+    assert any("Upload alert" in s for s in labels)
+    assert any("Cleanup TTL" in s for s in labels)
+
+    mid = next(m_id for m_id, m in bot.tg.messages.items()
+               if "Settings" in m["text"])
+
+    # Upload alert: default is 500 MB → switch to 250.
+    assert bot.mod._UPLOAD_WARN_BYTES == 500 * 1024 * 1024
+    bot.tg.inject_update(callback_update(
+        "st:w:250", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, message_id=mid,
+    ))
+    _drain_updates(bot)
+    assert bot.mod._UPLOAD_WARN_BYTES == 250 * 1024 * 1024
+
+    # Cleanup TTL: default 48h → switch to 6h; the temp-note must rebuild.
+    assert bot.mod._UPLOAD_TTL_S == 48 * 3600
+    bot.tg.inject_update(callback_update(
+        "st:t:21600", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, message_id=mid,
+    ))
+    _drain_updates(bot)
+    assert bot.mod._UPLOAD_TTL_S == 21600
+    assert "6h" in bot.mod._TEMP_NOTE
+
+    import config
+    env_txt = open(config._ENV_FILE).read()
+    assert "UPLOAD_WARN_MB=250" in env_txt
+    assert "UPLOAD_TTL_S=21600" in env_txt
