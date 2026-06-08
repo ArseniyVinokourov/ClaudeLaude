@@ -102,6 +102,12 @@ def bot(bot_env, monkeypatch: pytest.MonkeyPatch):
     # Suppress real threads from auto-rename helper (it shells out to claude).
     bot_mod = importlib.import_module("bot")
 
+    # /settings persists knobs via config.set_env, which writes the repo .env.
+    # Redirect it to a tmp file so tests never touch the real one.
+    import config as config_mod
+    monkeypatch.setattr(config_mod, "_ENV_FILE",
+                        str(bot_env.tmp_path / ".env"))
+
     # Stub auto-rename — it spawns its own claude subprocess via shell.
     monkeypatch.setattr(bot_mod.turnctl, "_auto_rename_topic",
                         lambda *a, **kw: None)

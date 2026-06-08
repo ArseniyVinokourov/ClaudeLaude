@@ -58,6 +58,7 @@ _HELP_TEXT = (
     "\n"
     "<b>Other</b>\n"
     "/update — check for bot updates\n"
+    "/settings — whisper model, media cleanup\n"
     "/menu — quick actions\n"
     "/help — this message\n"
     "/stop_bot — shutdown bot\n"

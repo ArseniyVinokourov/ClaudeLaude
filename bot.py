@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from config import (OWNER_ID, AUTO_UPDATE, AUTO_UPDATE_POLICY,
                     UNLOCK_WORD, add_pending_delete,
                     get_forum_chat_id, get_uploads_warned_at,
-                    set_uploads_warned_at,
+                    set_uploads_warned_at, set_env,
                     is_killed, activate_kill, deactivate_kill)
 import audit
 import frames
@@ -322,10 +322,15 @@ _UPLOAD_WARN_BYTES = int(os.environ.get("UPLOAD_WARN_MB", "500")) * 1024 * 1024
 _UPLOAD_WARN_INTERVAL_S = 24 * 3600
 _uploads_last_sweep = 0.0
 
-# Appended to every turn that hands Claude an _UPLOAD_DIR path.
-_TEMP_NOTE = (f"(note: attached files under {_UPLOAD_DIR} are temporary — "
-              f"auto-deleted after ~{_UPLOAD_TTL_S // 3600}h; copy anything "
-              f"needed long-term into the project)")
+# Appended to every turn that hands Claude an _UPLOAD_DIR path. Rebuilt
+# when /settings changes the TTL so the stated retention stays accurate.
+def _build_temp_note() -> str:
+    return (f"(note: attached files under {_UPLOAD_DIR} are temporary — "
+            f"auto-deleted after ~{_UPLOAD_TTL_S // 3600}h; copy anything "
+            f"needed long-term into the project)")
+
+
+_TEMP_NOTE = _build_temp_note()
 
 
 def _known_session_jsonls() -> list[str]:
@@ -407,8 +412,9 @@ def _warn_uploads_size():
     set_uploads_warned_at(time.time())
     mb = total // (1024 * 1024)
     tg.send(f"📦 Media uploads folder reached {mb} MB ({_UPLOAD_DIR}).\n"
-            f"Files older than 48h are cleaned automatically; the rest "
-            f"is recent media still referenced by sessions.", OWNER_ID)
+            f"Files older than {_UPLOAD_TTL_S // 3600}h are cleaned "
+            f"automatically; the rest is recent media still referenced "
+            f"by sessions.", OWNER_ID)
 
 
 def _on_topic_dead(chat_id: int, thread_id: int) -> None:
@@ -648,6 +654,7 @@ def main():
         {"command": "usage", "description": "Token usage"},
         {"command": "display", "description": "Toggle mobile/desktop"},
         {"command": "update", "description": "Check for bot updates"},
+        {"command": "settings", "description": "Bot settings"},
         {"command": "help", "description": "Show help"},
     ])
     threading.Thread(target=_auto_update_loop, daemon=True).start()
@@ -1013,6 +1020,147 @@ def _run_media_install(entry, choice):
             chat_id, entry["msg_id"], thread_id)
 
 
+# ── /settings runtime menu (#102) ───────────────────────────────────
+# Owner-level, bot-wide knobs changed at runtime and persisted to .env.
+# Presets only — no free-text capture. The live value is the bot.py global
+# above (_UPLOAD_TTL_S / _UPLOAD_WARN_BYTES, plus WHISPER_MODEL in the env);
+# a change reassigns the global AND writes .env so it survives a restart.
+# A Whisper change first downloads the model (stt_install) in the background.
+
+_SETTINGS_TTL_S = 120
+_WARN_MB_PRESETS = [100, 250, 500, 1000, 2000]
+_TTL_PRESETS = [6 * 3600, 24 * 3600, 48 * 3600, 7 * 86400, 14 * 86400]
+
+
+def _fmt_ttl(seconds: int) -> str:
+    if seconds >= 86400 and seconds % 86400 == 0:
+        return f"{seconds // 86400}d"
+    return f"{seconds // 3600}h"
+
+
+def _settings_root_rows():
+    return [
+        [{"text": "🎙 Whisper model", "callback_data": "st:m"}],
+        [{"text": "📦 Upload alert", "callback_data": "st:w"}],
+        [{"text": "🗑 Cleanup TTL", "callback_data": "st:t"}],
+        CLOSE_ROW,
+    ]
+
+
+def _settings_text():
+    return (
+        "⚙️ <b>Settings</b>\n\n"
+        f"🎙 Whisper model: <b>{tg.esc(stt.model_name())}</b>\n"
+        f"📦 Upload alert: <b>{_UPLOAD_WARN_BYTES // (1024 * 1024)} MB</b>\n"
+        f"🗑 Cleanup after: <b>{_fmt_ttl(_UPLOAD_TTL_S)}</b>"
+    )
+
+
+def _settings_menu(chat_id, thread_id=None):
+    mid = tg.send(_settings_text(), chat_id, thread_id=thread_id,
+                  buttons=_settings_root_rows())
+    if not thread_id and mid:
+        ui.delete_after(mid, chat_id, _SETTINGS_TTL_S)
+
+
+def _settings_show(cb_msg, cb_chat, which):
+    """Expand a root item into its preset picker, in place."""
+    if which == "m":
+        cur = stt.model_name()
+        rows = [[{"text": f"{'• ' if k == cur else ''}{k} — {size}",
+                  "callback_data": f"st:m:{k}"}]
+                for k, size in stt_install.MODELS.items()]
+        rows.append([{"text": "↩ Back", "callback_data": "st:root"}])
+        tg.edit(cb_msg, "🎙 <b>Whisper model</b>\nChanging downloads the "
+                "model if needed (runs in background).", cb_chat, buttons=rows)
+    elif which == "w":
+        cur = _UPLOAD_WARN_BYTES // (1024 * 1024)
+        rows = [[{"text": f"{'• ' if mb == cur else ''}{mb} MB",
+                  "callback_data": f"st:w:{mb}"}] for mb in _WARN_MB_PRESETS]
+        rows.append([{"text": "↩ Back", "callback_data": "st:root"}])
+        tg.edit(cb_msg, "📦 <b>Upload-folder size alert</b>\nDM the owner "
+                "once a day past this size.", cb_chat, buttons=rows)
+    elif which == "t":
+        cur = _UPLOAD_TTL_S
+        rows = [[{"text": f"{'• ' if s == cur else ''}{_fmt_ttl(s)}",
+                  "callback_data": f"st:t:{s}"}] for s in _TTL_PRESETS]
+        rows.append([{"text": "↩ Back", "callback_data": "st:root"}])
+        tg.edit(cb_msg, "🗑 <b>Cleanup TTL</b>\nDelete uploaded media older "
+                "than this (kept if a session still references it).",
+                cb_chat, buttons=rows)
+
+
+def _settings_set_warn(cb_msg, cb_chat, mb):
+    global _UPLOAD_WARN_BYTES
+    _UPLOAD_WARN_BYTES = mb * 1024 * 1024
+    set_env("UPLOAD_WARN_MB", str(mb))
+    audit.log("settings", f"upload_warn_mb={mb}")
+    tg.edit(cb_msg, _settings_text(), cb_chat, buttons=_settings_root_rows())
+
+
+def _settings_set_ttl(cb_msg, cb_chat, seconds):
+    global _UPLOAD_TTL_S, _TEMP_NOTE
+    _UPLOAD_TTL_S = seconds
+    _TEMP_NOTE = _build_temp_note()
+    set_env("UPLOAD_TTL_S", str(seconds))
+    audit.log("settings", f"upload_ttl_s={seconds}")
+    tg.edit(cb_msg, _settings_text(), cb_chat, buttons=_settings_root_rows())
+
+
+def _settings_set_model(cb_msg, cb_chat, model):
+    if model not in stt_install.MODELS:
+        return
+    if model == stt.model_name() and stt.pkg_present("faster_whisper"):
+        tg.edit(cb_msg, _settings_text(), cb_chat,
+                buttons=_settings_root_rows())
+        return
+    if stt_install.busy():
+        ui.ephemeral(cb_chat, "⏳ Another install is already running",
+                     seconds=6)
+        return
+    tg.edit(cb_msg, f"⏳ Downloading Whisper <b>{tg.esc(model)}</b> — "
+            "this can take a few minutes…", cb_chat)
+    threading.Thread(target=_run_settings_model_install,
+                     args=(cb_msg, cb_chat, model),
+                     daemon=True, name="bot-bg-install").start()
+
+
+def _run_settings_model_install(cb_msg, cb_chat, model):
+    # install_whisper persists WHISPER_MODEL (.env + env) on success, so
+    # stt.model_name() reflects the switch once this returns ok.
+    ok = stt_install.install_whisper(model)
+    audit.log("settings", f"whisper_model={model} {'ok' if ok else 'FAILED'}")
+    try:
+        if ok:
+            tg.edit(cb_msg, _settings_text(), cb_chat,
+                    buttons=_settings_root_rows())
+        else:
+            tg.edit(cb_msg, f"❌ Failed to install Whisper {tg.esc(model)} "
+                    "— see bot.log.", cb_chat, buttons=_settings_root_rows())
+    except Exception:
+        pass
+
+
+def _settings_clicked(cb_msg, cb_chat, rest):
+    if rest == "root":
+        tg.edit(cb_msg, _settings_text(), cb_chat,
+                buttons=_settings_root_rows())
+    elif rest in ("m", "w", "t"):
+        _settings_show(cb_msg, cb_chat, rest)
+    elif rest.startswith("m:"):
+        _settings_set_model(cb_msg, cb_chat, rest[2:])
+    elif rest.startswith("w:"):
+        try:
+            _settings_set_warn(cb_msg, cb_chat, int(rest[2:]))
+        except ValueError:
+            pass
+    elif rest.startswith("t:"):
+        try:
+            _settings_set_ttl(cb_msg, cb_chat, int(rest[2:]))
+        except ValueError:
+            pass
+
+
 def _reject_no_session(chat_id, thread_id, what):
     """Notice for media/stickers dropped without an active bot session.
 
@@ -1307,6 +1455,8 @@ def _handle_command(cmd, args, chat_id, thread_id, session):
         commands.cmd_help(chat_id, thread_id)
     elif cmd == "/menu":
         commands.cmd_menu(chat_id, thread_id, session)
+    elif cmd == "/settings":
+        _settings_menu(chat_id, thread_id)
     else:
         if session and session.is_bot_spawned:
             ok = mgr.send_user_message(session.sid,
@@ -1339,6 +1489,11 @@ def _handle_callback(cb, data):
         parts = data.split(":")
         if len(parts) == 3:
             _media_install_clicked(parts[1], parts[2])
+        return
+
+    if data.startswith("st:"):
+        if cb_msg and cb_chat:
+            _settings_clicked(cb_msg, cb_chat, data[3:])
         return
 
     if data.startswith("p:"):
