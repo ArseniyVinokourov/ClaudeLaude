@@ -1024,6 +1024,10 @@ def test_session_context_is_appended(bot, tmp_path):
     assert str(cwd) in appended
     assert "mode: default" in appended
     assert _permission_mode(cmd) == "auto"
+    # #105: Claude must know about the non-text input channels and that
+    # AskUserQuestion works here (renders as inline buttons).
+    assert "AskUserQuestion" in appended
+    assert "reacted" in appended
 
 
 def test_mode_plan_switches_permission(bot, tmp_path):
@@ -1223,6 +1227,13 @@ def test_sticker_routed_to_claude_as_text(bot, tmp_path):
     assert captured, "send_user_message never called for sticker"
     assert "🚀" in captured[0]
     assert "RocketPack" in captured[0]
+    # #104: the sticker must be framed as a deliberate emotional/reaction
+    # cue, not just a dropped image, so Claude interprets it as communication.
+    assert "emotional" in captured[0] or "reaction cue" in captured[0]
+    assert "not just a dropped image" in captured[0]
+    # Sticker text + drawing must be weighed equally — Claude tends to fixate
+    # on on-sticker words and overlook the picture otherwise.
+    assert "equal weight" in captured[0]
 
 
 def test_static_sticker_attaches_image(bot, tmp_path, monkeypatch):
