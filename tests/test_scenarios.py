@@ -655,16 +655,19 @@ def test_compact_button_no_checkmark(bot, tmp_path):
     _drain_updates(bot)
     bot.tg.wait_for_call("sendMessage", message_thread_id=100, timeout=3)
 
-    # Compact button is now added via editMessageReplyMarkup on last msg.
-    edits = bot.tg.calls_of("editMessageReplyMarkup")
-    compact_edits = [
-        e for e in edits
-        if "reply_markup" in e
-        and any("Compact" in b["text"]
-                for row in e["reply_markup"]["inline_keyboard"]
-                for b in row)
-    ]
-    assert compact_edits, "no Compact button via editMessageReplyMarkup"
+    # Compact button is added via editMessageReplyMarkup on the last msg — it
+    # lands in the worker thread shortly AFTER the reply send, so wait for it
+    # rather than racing the check (flaked on slower CI runners).
+    def _compact_edits():
+        return [
+            e for e in bot.tg.calls_of("editMessageReplyMarkup")
+            if "reply_markup" in e
+            and any("Compact" in b["text"]
+                    for row in e["reply_markup"]["inline_keyboard"]
+                    for b in row)
+        ]
+    _wait_until(lambda: bool(_compact_edits()))
+    assert _compact_edits(), "no Compact button via editMessageReplyMarkup"
     # No separate "·" or "✅" anchor message.
     anchor_msgs = [
         m for m in bot.tg.calls_of("sendMessage")
