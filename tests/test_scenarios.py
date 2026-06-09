@@ -4347,3 +4347,94 @@ def test_validate_help_stays_green(bot, capsys):
     bot.mod._validate_help()
     err = capsys.readouterr().err
     assert "WARN" not in err
+
+
+# ── /settings: display default, default mode, auto-update ───────────
+
+def test_settings_display_default_applies_and_persists(bot):
+    import config
+    bot.tg.inject_update(callback_update(
+        "st:d:desktop", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, message_id=700,
+    ))
+    _drain_updates(bot)
+    assert bot.mod.DEFAULT_DISPLAY == "desktop"
+    # Live copies the components hold were updated too.
+    assert bot.mod.turnctl._default_display == "desktop"
+    assert bot.mod.commands._default_display == "desktop"
+    assert "DEFAULT_DISPLAY=desktop" in open(config._ENV_FILE).read()
+
+
+def test_settings_default_mode_applies_to_new_session(bot, tmp_path):
+    import config
+    bot.tg.inject_update(callback_update(
+        "st:dm:terse", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, message_id=701,
+    ))
+    _drain_updates(bot)
+    assert config.get_default_mode() == "terse"
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    assert sess.mode == "terse"
+
+
+def test_settings_autoupdate_toggle_and_policy(bot):
+    import config
+    bot.tg.inject_update(callback_update(
+        "st:au:on", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, message_id=702,
+    ))
+    _drain_updates(bot)
+    assert bot.mod.AUTO_UPDATE is True
+    assert "AUTO_UPDATE=true" in open(config._ENV_FILE).read()
+
+    bot.tg.inject_update(callback_update(
+        "st:au:merge", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, message_id=702,
+    ))
+    _drain_updates(bot)
+    assert bot.mod.AUTO_UPDATE_POLICY == "merge"
+
+    bot.tg.inject_update(callback_update(
+        "st:au:off", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, message_id=702,
+    ))
+    _drain_updates(bot)
+    assert bot.mod.AUTO_UPDATE is False
+
+
+def test_settings_stt_timeout_applies_and_persists(bot):
+    import config
+    import stt
+    bot.tg.inject_update(callback_update(
+        "st:st:300", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, message_id=703,
+    ))
+    _drain_updates(bot)
+    assert stt._TIMEOUT == 300
+    assert "STT_TIMEOUT=300" in open(config._ENV_FILE).read()
+
+
+def test_whisper_install_result_fresh_msg_when_menu_gone(bot, monkeypatch):
+    """If the /settings message TTL'd out during the download, the result is
+    delivered as a fresh message instead of a lost edit."""
+    monkeypatch.setattr(bot.mod.stt_install, "install_whisper",
+                        lambda model: True)
+    bot.tg.fail_edits.add(800)        # menu message is gone
+    bot.mod._run_settings_model_install(800, bot.forum_chat_id, "base")
+    sent = " ".join(p.get("text", "")
+                    for p in bot.tg.calls_of("sendMessage"))
+    assert "Whisper base ready" in sent
+
+
+def test_whisper_install_result_edits_when_menu_present(bot, monkeypatch):
+    """If the menu message still exists, the result edits it in place — no
+    extra fresh message."""
+    monkeypatch.setattr(bot.mod.stt_install, "install_whisper",
+                        lambda model: True)
+    bot.mod._run_settings_model_install(801, bot.forum_chat_id, "base")
+    edit = bot.tg.find_call("editMessageText", message_id=801)
+    assert edit is not None
+    sent = " ".join(p.get("text", "")
+                    for p in bot.tg.calls_of("sendMessage"))
+    assert "ready" not in sent

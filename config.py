@@ -97,6 +97,18 @@ def set_terminal_topic_id(topic_id: int | None):
     _save_state(state)
 
 
+def get_default_mode() -> str:
+    """Mode new bot sessions start in (a /mode preset name; default 'default').
+    State-backed so every module reads the current value live."""
+    return _load_state().get("default_mode", "default")
+
+
+def set_default_mode(name: str):
+    state = _load_state()
+    state["default_mode"] = name
+    _save_state(state)
+
+
 def get_tour_shown() -> bool:
     return _load_state().get("tour_shown", False)
 
