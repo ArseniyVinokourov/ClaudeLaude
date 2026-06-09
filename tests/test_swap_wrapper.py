@@ -225,6 +225,38 @@ def test_wrapper_does_not_eval_sentinel_values(tmp_path: Path):
     )
 
 
+def test_installer_zsh_writes_marked_block_and_is_idempotent(tmp_path: Path):
+    """The swap wrapper installs into ~/.zshrc (posix path), backs up once,
+    and a re-run leaves exactly one claude() definition."""
+    home = tmp_path / "home"
+    home.mkdir()
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+    for _ in range(2):
+        subprocess.check_call(["bash", str(INSTALLER), "zsh"], env=env)
+    rc = home / ".zshrc"
+    text = rc.read_text()
+    assert "# >>> claudelaude swap >>>" in text
+    assert text.count("claude() {") == 1
+    assert (home / ".zshrc.before-claudelaude").exists()
+
+
+def test_installer_fish_writes_function_file(tmp_path: Path):
+    """Fish uses a per-function file, not an rc block; re-running keeps it
+    ours (no spurious 'not ours' bail-out)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+    for _ in range(2):
+        subprocess.check_call(["bash", str(INSTALLER), "fish"], env=env)
+    f = home / ".config" / "fish" / "functions" / "claude.fish"
+    assert f.exists()
+    text = f.read_text()
+    assert "claudelaude-swap" in text
+    assert "function claude" in text
+
+
 def test_installer_strips_legacy_block(tmp_path: Path):
     """Upgrading from the old always-on `claudelaude mirror` block
     leaves the rc with exactly one `claude()` definition (ours)."""

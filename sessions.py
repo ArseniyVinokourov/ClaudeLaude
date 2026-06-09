@@ -156,6 +156,7 @@ class Session:
     turn_input_tokens: int = 0
     turn_output_tokens: int = 0
     pending_images: list[str] = field(default_factory=list)
+    pending_files: list[str] = field(default_factory=list)
     _queue: queue.Queue = field(default_factory=queue.Queue)
     _proc: subprocess.Popen | None = field(default=None, repr=False)
     # Holds the in-flight AskUserQuestion entry while a turn waits on the
@@ -560,6 +561,7 @@ class SessionManager:
         session.turn_input_tokens = 0
         session.turn_output_tokens = 0
         session.pending_images.clear()
+        session.pending_files.clear()
 
         if session._worker_generation != gen:
             return

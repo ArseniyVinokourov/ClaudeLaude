@@ -23,10 +23,19 @@ What it does
  - /new spawns a Claude Code session in a project of your choice and
    gives it its own forum topic. You write into the topic; the message
    goes to Claude. Claude's replies and tool calls come back live.
+ - A guided tour (/tour, and auto-shown after first /setup) walks you
+   through what the bot can do — no command-poking to discover it.
  - Project picker: bare /new lists the four most recently touched
    projects, with "show all" for the rest.
  - /resume picks up an existing JSONL session after a restart, a fork,
    or after the bot was down.
+ - /mode switches the response style per session: terse, verbose,
+   beginner, plan (read-only), or burn (Opus 1M, max effort).
+ - Send media into a topic: photos, albums, voice (transcribed),
+   video (transcript + scene frames), stickers, files. React to a
+   reply and Claude sees the reaction.
+ - When Claude asks a question (AskUserQuestion), you answer with
+   inline buttons.
  - Topics rename themselves from the conversation context.
  - /compact folds long output into a preview; /expand puts it back.
  - One live status message per turn from the worker thread, instead
@@ -37,10 +46,13 @@ What it does
    land in General.
  - General is ephemeral: everything self-deletes in 5–15 seconds
    except the pinned message.
- - Healthcheck pings live sessions and revives the stuck ones.
  - /usage reports real context-window % via PTY, not the generic
    text the CLI prints to a pipe.
+ - /settings tunes the Whisper model and media-cleanup knobs at
+   runtime, from a button menu.
  - /display flips a topic between mobile (lists) and desktop (tables).
+ - A kill switch (/kill) freezes the bot; an audit log records every
+   action; unlock is one-directional with brute-force protection.
  - Unknown /commands are forwarded as plain text to the active
    session, so Claude's own slash commands keep working.
  - /bot-mirror inside a terminal Claude session opens a Telegram

@@ -35,6 +35,26 @@ _NOISE_TEXTS = {
     "claude is waiting for your input",
 }
 _MAX_SAVED_TURNS = 50
+
+# Claude asks the bot to deliver a file by emitting `[Send file: <path>]` in
+# its reply (mirrors the inbound `[Attached file: ...]` convention). The bot
+# extracts the paths, removes the marker from the shown text, and sends the
+# files to the topic at turn end.
+_SEND_FILE_RE = re.compile(r"\[Send file:\s*([^\]]+?)\s*\]")
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+
+
+def _extract_send_files(text, cwd):
+    """Pull `[Send file: ...]` paths out of `text`. Returns (clean_text,
+    paths) — paths resolved against `cwd` when relative."""
+    paths = []
+    for m in _SEND_FILE_RE.finditer(text):
+        p = m.group(1).strip()
+        if cwd and not os.path.isabs(p):
+            p = os.path.join(cwd, p)
+        paths.append(p)
+    clean = _SEND_FILE_RE.sub("", text).strip() if paths else text
+    return clean, paths
 _REACT_STREAMING = "🔥"
 _REACT_TOOL = "⚡"
 
@@ -304,6 +324,9 @@ class TurnController:
             "- Inline buttons truncate at ~25 chars on mobile.",
             "- Photos/files the owner sends arrive as attachment paths in "
             "your user message.",
+            "- To send a file back to this topic (a document, log, image, "
+            "etc.), put a line `[Send file: /abs/path]` in your reply. The "
+            "bot delivers the file and removes that line from what's shown.",
         ]
         return "\n".join(lines)
 
@@ -313,6 +336,13 @@ class TurnController:
         if not session.topic_id:
             return
         if text.strip().lower() in _NOISE_TEXTS:
+            return
+        # Pull out any `[Send file: ...]` markers: queue the files for delivery
+        # and strip the markers so the user sees a clean reply.
+        text, files = _extract_send_files(text, session.cwd)
+        if files:
+            session.pending_files.extend(files)
+        if not text:
             return
         turn = self._get_turn(session)
         # Upgrade reaction to 🔥 on first real assistant text, but not over ⚡
@@ -360,7 +390,20 @@ class TurnController:
                 tg.send_photo(fid, extra, thread_id=session.topic_id)
         elif imgs:
             tg.send_photo(fid, imgs[0], thread_id=session.topic_id)
+        already = set(imgs)
         session.pending_images.clear()
+
+        # Deliver files Claude asked to send (`[Send file: ...]`): images as
+        # photos, everything else as documents. Skip ones already sent above.
+        for p in session.pending_files:
+            if p in already or not os.path.isfile(p):
+                continue
+            already.add(p)
+            if p.lower().endswith(_IMAGE_EXTS):
+                tg.send_photo(fid, p, thread_id=session.topic_id)
+            else:
+                tg.send_document(fid, p, thread_id=session.topic_id)
+        session.pending_files.clear()
 
         if turn.msg_ids:
             with self.state.lock:

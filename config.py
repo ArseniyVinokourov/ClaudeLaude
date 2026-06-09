@@ -97,6 +97,36 @@ def set_terminal_topic_id(topic_id: int | None):
     _save_state(state)
 
 
+def get_tour_shown() -> bool:
+    return _load_state().get("tour_shown", False)
+
+
+def set_tour_shown(v: bool = True):
+    state = _load_state()
+    state["tour_shown"] = v
+    _save_state(state)
+
+
+def get_tour_msg_id() -> int | None:
+    return _load_state().get("tour_msg_id")
+
+
+def set_tour_msg_id(msg_id: int | None):
+    state = _load_state()
+    state["tour_msg_id"] = msg_id
+    _save_state(state)
+
+
+def get_help_msg_id() -> int | None:
+    return _load_state().get("help_msg_id")
+
+
+def set_help_msg_id(msg_id: int | None):
+    state = _load_state()
+    state["help_msg_id"] = msg_id
+    _save_state(state)
+
+
 # Pending-delete registry: transient bot messages in the forum group
 # (ephemerals, pickers, replaced dashboard pins) that must not outlive their
 # TTL. Each entry is [msg_id, due_ts] — registered when the delete is

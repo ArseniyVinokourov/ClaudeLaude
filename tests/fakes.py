@@ -51,6 +51,11 @@ class FakeTelegram:
                 self._update_queue.clear()
             return {"ok": True, "result": ups}
 
+        if method == "getChat":
+            # cmd_setup gates on result.is_forum; the test group is a forum.
+            return {"ok": True, "result": {"id": params.get("chat_id"),
+                                           "is_forum": True}}
+
         if method in ("sendMessage", "editMessageText", "deleteMessage",
                       "pinChatMessage", "createForumTopic"):
             if params.get("chat_id") in self.dead_chats:

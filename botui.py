@@ -43,11 +43,14 @@ class BotUI:
         """
         fid = get_forum_chat_id()
         if fid:
-            mid = tg.send(text, fid, buttons=buttons)
+            # persist=True at the tg layer: this helper owns the lifecycle
+            # (it schedules its own delete below when not persistent), so it
+            # opts out of the General auto-reap backstop.
+            mid = tg.send(text, fid, buttons=buttons, persist=True)
             if mid and not persist:
                 self.delete_after(mid, fid, seconds)
             return mid
-        return tg.send(text, OWNER_ID, buttons=buttons)
+        return tg.send(text, OWNER_ID, buttons=buttons, persist=True)
 
     def reply(self, chat_id, thread_id, text, buttons=None):
         if chat_id:
@@ -56,7 +59,10 @@ class BotUI:
 
     def ephemeral(self, chat_id, text, thread_id=None, seconds=15, buttons=None):
         """Send a message that auto-deletes after `seconds`."""
-        mid = tg.send(text, chat_id, thread_id=thread_id, buttons=buttons)
+        # persist=True at the tg layer — this helper schedules its own delete
+        # below, so it opts out of the General auto-reap backstop.
+        mid = tg.send(text, chat_id, thread_id=thread_id, buttons=buttons,
+                      persist=True)
         self.delete_after(mid, chat_id, seconds)
         return mid
 

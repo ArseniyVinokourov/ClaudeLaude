@@ -14,7 +14,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from config import (OWNER_ID, AUTO_UPDATE, AUTO_UPDATE_POLICY,
                     UNLOCK_WORD, add_pending_delete,
-                    get_forum_chat_id, get_uploads_warned_at,
+                    get_forum_chat_id, get_tour_shown, set_tour_shown,
+                    get_uploads_warned_at,
                     set_uploads_warned_at, set_env,
                     is_killed, activate_kill, deactivate_kill)
 import audit
@@ -22,6 +23,7 @@ import frames
 import stt
 import stt_install
 import telegram as tg
+import tour
 from botui import BotUI, CLOSE_ROW
 from commands import Commands
 from dashboard import Dashboard
@@ -96,6 +98,15 @@ class BotState:
 state = BotState()
 bot_running = True
 ui = BotUI()
+
+# General auto-reap backstop: any non-persistent message sent to General gets a
+# delete scheduled this far out — longer than any legitimate self-managed TTL
+# (pickers are 60s), so it only ever clears messages that would otherwise have
+# no timer at all. Keeps General structurally clean (only the pinned dashboard
+# and opted-out onboarding/alerts persist).
+_GENERAL_BACKSTOP_TTL = 180
+tg.configure_general_guard(
+    lambda mid: ui.delete_after(mid, get_forum_chat_id(), _GENERAL_BACKSTOP_TTL))
 turnctl = TurnController(
     state, ui, _CLAUDE_BIN,
     default_display=DEFAULT_DISPLAY,
@@ -223,18 +234,38 @@ def _auto_update_loop():
 _KNOWN_COMMANDS = {
     "/setup", "/new", "/sessions", "/resume", "/history", "/stop",
     "/interrupt", "/restart", "/usage", "/display", "/mode", "/test_perm",
-    "/update", "/stop_bot", "/help", "/start", "/menu",
-    "/kill", "/audit",
+    "/update", "/settings", "/stop_bot", "/help", "/start", "/menu",
+    "/tour", "/kill", "/audit",
 }
 
 _HELP_DOCUMENTED_COMMANDS = {
     "/new", "/sessions", "/resume", "/stop", "/interrupt", "/restart",
-    "/history", "/usage", "/display", "/mode", "/update",
-    "/menu", "/help", "/stop_bot",
+    "/history", "/usage", "/display", "/mode", "/update", "/settings",
+    "/menu", "/help", "/tour", "/stop_bot",
 }
 
 
 _HIDDEN_COMMANDS = {"/setup", "/test_perm", "/start", "/kill", "/audit"}
+
+
+# The BotFather command menu (setMyCommands). Hoisted to a module constant so
+# it is test-assertable; applied across scopes in main().
+_BOT_COMMANDS = [
+    {"command": "tour", "description": "Guided walkthrough"},
+    {"command": "new", "description": "New Claude session"},
+    {"command": "resume", "description": "Resume a session"},
+    {"command": "sessions", "description": "Active sessions"},
+    {"command": "menu", "description": "Quick actions"},
+    {"command": "mode", "description": "Response style"},
+    {"command": "stop", "description": "Stop session"},
+    {"command": "restart", "description": "Restart stopped session"},
+    {"command": "history", "description": "Last N events"},
+    {"command": "usage", "description": "Token usage"},
+    {"command": "display", "description": "Toggle mobile/desktop"},
+    {"command": "settings", "description": "Bot settings"},
+    {"command": "update", "description": "Check for bot updates"},
+    {"command": "help", "description": "Show help"},
+]
 
 
 def _validate_help():
@@ -644,19 +675,7 @@ def main():
     threading.Thread(target=_dashboard_loop, daemon=True).start()
     threading.Thread(target=hooks.terminal_watcher, daemon=True).start()
     threading.Thread(target=_device_monitor_loop, daemon=True).start()
-    tg.set_my_commands([
-        {"command": "new", "description": "New Claude session"},
-        {"command": "sessions", "description": "Active sessions"},
-        {"command": "menu", "description": "Quick actions"},
-        {"command": "stop", "description": "Stop session"},
-        {"command": "restart", "description": "Restart stopped session"},
-        {"command": "history", "description": "Last N events"},
-        {"command": "usage", "description": "Token usage"},
-        {"command": "display", "description": "Toggle mobile/desktop"},
-        {"command": "update", "description": "Check for bot updates"},
-        {"command": "settings", "description": "Bot settings"},
-        {"command": "help", "description": "Show help"},
-    ])
+    tg.set_my_commands(_BOT_COMMANDS)
     threading.Thread(target=_auto_update_loop, daemon=True).start()
     dashboard.refresh_usage()
     dashboard.sync()
@@ -1418,6 +1437,13 @@ def _handle_command(cmd, args, chat_id, thread_id, session):
     global bot_running
     if cmd == "/setup":
         commands.cmd_setup(chat_id)
+        # First successful link → drop the owner into the guided tour (once).
+        fid = get_forum_chat_id()
+        if fid and not get_tour_shown():
+            tour.open_tour(fid)
+            set_tour_shown(True)
+    elif cmd == "/tour":
+        tour.open_tour(get_forum_chat_id())
     elif cmd == "/new":
         commands.cmd_new(args, chat_id=chat_id, thread_id=thread_id)
     elif cmd == "/sessions":
@@ -1494,6 +1520,32 @@ def _handle_callback(cb, data):
     if data.startswith("st:"):
         if cb_msg and cb_chat:
             _settings_clicked(cb_msg, cb_chat, data[3:])
+        return
+
+    if data.startswith("tr:"):
+        rest = data[3:]
+        if rest.startswith("nav:") and cb_msg and cb_chat:
+            idx_s = rest[4:]
+            if idx_s.isdigit():
+                tour.paint(cb_msg, cb_chat, int(idx_s))
+        elif rest == "open":
+            tour.open_tour(get_forum_chat_id())
+        elif rest == "close" and cb_msg and cb_chat:
+            tour.close_tour(cb_msg, cb_chat)
+        elif rest == "go:new":
+            commands.cmd_new("", chat_id=get_forum_chat_id(), thread_id=None)
+        elif rest == "go:help":
+            commands.cmd_help(get_forum_chat_id(), None)
+        return
+
+    if data.startswith("hr:") and cb_msg and cb_chat:
+        rest = data[3:]
+        if rest == "menu":
+            commands.render_help_menu(cb_msg, cb_chat)
+        elif rest == "close":
+            commands.close_help(cb_msg, cb_chat)
+        elif rest.startswith("cat:"):
+            commands.render_help_section(cb_msg, cb_chat, rest[4:])
         return
 
     if data.startswith("p:"):

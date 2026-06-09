@@ -1629,6 +1629,69 @@ def test_single_image_uses_send_photo(bot, tmp_path, monkeypatch):
     assert photo_calls == [str(p)], photo_calls
 
 
+def test_send_file_marker_extracted_and_stripped(bot, tmp_path):
+    """`[Send file: ...]` in a reply queues the path and is removed from the
+    text the user sees."""
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    bot.tg.reset()
+    bot.mod.turnctl.on_assistant(
+        sess, "Here is the log [Send file: /tmp/out.log] enjoy")
+    assert "/tmp/out.log" in sess.pending_files
+    sent = " ".join(p.get("text", "")
+                     for p in bot.tg.calls_of("sendMessage"))
+    assert "Send file" not in sent
+    assert "Here is the log" in sent
+
+
+def test_send_file_delivers_document_on_result(bot, tmp_path, monkeypatch):
+    """A queued non-image file is delivered via sendDocument at turn end."""
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    doc = tmp_path / "report.pdf"
+    doc.write_bytes(b"%PDF-1.4 fake")
+    sess.pending_files.append(str(doc))
+
+    import telegram as tg_mod
+    doc_calls: list = []
+    photo_calls: list = []
+    monkeypatch.setattr(tg_mod, "send_document",
+                        lambda chat_id, p, caption="", thread_id=None:
+                        doc_calls.append((chat_id, p, thread_id)) or None)
+    monkeypatch.setattr(tg_mod, "send_photo",
+                        lambda chat_id, p, caption="", thread_id=None:
+                        photo_calls.append(p) or None)
+
+    bot.mod.turnctl.on_result(sess, "", "")
+    assert doc_calls == [(bot.forum_chat_id, str(doc), sess.topic_id)]
+    assert photo_calls == []
+    assert sess.pending_files == []
+
+
+def test_send_file_image_goes_as_photo(bot, tmp_path, monkeypatch):
+    """A queued image file is delivered as a photo, not a document."""
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    img = tmp_path / "chart.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n")
+    sess.pending_files.append(str(img))
+
+    import telegram as tg_mod
+    doc_calls: list = []
+    photo_calls: list = []
+    monkeypatch.setattr(tg_mod, "send_document",
+                        lambda *a, **k: doc_calls.append(a) or None)
+    monkeypatch.setattr(tg_mod, "send_photo",
+                        lambda chat_id, p, caption="", thread_id=None:
+                        photo_calls.append(p) or None)
+    monkeypatch.setattr(tg_mod, "send_media_group",
+                        lambda *a, **k: [])
+
+    bot.mod.turnctl.on_result(sess, "", "")
+    assert photo_calls == [str(img)]
+    assert doc_calls == []
+
+
 def test_media_group_album_combines_into_one_turn(bot, tmp_path, monkeypatch):
     """An incoming album (N messages sharing media_group_id) → ONE Claude
     turn whose prompt carries every attachment path, not N separate turns."""
@@ -4031,3 +4094,253 @@ def test_settings_presets_apply_at_runtime_and_persist(bot):
     env_txt = open(config._ENV_FILE).read()
     assert "UPLOAD_WARN_MB=250" in env_txt
     assert "UPLOAD_TTL_S=21600" in env_txt
+
+
+# ── guided tour ─────────────────────────────────────────────────────
+
+def _cb_datas(params):
+    """Flatten the callback_data values out of a recorded send/edit's
+    reply_markup inline keyboard."""
+    kb = (params.get("reply_markup") or {}).get("inline_keyboard", [])
+    return [btn.get("callback_data") for row in kb for btn in row]
+
+
+def _welcome_sends(bot):
+    """sendMessage calls that are the tour welcome card (screen 0) in General."""
+    return [p for p in bot.tg.calls_of("sendMessage")
+            if "ClaudeLaude" in p.get("text", "")
+            and "tr:nav:1" in _cb_datas(p)]
+
+
+def test_setup_posts_tour_in_general_and_persists(bot):
+    import config
+    assert config.get_tour_shown() is False
+    bot.tg.inject_update(text_update(
+        "/setup", owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
+    ))
+    _drain_updates(bot)
+
+    # Tour welcome posted into General (no topic created, no thread id), with
+    # a Next button and no Back; first-run flag + message id persisted.
+    welcome = _welcome_sends(bot)
+    assert len(welcome) == 1
+    w = welcome[0]
+    assert w["chat_id"] == bot.forum_chat_id
+    assert w.get("message_thread_id") is None
+    assert "tr:nav:-1" not in _cb_datas(w)
+    assert bot.tg.find_call("createForumTopic") is None  # General, not a topic
+    assert config.get_tour_shown() is True
+    assert config.get_tour_msg_id() is not None
+
+
+def test_setup_twice_does_not_repost_tour(bot):
+    for _ in range(2):
+        bot.tg.inject_update(text_update(
+            "/setup", owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
+        ))
+        _drain_updates(bot)
+    # Welcome posted exactly once — the second /setup is gated by tour_shown.
+    assert len(_welcome_sends(bot)) == 1
+
+
+def test_tour_nav_repaints_and_keeps_buttons(bot):
+    bot.tg.inject_update(callback_update(
+        "tr:nav:1", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, message_id=555,
+    ))
+    _drain_updates(bot)
+    edit = bot.tg.find_call("editMessageText", message_id=555)
+    assert edit is not None
+    assert "Sessions" in edit["text"]          # screen 1 title
+    # reply_markup must be re-passed or Telegram strips the keyboard.
+    assert edit.get("reply_markup"), "nav repaint dropped the keyboard"
+    datas = _cb_datas(edit)
+    assert "tr:nav:0" in datas and "tr:nav:2" in datas  # Back + Next
+
+
+def test_tour_last_screen_has_no_next(bot):
+    import tour
+    last = len(tour.TOUR) - 1
+    bot.tg.inject_update(callback_update(
+        f"tr:nav:{last}", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, message_id=556,
+    ))
+    _drain_updates(bot)
+    edit = bot.tg.find_call("editMessageText", message_id=556)
+    datas = _cb_datas(edit)
+    assert f"tr:nav:{last - 1}" in datas        # Back present
+    assert f"tr:nav:{last + 1}" not in datas     # no Next off the end
+    assert "tr:go:new" in datas                  # culminating try-it
+
+
+def test_tour_out_of_range_is_noop(bot):
+    bot.tg.inject_update(callback_update(
+        "tr:nav:99", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, message_id=557,
+    ))
+    _drain_updates(bot)
+    assert bot.tg.find_call("editMessageText", message_id=557) is None
+
+
+def test_tour_close_deletes_and_clears_id(bot):
+    import config
+    config.set_tour_msg_id(558)
+    bot.tg.inject_update(callback_update(
+        "tr:close", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, message_id=558,
+    ))
+    _drain_updates(bot)
+    assert 558 in bot.tg.deleted_messages
+    assert config.get_tour_msg_id() is None
+
+
+def test_tr_go_new_opens_project_picker_in_forum(bot):
+    bot.tg.inject_update(callback_update(
+        "tr:go:new", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, message_id=559,
+    ))
+    _drain_updates(bot)
+    picker = next(
+        (p for p in bot.tg.calls_of("sendMessage")
+         if "Choose project" in p.get("text", "")), None)
+    assert picker is not None
+    assert picker["chat_id"] == bot.forum_chat_id
+
+
+def test_dashboard_start_here_posts_tour_in_general(bot):
+    bot.tg.inject_update(callback_update(
+        "tr:open", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, message_id=560,
+    ))
+    _drain_updates(bot)
+    assert bot.tg.find_call("createForumTopic") is None
+    assert len(_welcome_sends(bot)) == 1
+
+
+def test_tour_open_dedups_previous_message(bot):
+    import config
+    config.set_tour_msg_id(777)  # pretend a tour card is already up
+    bot.tg.inject_update(callback_update(
+        "tr:open", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, message_id=560,
+    ))
+    _drain_updates(bot)
+    assert 777 in bot.tg.deleted_messages          # old card removed
+    assert config.get_tour_msg_id() != 777          # new id stored
+
+
+def test_tour_msg_id_roundtrip(bot):
+    import config
+    assert config.get_tour_msg_id() is None
+    config.set_tour_msg_id(123)
+    assert config.get_tour_msg_id() == 123
+
+
+# ── /help interactive reference ─────────────────────────────────────
+
+def test_help_opens_category_menu(bot):
+    bot.tg.inject_update(text_update(
+        "/help", owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
+    ))
+    _drain_updates(bot)
+    menu = next((p for p in bot.tg.calls_of("sendMessage")
+                 if "Reference" in p.get("text", "")), None)
+    assert menu is not None
+    datas = _cb_datas(menu)
+    assert "hr:cat:sessions" in datas
+    assert "hr:cat:commands" in datas
+    assert "hr:close" in datas
+
+
+def test_help_section_shows_commands_incl_tour(bot):
+    bot.tg.inject_update(callback_update(
+        "hr:cat:commands", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, message_id=600,
+    ))
+    _drain_updates(bot)
+    edit = bot.tg.find_call("editMessageText", message_id=600)
+    assert edit is not None
+    assert "/tour" in edit["text"]
+    datas = _cb_datas(edit)
+    assert "hr:menu" in datas and "hr:close" in datas
+
+
+def test_help_back_returns_to_menu(bot):
+    bot.tg.inject_update(callback_update(
+        "hr:menu", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, message_id=601,
+    ))
+    _drain_updates(bot)
+    edit = bot.tg.find_call("editMessageText", message_id=601)
+    assert edit is not None and "Reference" in edit["text"]
+
+
+def test_help_close_deletes(bot):
+    import config
+    config.set_help_msg_id(602)
+    bot.tg.inject_update(callback_update(
+        "hr:close", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, message_id=602,
+    ))
+    _drain_updates(bot)
+    assert 602 in bot.tg.deleted_messages
+    assert config.get_help_msg_id() is None
+
+
+def test_resume_no_sessions_is_ephemeral_in_general(bot, monkeypatch):
+    """/resume with nothing to resume must NOT leave a permanent message in
+    General — it goes through the auto-deleting ephemeral path."""
+    monkeypatch.setattr(bot.mod.commands, "_discover_resumable_sessions",
+                        lambda *a, **k: [])
+    eph = []
+    monkeypatch.setattr(bot.mod.ui, "ephemeral",
+                        lambda chat_id, text, **k: eph.append(text) or 1)
+    bot.tg.inject_update(text_update(
+        "/resume", owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
+    ))
+    _drain_updates(bot)
+    assert any("No resumable" in t for t in eph), eph
+
+
+def test_general_auto_reap_backstop(bot, monkeypatch):
+    """Any non-persistent message to General root is auto-scheduled for
+    deletion; persistent ones, topic messages, and DMs are left alone."""
+    import telegram as tg
+    tg.set_forum_chat_id(bot.forum_chat_id)
+    reaped = []
+    monkeypatch.setattr(tg, "_general_reaper", lambda mid: reaped.append(mid))
+
+    mid = tg.send("transient notice", bot.forum_chat_id)   # General root
+    assert mid in reaped
+
+    reaped.clear()
+    tg.send("keep me", bot.forum_chat_id, persist=True)     # opted out
+    assert reaped == []
+
+    tg.send("in a topic", bot.forum_chat_id, thread_id=77)  # has a thread
+    assert reaped == []
+
+    tg.send("a dm", bot.owner_id)                            # not General
+    assert reaped == []
+
+
+def test_send_general_opts_out_of_reap(bot, monkeypatch):
+    """BotUI.send_general manages its own timer, so it must not also trigger
+    the backstop (no double-scheduling)."""
+    import telegram as tg
+    tg.set_forum_chat_id(bot.forum_chat_id)
+    reaped = []
+    monkeypatch.setattr(tg, "_general_reaper", lambda mid: reaped.append(mid))
+    bot.mod.ui.send_general("hello")
+    assert reaped == []
+
+
+def test_bot_commands_menu_includes_new_entries(bot):
+    cmds = {c["command"] for c in bot.mod._BOT_COMMANDS}
+    assert {"tour", "mode", "resume"} <= cmds
+
+
+def test_validate_help_stays_green(bot, capsys):
+    bot.mod._validate_help()
+    err = capsys.readouterr().err
+    assert "WARN" not in err
