@@ -1335,12 +1335,23 @@ def _handle_update(u):
             return
         emoji = sticker.get("emoji") or ""
         set_name = sticker.get("set_name") or ""
-        if set_name:
-            descr = f"[Sticker: {emoji} from \"{set_name}\"]"
+        if set_name and emoji:
+            ident = f" {emoji} (from pack \"{set_name}\")"
+        elif set_name:
+            ident = f" (from pack \"{set_name}\")"
         elif emoji:
-            descr = f"[Sticker: {emoji}]"
+            ident = f" {emoji}"
         else:
-            descr = "[Sticker]"
+            ident = ""
+        descr = (
+            f"[The owner sent you a sticker{ident} — a sticker is a "
+            "deliberate emotional/reaction cue, not just a dropped image. "
+            "Read its expression, pose, any text on it, and the emoji it "
+            "maps to as part of what the owner is communicating. When the "
+            "sticker has BOTH a drawing and text, give the image and the "
+            "text equal weight — do not fixate on the words and overlook "
+            "the picture (or the reverse); both carry the meaning.]"
+        )
         if sticker.get("is_video"):
             if not frames.available():
                 _offer_media_install(session, "sticker", sticker["file_id"],
@@ -1361,7 +1372,8 @@ def _handle_update(u):
         else:
             image_id = sticker["file_id"]
             ext = "webp"
-        audit.log("user_message", descr, sid=session.sid)
+        audit.log("user_message",
+                  f"[sticker]{ident}".strip(), sid=session.sid)
         if image_id:
             dest = os.path.join(_UPLOAD_DIR,
                                 f"{int(time.time())}_sticker.{ext}")

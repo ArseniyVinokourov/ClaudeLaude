@@ -324,6 +324,13 @@ class TurnController:
             "- Inline buttons truncate at ~25 chars on mobile.",
             "- Photos/files the owner sends arrive as attachment paths in "
             "your user message.",
+            "- The owner may also send voice and video (delivered to you "
+            "transcribed, with video scene-frames attached), stickers, and "
+            "emoji reactions to your messages (arrive as `[User reacted …]`) "
+            "— treat all of these as normal user input.",
+            "- You may ask the owner clarifying questions with the "
+            "AskUserQuestion tool; its options render as tappable inline "
+            "buttons in Telegram, so it works here.",
             "- To send a file back to this topic (a document, log, image, "
             "etc.), put a line `[Send file: /abs/path]` in your reply. The "
             "bot delivers the file and removes that line from what's shown.",
