@@ -24,8 +24,8 @@ import audit
 import session_discovery
 import telegram as tg
 from botui import CLOSE_ROW
-from config import (HOOK_PORT, get_forum_chat_id,
-                    set_forum_chat_id)
+from config import (HOOK_PORT, get_forum_chat_id, get_help_msg_id,
+                    set_forum_chat_id, set_help_msg_id)
 from formatting import (_format_age, _short_cwd, _strip_md,
                         topic_control_rows)
 from session_discovery import (_discover_projects, _live_claude_session_ids,
@@ -37,37 +37,129 @@ _PICKER_TTL = 60
 _RESUME_RECENT_SECONDS = 5 * 60
 _RESUME_RECENT_LIMIT = 4
 
-_HELP_TEXT = (
-    "<b>ClaudeLaude — Help</b>\n"
-    "\n"
-    "<b>Sessions</b>\n"
-    "/new — project picker\n"
-    "/new &lt;path&gt; [name] — session in dir\n"
-    "/sessions — list sessions + fork\n"
-    "/resume — pick session to continue\n"
-    "/resume &lt;id&gt; — continue by session id\n"
-    "/stop — stop current session\n"
-    "/restart — restart stopped session\n"
-    "/interrupt — abort current turn\n"
-    "\n"
-    "<b>In topic</b>\n"
-    "/history [N] — last N events (default 30)\n"
-    "/usage — session tokens + account limits\n"
-    "/display [mobile|desktop] — toggle view\n"
-    "/mode [default|terse|verbose|beginner|plan|burn] — response style\n"
-    "\n"
-    "<b>Other</b>\n"
-    "/update — check for bot updates\n"
-    "/settings — whisper model, media cleanup\n"
-    "/menu — quick actions\n"
-    "/help — this message\n"
-    "/stop_bot — shutdown bot\n"
-    "\n"
-    "Unknown /commands in bot sessions are\n"
-    "forwarded to Claude as user messages.\n"
-    "Photos/files in bot topics are sent\n"
-    "to the session as attachments."
+# ── /help as an interactive reference ───────────────────────────────
+# A menu of category buttons; each opens a section that mixes commands with
+# the no-command processes for that area. `hr:` callbacks (dispatched in
+# bot.py) flip between the menu and a section, both editing one message.
+
+_HELP_INTRO = (
+    "<b>ClaudeLaude — Reference</b>\n\n"
+    "Tap a topic to explore:"
 )
+
+# Ordered: (key, button label, section body). Bodies are mobile-width.
+_HELP_SECTIONS: list[tuple[str, str, str]] = [
+    ("sessions", "\U0001f4c1 Sessions",
+     "<b>\U0001f4c1 Sessions</b>\n\n"
+     "A session is one Claude Code run,\n"
+     "shown as a forum topic.\n\n"
+     "/new — pick a project, open a topic\n"
+     "/new &lt;path&gt; [name] — in a set dir\n"
+     "/sessions — sessions running in the\n"
+     "  bot; tap one to fork it\n"
+     "/resume — pull in a Claude session\n"
+     "  from outside the bot (e.g. one you\n"
+     "  ran in a terminal)\n"
+     "/resume &lt;id&gt; — by session id\n"
+     "/stop — stop the one in this topic\n"
+     "/restart — restart a stopped one\n"
+     "/interrupt — abort the current turn\n\n"
+     "Topics rename themselves from the\n"
+     "conversation."),
+    ("modes", "\U0001f3a8 Modes",
+     "<b>\U0001f3a8 Modes</b>\n\n"
+     "Set how Claude answers, per session.\n\n"
+     "/mode — show current / list all\n"
+     "/mode &lt;name&gt; — switch\n\n"
+     "default · normal\n"
+     "terse · short answers\n"
+     "verbose · full reasoning\n"
+     "beginner · explains as it goes\n"
+     "plan · plans first, no changes\n"
+     "burn · maximum effort\n\n"
+     "Also one tap from a topic's panel."),
+    ("media", "\U0001f4ce Send media",
+     "<b>\U0001f4ce Send media</b> (no command)\n\n"
+     "Just send it into a session topic:\n"
+     "• Photos &amp; albums\n"
+     "• Voice messages → transcribed\n"
+     "• Videos &amp; video messages →\n"
+     "  transcript + scene frames\n"
+     "• Stickers\n"
+     "• Files &amp; documents\n\n"
+     "Claude receives it as an attachment.\n"
+     "React to a reply with an emoji and\n"
+     "Claude sees the reaction.\n\n"
+     "Voice/video transcription is opt-in\n"
+     "(installed on first use or via\n"
+     "/settings)."),
+    ("control", "\U0001f518 Control",
+     "<b>\U0001f518 Control &amp; questions</b>\n\n"
+     "Each topic has a pinned panel:\n"
+     "Mode · Display · Stop · Usage ·\n"
+     "History (Restart when stopped).\n\n"
+     "/display [mobile|desktop] — layout\n"
+     "/usage — context %, tokens, cost\n"
+     "/history [N] — last N events\n\n"
+     "When Claude asks a question, you\n"
+     "answer with inline buttons.\n"
+     "Unknown /commands in a session are\n"
+     "forwarded to Claude as-is."),
+    ("mirror", "\U0001f517 Mirror",
+     "<b>\U0001f517 Mirror a terminal</b>\n\n"
+     "Bring a terminal Claude session into\n"
+     "Telegram.\n\n"
+     "Run /bot-mirror inside a terminal\n"
+     "Claude session: its output streams to\n"
+     "a topic and you can type back from\n"
+     "your phone.\n\n"
+     "If the terminal closes, continue the\n"
+     "session as a bot session with one tap."),
+    ("safety", "⚙️ Settings & safety",
+     "<b>⚙️ Settings &amp; safety</b>\n\n"
+     "/settings — whisper model, media\n"
+     "  cleanup TTL, storage alerts\n"
+     "/update — check for bot updates\n"
+     "/stop_bot — shut the bot down\n\n"
+     "\U0001f512 /kill freezes the bot and stops\n"
+     "every session. Unlock is one-way\n"
+     "(needs your secret word), with\n"
+     "brute-force protection. Every action\n"
+     "is written to an audit log."),
+    ("commands", "\U0001f4cb All commands",
+     "<b>\U0001f4cb All commands</b>\n\n"
+     "/tour — guided walkthrough\n"
+     "/new — new session (or picker)\n"
+     "/sessions — list + fork\n"
+     "/resume — resume a session\n"
+     "/stop · /restart · /interrupt\n"
+     "/mode — response style\n"
+     "/display — mobile/desktop\n"
+     "/usage — tokens + limits\n"
+     "/history [N] — last N events\n"
+     "/settings — bot settings\n"
+     "/update — check updates\n"
+     "/menu — quick actions\n"
+     "/help — this reference\n"
+     "/stop_bot — shut down"),
+]
+
+_HELP_BODY = {key: body for key, _label, body in _HELP_SECTIONS}
+
+
+def _help_menu_rows():
+    cats = [{"text": label, "callback_data": f"hr:cat:{key}"}
+            for key, label, _body in _HELP_SECTIONS]
+    # Two per row, except the last (All commands) gets its own row.
+    rows = [cats[i:i + 2] for i in range(0, len(cats) - 1, 2)]
+    rows.append([cats[-1]])
+    rows.append([{"text": "✕ Close", "callback_data": "hr:close"}])
+    return rows
+
+
+def _help_section_rows():
+    return [[{"text": "◀ Back", "callback_data": "hr:menu"}],
+            [{"text": "✕ Close", "callback_data": "hr:close"}]]
 
 
 class Commands:
@@ -93,7 +185,8 @@ class Commands:
             tg.send("❌ Enable Topics in this group first.", chat_id)
             return
         set_forum_chat_id(chat_id)
-        tg.send("✅ Forum linked. Use /new to start a session.", chat_id)
+        tg.send("✅ Forum linked. A quick tour is below — "
+                "or /new to jump straight in.", chat_id)
 
     def cmd_new(self, args: str, chat_id=None, thread_id=None):
         fid = get_forum_chat_id()
@@ -346,7 +439,14 @@ class Commands:
             return
         sessions = self._discover_resumable_sessions()
         if not sessions:
-            self.ui.reply(chat_id, thread_id, "No resumable sessions found.")
+            # In General the reply must self-clean (General stays clean —
+            # only the pinned dashboard persists); in a topic it can stay.
+            if not thread_id and chat_id:
+                self.ui.ephemeral(chat_id, "No resumable sessions found.",
+                                  seconds=7)
+            else:
+                self.ui.reply(chat_id, thread_id,
+                              "No resumable sessions found.")
             return
         pick_id = str(time.time_ns())[-10:]
         with self.state.lock:
@@ -663,10 +763,35 @@ class Commands:
         threading.Thread(target=_do_check, daemon=True).start()
 
     def cmd_help(self, chat_id, thread_id=None):
-        if not thread_id:
-            self.ui.ephemeral(chat_id, _HELP_TEXT, seconds=_PICKER_TTL)
-        else:
-            tg.send(_HELP_TEXT, chat_id, thread_id=thread_id)
+        """Open the interactive reference (menu of category buttons)."""
+        if thread_id:
+            tg.send(_HELP_INTRO, chat_id, thread_id=thread_id,
+                    buttons=_help_menu_rows())
+            return
+        # General: keep exactly one help message, dismissed via Close. It
+        # carries no delete timer, so the General sweep leaves it alone.
+        old = get_help_msg_id()
+        if old:
+            tg.delete(old, chat_id)
+        # persist=True: onboarding reference, dismissed by Close — opts out of
+        # the General auto-reap backstop.
+        mid = tg.send(_HELP_INTRO, chat_id, buttons=_help_menu_rows(),
+                      persist=True)
+        set_help_msg_id(mid)
+
+    def render_help_menu(self, msg_id, chat_id):
+        tg.edit(msg_id, _HELP_INTRO, chat_id, buttons=_help_menu_rows())
+
+    def render_help_section(self, msg_id, chat_id, key):
+        body = _HELP_BODY.get(key)
+        if not body:
+            return
+        tg.edit(msg_id, body, chat_id, buttons=_help_section_rows())
+
+    def close_help(self, msg_id, chat_id):
+        tg.delete(msg_id, chat_id)
+        if get_help_msg_id() == msg_id:
+            set_help_msg_id(None)
 
     # ── per-topic control panel (pinned opening message) ─────────────
 

@@ -22,14 +22,20 @@ if ! command -v python3 &>/dev/null; then
     err "python3 not found. Install Python 3.10+."
     exit 1
 fi
+if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)'; then
+    err "Python 3.10+ required (found $(python3 --version)). Upgrade Python."
+    exit 1
+fi
 ok "python3 found: $(python3 --version)"
 
-if ! command -v claude &>/dev/null; then
-    warn "claude CLI not found in PATH."
+if command -v claude &>/dev/null; then
+    ok "claude CLI found"
+elif [ -x "$HOME/.local/bin/claude" ]; then
+    ok "claude CLI found at ~/.local/bin/claude"
+else
+    warn "claude CLI not found in PATH or ~/.local/bin."
     echo "  Install: https://docs.anthropic.com/en/docs/claude-code/getting-started"
     echo "  The bot won't be able to create sessions until claude is available."
-else
-    ok "claude CLI found"
 fi
 
 # ── .env ─────────────────────────────────────────────────────────────
@@ -323,6 +329,8 @@ else
     if bash "$SCRIPT_DIR/scripts/install-claude-swap.sh" "$SWAP_SHELL"; then
         ok "Installed swap wrapper for $SWAP_SHELL"
         echo "  Open a new terminal (or source your rc) for it to take effect."
+        echo "  Use another shell too? Re-run:"
+        echo "    bash scripts/install-claude-swap.sh <bash|zsh|fish>"
     else
         warn "Could not install swap wrapper — see message above."
     fi
@@ -372,7 +380,7 @@ fi
 # ── smoke test ───────────────────────────────────────────────────────
 bold "\nSmoke test"
 
-if .venv/bin/python -c "import bot, telegram, sessions, hooks, config, version, terminal_mirror" 2>/tmp/claudelaude_smoke.log; then
+if .venv/bin/python -c "import bot, telegram, sessions, hooks, config, version, terminal_mirror, tour, commands, dashboard, lifecycle" 2>/tmp/claudelaude_smoke.log; then
     ok "Python imports OK"
 else
     warn "Python import check failed (see /tmp/claudelaude_smoke.log)"

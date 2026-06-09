@@ -35,6 +35,29 @@ def set_forum_chat_id(cid: int | None) -> None:
     _forum_chat_id = cid
 
 
+# General auto-reap guard. Any message sent to the General topic (forum root,
+# no thread) that is not explicitly persistent gets a default delete scheduled,
+# so General can never accumulate timer-less junk. The pinned dashboard,
+# security alerts and the onboarding tour/help opt out with persist=True; the
+# self-managing BotUI helpers (send_general/ephemeral) also opt out because
+# they schedule their own delete. The reaper (set by bot.py) is a generous
+# backstop — longer than any legitimate self-managed TTL — so it only matters
+# for messages that would otherwise have NO timer at all.
+_general_reaper = None  # callable(msg_id) -> None
+
+
+def configure_general_guard(reaper) -> None:
+    global _general_reaper
+    _general_reaper = reaper
+
+
+def _maybe_reap_general(chat_id, thread_id, persist, msg_id) -> None:
+    if (msg_id and not persist and _general_reaper is not None
+            and _forum_chat_id is not None
+            and chat_id == _forum_chat_id and not thread_id):
+        _general_reaper(msg_id)
+
+
 def set_on_429(callback) -> None:
     """Install a hook called whenever we hit 429 on the group.
 
@@ -305,9 +328,11 @@ def recent_send_info(chat_id: int, msg_id: int):
 
 def send(text: str, chat_id: int, thread_id: int | None = None,
          buttons: list | None = None, markdown: bool = False,
-         prio: int = P1) -> int | None:
-    return _via_budget(chat_id, prio, _send_impl,
-                       text, chat_id, thread_id, buttons, markdown)
+         prio: int = P1, persist: bool = False) -> int | None:
+    mid = _via_budget(chat_id, prio, _send_impl,
+                      text, chat_id, thread_id, buttons, markdown)
+    _maybe_reap_general(chat_id, thread_id, persist, mid)
+    return mid
 
 
 def _send_impl(text, chat_id, thread_id, buttons, markdown) -> int | None:
@@ -469,9 +494,11 @@ def _edit_impl(msg_id, text, chat_id, buttons):
 
 def send_photo(chat_id: int, photo_path: str, caption: str = "",
                thread_id: int | None = None,
-               prio: int = P1) -> int | None:
-    return _via_budget(chat_id, prio, _send_photo_impl,
-                       chat_id, photo_path, caption, thread_id)
+               prio: int = P1, persist: bool = False) -> int | None:
+    mid = _via_budget(chat_id, prio, _send_photo_impl,
+                      chat_id, photo_path, caption, thread_id)
+    _maybe_reap_general(chat_id, thread_id, persist, mid)
+    return mid
 
 
 def _send_photo_impl(chat_id, photo_path, caption, thread_id) -> int | None:
@@ -531,7 +558,7 @@ def _copy_messages_impl(chat_id, from_chat_id, message_ids, thread_id,
 
 def send_media_group(chat_id: int, photo_paths: list[str],
                      thread_id: int | None = None,
-                     prio: int = P1) -> list[int]:
+                     prio: int = P1, persist: bool = False) -> list[int]:
     """Send 2–10 photos as a single album. Returns list of message_ids.
 
     Telegram caps an album at 10 items. Callers should split if more.
@@ -541,8 +568,11 @@ def send_media_group(chat_id: int, photo_paths: list[str],
     Note: an album costs ~20 budget units server-side, near-flat in photo
     count (probe #3). For typical usage prefer N×send_photo (cost N).
     """
-    return _via_budget(chat_id, prio, _send_media_group_impl,
-                       chat_id, photo_paths, thread_id)
+    ids = _via_budget(chat_id, prio, _send_media_group_impl,
+                      chat_id, photo_paths, thread_id)
+    for mid in (ids or []):
+        _maybe_reap_general(chat_id, thread_id, persist, mid)
+    return ids
 
 
 def _send_media_group_impl(chat_id, photo_paths, thread_id) -> list[int]:
@@ -584,9 +614,11 @@ def _send_media_group_impl(chat_id, photo_paths, thread_id) -> list[int]:
 
 def send_document(chat_id: int, doc_path: str, caption: str = "",
                   thread_id: int | None = None,
-                  prio: int = P1) -> int | None:
-    return _via_budget(chat_id, prio, _send_document_impl,
-                       chat_id, doc_path, caption, thread_id)
+                  prio: int = P1, persist: bool = False) -> int | None:
+    mid = _via_budget(chat_id, prio, _send_document_impl,
+                      chat_id, doc_path, caption, thread_id)
+    _maybe_reap_general(chat_id, thread_id, persist, mid)
+    return mid
 
 
 def _send_document_impl(chat_id, doc_path, caption, thread_id) -> int | None:

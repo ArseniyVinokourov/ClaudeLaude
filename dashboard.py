@@ -33,6 +33,7 @@ _MENU_ROWS = [
      {"text": "\U0001f4cb Sessions", "callback_data": "m:sessions"}],
     [{"text": "▶️ Resume", "callback_data": "m:resume"},
      {"text": "❓ Help", "callback_data": "m:help"}],
+    [{"text": "\U0001f44b Start here", "callback_data": "tr:open"}],
 ]
 
 
@@ -244,7 +245,7 @@ class Dashboard:
             add_pending_delete(old_id, time.time())  # due now
             if tg.delete(old_id, fid):
                 remove_pending_delete(old_id)
-        msg_id = tg.send(text, fid, buttons=_MENU_ROWS)
+        msg_id = tg.send(text, fid, buttons=_MENU_ROWS, persist=True)
         if msg_id:
             tg.pin(msg_id, fid)
             set_dashboard_id(msg_id)
