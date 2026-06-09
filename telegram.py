@@ -458,8 +458,12 @@ def _unpin_impl(msg_id, chat_id):
 
 
 def edit(msg_id: int, text: str, chat_id: int, buttons: list | None = None,
-         prio: int = P1):
-    _via_budget(chat_id, prio, _edit_impl, msg_id, text, chat_id, buttons)
+         prio: int = P1) -> bool:
+    """Edit a message. Returns True if it landed (or was a benign no-op),
+    False if the message is gone / the edit failed — so callers can fall back
+    to a fresh send."""
+    return bool(_via_budget(chat_id, prio, _edit_impl,
+                            msg_id, text, chat_id, buttons))
 
 
 def _edit_impl(msg_id, text, chat_id, buttons):
@@ -473,6 +477,7 @@ def _edit_impl(msg_id, text, chat_id, buttons):
         params["reply_markup"] = {"inline_keyboard": buttons}
     try:
         _req("editMessageText", params)
+        return True
     except requests.HTTPError as e:
         body = ""
         if e.response is not None:
@@ -483,11 +488,15 @@ def _edit_impl(msg_id, text, chat_id, buttons):
         _check_topic_dead(chat_id, None, body)
         # A no-op edit (same text + markup) is benign — Telegram rejects it
         # with "message is not modified". The status indicator re-paints with
-        # identical content sometimes; don't treat that as an error.
-        if "not modified" not in body.lower():
-            _log(f"edit error: {e} :: {body[:200]}")
+        # identical content sometimes; don't treat that as an error. The
+        # message still exists, so report success.
+        if "not modified" in body.lower():
+            return True
+        _log(f"edit error: {e} :: {body[:200]}")
+        return False
     except Exception as e:
         _log(f"edit error: {e}")
+        return False
 
 
 # ── media ───────────────────────────────────────────────────────────

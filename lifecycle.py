@@ -15,7 +15,7 @@ import time
 
 import audit
 import telegram as tg
-from config import add_pending_delete, get_forum_chat_id
+from config import add_pending_delete, get_default_mode, get_forum_chat_id
 from formatting import topic_control_rows
 
 
@@ -55,6 +55,10 @@ class SessionLifecycle:
             self.state.topic_labels[topic_id] = label
         s = self.mgr.create(cwd=cwd, name=name, topic_id=topic_id)
         s.topic_label = label
+        # New sessions start in the configured default mode (/settings).
+        default_mode = get_default_mode()
+        if default_mode != "default":
+            self.mgr.set_mode(s.sid, default_mode)
         self.attach_controls(s)
         self.mgr._persist()
         audit.log("session_start", cwd, sid=s.sid)

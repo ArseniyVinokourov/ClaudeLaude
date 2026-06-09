@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from config import (OWNER_ID, AUTO_UPDATE, AUTO_UPDATE_POLICY,
                     UNLOCK_WORD, add_pending_delete,
+                    get_default_mode, set_default_mode,
                     get_forum_chat_id, get_tour_shown, set_tour_shown,
                     get_uploads_warned_at,
                     set_uploads_warned_at, set_env,
@@ -31,7 +32,7 @@ from hookhandlers import HookHandlers
 from lifecycle import SessionLifecycle
 from mirrorbridge import MirrorProjector
 from turncontroller import TurnController, TurnState
-from sessions import SessionManager
+from sessions import MODE_PRESETS, SessionManager, valid_mode
 from questions import QuestionAsker
 from updater import (
     _check_update, _has_local_changes, _restart_bot, _run_update,
@@ -46,7 +47,7 @@ from session_discovery import _resolve_session_cwd, _session_jsonl_path
 # ── state ────────────────────────────────────────────────────────────
 
 _CLAUDE_BIN = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
-DEFAULT_DISPLAY = "mobile"
+DEFAULT_DISPLAY = os.environ.get("DEFAULT_DISPLAY", "mobile")
 _UPLOAD_DIR = "/tmp/bot_uploads"
 
 _ICON_ACTIVE = "5417915203100613993"   # 💬
@@ -188,11 +189,19 @@ def _do_kill():
 
 
 def _auto_update_loop():
-    """Background thread: check for updates at startup + every hour."""
-    if not AUTO_UPDATE:
-        return
+    """Background thread: check for updates at startup + every hour.
+
+    Always runs; honours the live AUTO_UPDATE flag each iteration so toggling
+    it from /settings takes effect without a restart (when off, idles ~60s and
+    rechecks)."""
     time.sleep(10)
     while bot_running:
+        if not AUTO_UPDATE:
+            for _ in range(60):
+                if not bot_running:
+                    break
+                time.sleep(1)
+            continue
         try:
             result = _check_update()
             if result:
@@ -1049,6 +1058,7 @@ def _run_media_install(entry, choice):
 _SETTINGS_TTL_S = 120
 _WARN_MB_PRESETS = [100, 250, 500, 1000, 2000]
 _TTL_PRESETS = [6 * 3600, 24 * 3600, 48 * 3600, 7 * 86400, 14 * 86400]
+_STT_PRESETS = [60, 120, 180, 300, 600]  # voice/video transcription timeout
 
 
 def _fmt_ttl(seconds: int) -> str:
@@ -1062,16 +1072,25 @@ def _settings_root_rows():
         [{"text": "🎙 Whisper model", "callback_data": "st:m"}],
         [{"text": "📦 Upload alert", "callback_data": "st:w"}],
         [{"text": "🗑 Cleanup TTL", "callback_data": "st:t"}],
+        [{"text": "📱 Display default", "callback_data": "st:d"}],
+        [{"text": "🎚 Default mode", "callback_data": "st:dm"}],
+        [{"text": "🕒 Transcription timeout", "callback_data": "st:st"}],
+        [{"text": "⬆️ Auto-update", "callback_data": "st:au"}],
         CLOSE_ROW,
     ]
 
 
 def _settings_text():
+    au = "on" if AUTO_UPDATE else "off"
     return (
         "⚙️ <b>Settings</b>\n\n"
         f"🎙 Whisper model: <b>{tg.esc(stt.model_name())}</b>\n"
         f"📦 Upload alert: <b>{_UPLOAD_WARN_BYTES // (1024 * 1024)} MB</b>\n"
-        f"🗑 Cleanup after: <b>{_fmt_ttl(_UPLOAD_TTL_S)}</b>"
+        f"🗑 Cleanup after: <b>{_fmt_ttl(_UPLOAD_TTL_S)}</b>\n"
+        f"📱 Display default: <b>{tg.esc(DEFAULT_DISPLAY)}</b>\n"
+        f"🎚 Default mode: <b>{tg.esc(get_default_mode())}</b>\n"
+        f"🕒 Transcription timeout: <b>{stt._TIMEOUT}s</b>\n"
+        f"⬆️ Auto-update: <b>{au}</b> ({tg.esc(AUTO_UPDATE_POLICY)})"
     )
 
 
@@ -1107,6 +1126,43 @@ def _settings_show(cb_msg, cb_chat, which):
         tg.edit(cb_msg, "🗑 <b>Cleanup TTL</b>\nDelete uploaded media older "
                 "than this (kept if a session still references it).",
                 cb_chat, buttons=rows)
+    elif which == "d":
+        rows = [[{"text": f"{'• ' if v == DEFAULT_DISPLAY else ''}{v}",
+                  "callback_data": f"st:d:{v}"}] for v in ("mobile", "desktop")]
+        rows.append([{"text": "↩ Back", "callback_data": "st:root"}])
+        tg.edit(cb_msg, "📱 <b>Display default</b>\nLayout new topics start "
+                "in. /display overrides it per topic.", cb_chat, buttons=rows)
+    elif which == "dm":
+        cur = get_default_mode()
+        rows = [[{"text": f"{'• ' if k == cur else ''}{k} — {p['label']}",
+                  "callback_data": f"st:dm:{k}"}]
+                for k, p in MODE_PRESETS.items()]
+        rows.append([{"text": "↩ Back", "callback_data": "st:root"}])
+        tg.edit(cb_msg, "🎚 <b>Default mode</b>\nWhich response style new "
+                "sessions start in.", cb_chat, buttons=rows)
+    elif which == "st":
+        cur = stt._TIMEOUT
+        rows = [[{"text": f"{'• ' if s == cur else ''}{s}s",
+                  "callback_data": f"st:st:{s}"}] for s in _STT_PRESETS]
+        rows.append([{"text": "↩ Back", "callback_data": "st:root"}])
+        tg.edit(cb_msg, "🕒 <b>Transcription timeout</b>\nHow long to wait "
+                "for voice/video transcription before giving up.",
+                cb_chat, buttons=rows)
+    elif which == "au":
+        on = AUTO_UPDATE
+        rows = [
+            [{"text": f"{'• ' if on else ''}On", "callback_data": "st:au:on"},
+             {"text": f"{'• ' if not on else ''}Off",
+              "callback_data": "st:au:off"}],
+            [{"text": f"{'• ' if AUTO_UPDATE_POLICY == 'replace' else ''}"
+              "policy: replace", "callback_data": "st:au:replace"}],
+            [{"text": f"{'• ' if AUTO_UPDATE_POLICY == 'merge' else ''}"
+              "policy: merge", "callback_data": "st:au:merge"}],
+            [{"text": "↩ Back", "callback_data": "st:root"}],
+        ]
+        tg.edit(cb_msg, "⬆️ <b>Auto-update</b>\nCheck hourly and update. On "
+                "local changes: replace (back up + overwrite) or merge "
+                "(wait, /update to review).", cb_chat, buttons=rows)
 
 
 def _settings_set_warn(cb_msg, cb_chat, mb):
@@ -1124,6 +1180,53 @@ def _settings_set_ttl(cb_msg, cb_chat, seconds):
     set_env("UPLOAD_TTL_S", str(seconds))
     audit.log("settings", f"upload_ttl_s={seconds}")
     tg.edit(cb_msg, _settings_text(), cb_chat, buttons=_settings_root_rows())
+
+
+def _settings_set_display(cb_msg, cb_chat, value):
+    if value not in ("mobile", "desktop"):
+        return
+    global DEFAULT_DISPLAY
+    DEFAULT_DISPLAY = value
+    # Update the live copies the components captured at construction, so new
+    # topics pick up the change without a restart.
+    turnctl._default_display = value
+    commands._default_display = value
+    set_env("DEFAULT_DISPLAY", value)
+    audit.log("settings", f"default_display={value}")
+    tg.edit(cb_msg, _settings_text(), cb_chat, buttons=_settings_root_rows())
+
+
+def _settings_set_default_mode(cb_msg, cb_chat, mode):
+    if not valid_mode(mode):
+        return
+    set_default_mode(mode)
+    audit.log("settings", f"default_mode={mode}")
+    tg.edit(cb_msg, _settings_text(), cb_chat, buttons=_settings_root_rows())
+
+
+def _settings_set_stt(cb_msg, cb_chat, seconds):
+    if seconds not in _STT_PRESETS:
+        return
+    stt._TIMEOUT = seconds
+    set_env("STT_TIMEOUT", str(seconds))
+    audit.log("settings", f"stt_timeout={seconds}")
+    tg.edit(cb_msg, _settings_text(), cb_chat, buttons=_settings_root_rows())
+
+
+def _settings_set_autoupdate(cb_msg, cb_chat, value):
+    global AUTO_UPDATE, AUTO_UPDATE_POLICY
+    if value in ("on", "off"):
+        AUTO_UPDATE = (value == "on")
+        set_env("AUTO_UPDATE", "true" if AUTO_UPDATE else "false")
+        audit.log("settings", f"auto_update={value}")
+    elif value in ("replace", "merge"):
+        AUTO_UPDATE_POLICY = value
+        set_env("AUTO_UPDATE_POLICY", value)
+        audit.log("settings", f"auto_update_policy={value}")
+    else:
+        return
+    # Re-render the picker so the • marker moves to the new selection.
+    _settings_show(cb_msg, cb_chat, "au")
 
 
 def _settings_set_model(cb_msg, cb_chat, model):
@@ -1149,22 +1252,24 @@ def _run_settings_model_install(cb_msg, cb_chat, model):
     # stt.model_name() reflects the switch once this returns ok.
     ok = stt_install.install_whisper(model)
     audit.log("settings", f"whisper_model={model} {'ok' if ok else 'FAILED'}")
-    try:
-        if ok:
-            tg.edit(cb_msg, _settings_text(), cb_chat,
-                    buttons=_settings_root_rows())
-        else:
-            tg.edit(cb_msg, f"❌ Failed to install Whisper {tg.esc(model)} "
-                    "— see bot.log.", cb_chat, buttons=_settings_root_rows())
-    except Exception:
-        pass
+    if ok:
+        body = _settings_text()
+    else:
+        body = f"❌ Failed to install Whisper {tg.esc(model)} — see bot.log."
+    # The download can run for minutes — longer than the /settings message's
+    # own TTL — so the menu message may already be gone. Try to edit it back;
+    # only if that fails (message deleted) send a fresh result notice, so the
+    # outcome is never silently lost.
+    if not tg.edit(cb_msg, body, cb_chat, buttons=_settings_root_rows()):
+        result = (f"✅ Whisper {tg.esc(model)} ready" if ok else body)
+        ui.ephemeral(cb_chat, result, seconds=30)
 
 
 def _settings_clicked(cb_msg, cb_chat, rest):
     if rest == "root":
         tg.edit(cb_msg, _settings_text(), cb_chat,
                 buttons=_settings_root_rows())
-    elif rest in ("m", "w", "t"):
+    elif rest in ("m", "w", "t", "d", "dm", "st", "au"):
         _settings_show(cb_msg, cb_chat, rest)
     elif rest.startswith("m:"):
         _settings_set_model(cb_msg, cb_chat, rest[2:])
@@ -1178,6 +1283,17 @@ def _settings_clicked(cb_msg, cb_chat, rest):
             _settings_set_ttl(cb_msg, cb_chat, int(rest[2:]))
         except ValueError:
             pass
+    elif rest.startswith("dm:"):
+        _settings_set_default_mode(cb_msg, cb_chat, rest[3:])
+    elif rest.startswith("st:"):
+        try:
+            _settings_set_stt(cb_msg, cb_chat, int(rest[3:]))
+        except ValueError:
+            pass
+    elif rest.startswith("d:"):
+        _settings_set_display(cb_msg, cb_chat, rest[2:])
+    elif rest.startswith("au:"):
+        _settings_set_autoupdate(cb_msg, cb_chat, rest[3:])
 
 
 def _reject_no_session(chat_id, thread_id, what):
