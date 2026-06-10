@@ -72,20 +72,18 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Tag and release
+      - name: Tag
         if: steps.check.outputs.skip != 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           V: ${{ steps.ver.outputs.version }}
         run: |
-          # Squash commit message becomes the release notes body.
-          notes=$(git log -1 --format='%B')
-
+          # Tag only — never auto-create a GitHub Release. A Release is the
+          # owner's manual "this is now available to update to" gate: the bot
+          # checks releases/latest, which stays empty until the owner clicks
+          # "Draft a new release" → picks a tag → Publish. Tags keep flowing on
+          # every merge so version.py / git describe stay accurate; they just
+          # no longer trigger "update available" on their own.
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "v$V" -m "v$V"
           git push origin "v$V"
-
-          gh release create "v$V" \
-            --title "v$V" \
-            --notes "$notes"

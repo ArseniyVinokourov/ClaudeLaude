@@ -743,10 +743,15 @@ class Commands:
                             thread_id=thread_id)
                 return
 
-            current, latest = result
+            current, latest, changelog = result
             modified = _has_local_changes()
 
             text = f"<b>Update available</b>\n{tg.esc(current)} → <b>{tg.esc(latest)}</b>"
+            if changelog:
+                body = changelog.strip()
+                if len(body) > 1500:
+                    body = body[:1500].rstrip() + "\n…"
+                text += f"\n\n{tg.esc(body)}"
             if modified:
                 text += f"\n\n⚠️ {len(modified)} locally modified file(s):"
                 for f in modified[:5]:
