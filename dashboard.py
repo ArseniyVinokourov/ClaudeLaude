@@ -22,6 +22,7 @@ from config import (PENDING_DELETE_RETRY_BACKOFF_S, add_pending_delete,
                     get_pinned_help_id, is_killed, remove_pending_delete,
                     set_dashboard_id, set_pinned_help_id)
 from version import get_version
+from terminal_mirror import dtach_socket_alive
 
 _USAGE_CACHE_TTL = 300
 # Periodic sweep touches an entry only this long past its due time — gives
@@ -164,7 +165,8 @@ class Dashboard:
         parts = [f"<b>ClaudeLaude</b> v{tg.esc(ver)}"]
         with self.state.lock:
             n_waiting = len(self.state.pending_permissions)
-        n_mirror = sum(1 for m in self.mirror_mgr.list() if m.alive)
+        n_mirror = sum(1 for m in self.mirror_mgr.list()
+                       if m.alive and dtach_socket_alive(m.dtach_socket))
         if n_waiting > 0:
             parts.append(f"\U0001f514 {n_waiting} waiting")
         if n_mirror > 0:

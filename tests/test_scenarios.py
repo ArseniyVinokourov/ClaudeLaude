@@ -724,6 +724,32 @@ def test_dashboard_no_waiting_line_when_empty(bot):
     assert "waiting" not in bot.mod.dashboard.build()
 
 
+def test_dashboard_counts_only_live_terminal_mirrors(bot, tmp_path):
+    """🔗 N mirror counts only mirrors whose dtach socket is live.
+    Output-only mirrors (socket None, or a socket file that no longer
+    exists) must NOT inflate the count — otherwise closed terminals
+    pile up forever in General."""
+    import socket as _socket
+
+    sock_path = str(tmp_path / "live.sock")
+    srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    srv.bind(sock_path)
+    mm = bot.mod.mirror_mgr
+    try:
+        mm.register("live00000001", str(tmp_path / "a"), 9001,
+                    dtach_socket=sock_path)          # live terminal
+        mm.register("outonly00002", str(tmp_path / "b"), 9002,
+                    dtach_socket=None)               # output-only
+        mm.register("deadsock0003", str(tmp_path / "c"), 9003,
+                    dtach_socket=str(tmp_path / "gone.sock"))  # terminal closed
+        text = bot.mod.dashboard.build()
+        assert "1 mirror" in text
+    finally:
+        srv.close()
+        for c in ("live00000001", "outonly00002", "deadsock0003"):
+            mm.unregister(c)
+
+
 # ── security: callback OWNER_ID check ─────────────────────────────
 
 def test_callback_from_stranger_is_ignored(bot):
