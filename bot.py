@@ -628,11 +628,47 @@ def _mirror_continue_buttons(csid: str) -> list:
               "callback_data": f"mr:{csid}"}]]
 
 
+def _reconcile_output_only_mirror_topics():
+    """One-shot at startup: reap output-only mirrors whose topic was
+    deleted while the bot was down.
+
+    Output-only mirrors (terminal already closed) get no further sends, so
+    the lazy TOPIC_ID_INVALID-on-send path that catches deleted topics
+    never fires for them — without this they linger in .mirrors.json
+    forever. The probe is silent (editForumTopic with the stored name) and
+    runs at P3 so it never competes with live traffic; only a
+    confirmed-deleted topic is reaped, never a transient failure. Mirrors
+    with a live terminal, or legacy records with no stored label, are
+    skipped."""
+    fid = forum()
+    if not fid:
+        return
+    for mirror in mirror_mgr.list():
+        if not mirror.alive or dtach_socket_alive(mirror.dtach_socket):
+            continue  # only mirrors that are already output-only
+        if not mirror.topic_label:
+            continue  # legacy record, no stored name -> can't probe silently
+        try:
+            if tg.topic_gone(fid, mirror.topic_id, mirror.topic_label):
+                print(f"[mirror reconcile] {mirror.csid[:8]} topic "
+                      f"{mirror.topic_id} gone — unregistering",
+                      file=sys.stderr, flush=True)
+                mirror_mgr.unregister(mirror.csid)
+        except Exception as e:
+            print(f"[mirror reconcile] probe error {mirror.csid[:8]}: {e}",
+                  file=sys.stderr, flush=True)
+
+
 def _mirror_socket_watcher():
     """Local-only watcher: flip mirrors to output-only when their dtach
     socket vanishes, and reap claudes whose terminal closed (zero
     attached clients + idle JSONL) so they don't run detached forever.
-    Uses no Telegram budget — only filesystem/proc stats."""
+    Uses no Telegram budget — only filesystem/proc stats.
+
+    Exception: a one-shot startup topic reconcile runs first (a P3
+    probe of already-output-only mirrors), then it settles into the
+    local-only loop."""
+    _reconcile_output_only_mirror_topics()
     while bot_running:
         time.sleep(30)
         for mirror in mirror_mgr.list():

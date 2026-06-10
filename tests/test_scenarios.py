@@ -750,6 +750,45 @@ def test_dashboard_counts_only_live_terminal_mirrors(bot, tmp_path):
             mm.unregister(c)
 
 
+def test_startup_reconcile_reaps_deleted_topic_mirrors(bot, tmp_path):
+    """One-shot startup reconcile reaps output-only mirrors whose topic
+    was deleted, but spares alive topics, live terminals, and legacy
+    (no-label) records — and never even probes a live-terminal mirror."""
+    import socket as _socket
+
+    sock_path = str(tmp_path / "live.sock")
+    srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    srv.bind(sock_path)
+    mm = bot.mod.mirror_mgr
+    try:
+        mm.register("gone00000001", str(tmp_path / "g"), 8001, None,
+                    topic_label="g mirror — 10:00")   # output-only, deleted
+        mm.register("alivetop0002", str(tmp_path / "a"), 8002, None,
+                    topic_label="a mirror — 10:00")   # output-only, alive
+        mm.register("liveterm0003", str(tmp_path / "l"), 8003, sock_path,
+                    topic_label="l mirror — 10:00")   # live terminal
+        mm.register("legacy000004", str(tmp_path / "x"), 8004, None)  # no label
+        bot.tg.dead_topics.add(8001)  # only this topic is deleted
+
+        bot.mod._reconcile_output_only_mirror_topics()
+
+        live = {m.topic_id for m in mm.list()}
+        assert 8001 not in live   # reaped: output-only + topic gone
+        assert 8002 in live       # alive topic spared
+        assert 8003 in live       # live terminal never reaped
+        assert 8004 in live       # legacy (no label) skipped
+
+        probed = {p.get("message_thread_id")
+                  for p in bot.tg.calls_of("editForumTopic")}
+        assert 8003 not in probed  # live terminal not even probed
+        assert 8004 not in probed  # legacy (no label) not probed
+    finally:
+        srv.close()
+        for c in ("gone00000001", "alivetop0002", "liveterm0003",
+                  "legacy000004"):
+            mm.unregister(c)
+
+
 # ── security: callback OWNER_ID check ─────────────────────────────
 
 def test_callback_from_stranger_is_ignored(bot):
