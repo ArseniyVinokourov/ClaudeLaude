@@ -468,6 +468,12 @@ class TerminalMirror:
     # the terminal directly; the bot has no read-back from the TUI
     # so we trust our own count.
     mode_index: int = field(default=0)
+    # Topic title assigned at creation (mirrorbridge). Stored so the
+    # startup reconcile can run a silent editForumTopic existence-probe
+    # with the CURRENT name: same name -> TOPIC_NOT_MODIFIED (no rename),
+    # deleted topic -> TOPIC_ID_INVALID -> reap. None for legacy records
+    # that pre-date this field, which the probe skips.
+    topic_label: str | None = field(default=None)
 
     def note_injection(self, text: str) -> None:
         """Record that `text` was just pushed into the pane from TG."""
@@ -512,7 +518,8 @@ class TerminalMirrorManager:
         self._restore()
 
     def register(self, csid: str, cwd: str, topic_id: int,
-                 dtach_socket: str | None = None) -> TerminalMirror:
+                 dtach_socket: str | None = None,
+                 topic_label: str | None = None) -> TerminalMirror:
         """Idempotent — second call for the same csid returns the existing record."""
         with self._lock:
             existing = self._mirrors.get(csid)
@@ -522,6 +529,7 @@ class TerminalMirrorManager:
                 csid=csid, cwd=cwd, topic_id=topic_id,
                 dtach_socket=dtach_socket or None,
                 jsonl_path=jsonl_path_for(csid, cwd),
+                topic_label=topic_label,
             )
             # Default: start the follower at EOF so it only projects
             # events that ARRIVE after registration. Any backfill of
@@ -753,6 +761,7 @@ class TerminalMirrorManager:
                         "filter_level": m.filter_level,
                         "welcome_msg_id": m.welcome_msg_id,
                         "mode_index": m.mode_index,
+                        "topic_label": m.topic_label,
                     })
             try:
                 with open(_PERSIST_PATH, "w") as f:
@@ -808,6 +817,7 @@ class TerminalMirrorManager:
                 filter_level=level,
                 welcome_msg_id=r.get("welcome_msg_id"),
                 mode_index=mode_index,
+                topic_label=r.get("topic_label"),
             )
             self._mirrors[csid] = m
             self._topic_map[topic_id] = csid

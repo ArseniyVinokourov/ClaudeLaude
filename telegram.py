@@ -760,6 +760,40 @@ def topic_alive(chat_id: int, thread_id: int, name: str | None = None) -> bool:
     return True
 
 
+def topic_gone(chat_id: int, thread_id: int, name: str,
+               priority: int = P3) -> bool:
+    """Confirm a forum topic was DELETED — precisely.
+
+    Returns True ONLY when Telegram reports the topic is gone
+    (TOPIC_ID_INVALID / "thread not found" — the same markers
+    `_check_topic_dead` keys on). A live topic, TOPIC_NOT_MODIFIED, or any
+    transient failure (network, 429, unknown 400) returns False, so a flaky
+    probe never reaps a live mirror. Silent: editForumTopic with the topic's
+    CURRENT name no-ops (TOPIC_NOT_MODIFIED) instead of renaming. Routed
+    through the group budget at `priority` (default P3, housekeeping) so it
+    never competes with live traffic.
+    """
+    def _probe() -> bool:
+        try:
+            _req("editForumTopic", {
+                "chat_id": chat_id,
+                "message_thread_id": thread_id,
+                "name": name[:128],
+            })
+            return False  # edited OK -> topic alive
+        except Exception as e:
+            body = ""
+            resp = getattr(e, "response", None)
+            if resp is not None:
+                try:
+                    body = resp.text
+                except Exception:
+                    pass
+            low = body.lower()
+            return "topic_id_invalid" in low or "thread not found" in low
+    return _via_budget(chat_id, priority, _probe)
+
+
 # ── forum topics ────────────────────────────────────────────────────
 
 def poll(offset: int | None = None, timeout: int = 30) -> list[dict]:

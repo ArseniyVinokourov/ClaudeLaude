@@ -347,7 +347,8 @@ class MirrorProjector:
             return {"error": "create_forum_topic returned no id"}
         with self.state.lock:
             self.state.topic_labels[topic_id] = label
-        m = self.mgr.register(csid, cwd, topic_id, dtach_socket)
+        m = self.mgr.register(csid, cwd, topic_id, dtach_socket,
+                               topic_label=label)
         snapshot_offset = m.last_offset  # JSONL size at registration time
         # Welcome with inline controls (filter toggle + mode cycle). Stays
         # at the top of the topic; we edit its buttons in place when state
