@@ -3967,6 +3967,48 @@ def test_dashboard_replace_failed_delete_retried_at_cleanup(bot, bot_env):
     assert 999 not in _pending_ids(bot_env)
 
 
+def test_dashboard_dedupes_stale_pin_on_startup(bot, bot_env):
+    """General must hold exactly one dashboard. A duplicate left pinned by a
+    previous run / crash / separate-state build is deleted on the first sync
+    and the tracked dashboard becomes General's sole pin (the recurring
+    "old dashboard stays after a new one loads" complaint)."""
+    import config
+
+    keep = bot.tg.add_general_message("ClaudeLaude vKEEP", pinned=True)
+    config.set_dashboard_id(keep)
+    # A second dashboard from a previous run, pinned on top of ours.
+    stale = bot.tg.add_general_message("ClaudeLaude v999", pinned=True)
+
+    bot.mod.dashboard._force_pin_reconcile = True
+    bot.mod.dashboard.sync()
+
+    # The intruder is gone; ours survives and is the only General pin.
+    assert stale in bot.tg.deleted_messages, "stale dashboard must be deleted"
+    assert keep not in bot.tg.deleted_messages, "tracked dashboard must survive"
+    assert config.get_dashboard_id() == keep
+    assert bot.tg.general_pin_stack == [keep], \
+        "General must end with exactly one pinned dashboard (ours)"
+
+
+def test_dashboard_transient_edit_does_not_duplicate(bot, bot_env):
+    """A transient edit failure (429 / network / parse) must NOT recreate the
+    dashboard — recreating on every transient error is how duplicates piled
+    up. The tracked id stays put and no new message is sent."""
+    import config
+
+    keep = bot.tg.add_general_message("ClaudeLaude vKEEP", pinned=True)
+    config.set_dashboard_id(keep)
+    bot.tg.transient_edits.add(keep)  # edit fails with a parse error, not "gone"
+    bot.mod.dashboard._force_pin_reconcile = False
+    sent_before = len(bot.tg.calls_of("sendMessage"))
+    bot.mod.dashboard.sync()
+
+    assert config.get_dashboard_id() == keep, "tracked id must not change"
+    assert len(bot.tg.calls_of("sendMessage")) == sent_before, \
+        "no replacement dashboard on a transient edit error"
+    assert keep not in bot.tg.deleted_messages
+
+
 def test_cleanup_general_does_not_range_sweep(bot, bot_env):
     """cleanup_general deletes only tracked ids. The old pinned-50 range
     sweep is gone — message ids are chat-global, a blind range hits
