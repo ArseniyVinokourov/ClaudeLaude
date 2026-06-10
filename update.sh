@@ -25,11 +25,13 @@ fi
 # ── parse flags ────────────────────────────────────────────────────
 NON_INTERACTIVE=false
 POLICY_OVERRIDE=""
+STRATEGY_OVERRIDE=""
 
 for arg in "$@"; do
     case "$arg" in
         --non-interactive) NON_INTERACTIVE=true ;;
         --policy=*) POLICY_OVERRIDE="${arg#--policy=}" ;;
+        --strategy=*) STRATEGY_OVERRIDE="${arg#--strategy=}" ;;
     esac
 done
 
@@ -79,98 +81,160 @@ if [ -z "$CURRENT_VER" ] && [ -f "$BOT_DIR/VERSION" ]; then
 fi
 CURRENT_VER="${CURRENT_VER:-unknown}"
 
-LATEST_TAG=$(git tag -l 'v*' | sort -V | tail -1)
-LATEST_VER="${LATEST_TAG#v}"
-
-if [ -z "$LATEST_VER" ]; then
-    LATEST_VER="unknown"
+# Target = the latest *manually published* GitHub Release tag, not the newest
+# tag on main. Tags flow on every merge (versioning); a Release is the owner's
+# explicit "available now" gate. Query the public REST API (no auth needed).
+SLUG=$(git remote get-url origin 2>/dev/null \
+    | sed -E 's#.*github\.com[:/]+([^/]+/[^/]+)#\1#; s#\.git$##; s#/$##')
+TARGET_TAG=""
+if [ -n "$SLUG" ] && command -v curl &>/dev/null && command -v python3 &>/dev/null; then
+    REL_JSON=$(curl -sf --max-time 10 -H 'Accept: application/vnd.github+json' \
+        "https://api.github.com/repos/$SLUG/releases/latest" 2>/dev/null || echo "")
+    if [ -n "$REL_JSON" ]; then
+        TARGET_TAG=$(printf '%s' "$REL_JSON" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin).get('tag_name',''))" 2>/dev/null || echo "")
+    fi
 fi
 
+if [ -z "$TARGET_TAG" ]; then
+    ok "No published release yet — nothing to update to."
+    exit 2
+fi
+
+LATEST_VER="${TARGET_TAG#v}"
 echo "  Current: $CURRENT_VER"
 echo "  Latest:  $LATEST_VER"
 echo ""
 
 LOCAL_HEAD=$(git rev-parse HEAD 2>/dev/null)
-REMOTE_HEAD=$(git rev-parse origin/main 2>/dev/null || echo "")
+TARGET_HEAD=$(git rev-parse "${TARGET_TAG}^{commit}" 2>/dev/null || echo "")
 
-if [ "$LOCAL_HEAD" = "$REMOTE_HEAD" ] && [ -n "$REMOTE_HEAD" ]; then
+if [ -z "$TARGET_HEAD" ]; then
+    err "Release tag $TARGET_TAG not found locally even after fetch."
+    exit 1
+fi
+
+if [ "$LOCAL_HEAD" = "$TARGET_HEAD" ]; then
     ok "Already up to date."
     exit 2
 fi
 
-# ── check for local code changes ──────────────────────────────────
-MODIFIED_FILES=()
-
-if [ -f "$BOT_DIR/.dist_checksums" ]; then
-    while IFS='  ' read -r expected_hash filepath; do
-        [ -z "$filepath" ] && continue
-        [ ! -f "$BOT_DIR/$filepath" ] && continue
-        actual_hash=$("${SHA256[@]}" "$BOT_DIR/$filepath" | cut -d' ' -f1)
-        if [ "$actual_hash" != "$expected_hash" ]; then
-            MODIFIED_FILES+=("$filepath")
-        fi
-    done < "$BOT_DIR/.dist_checksums"
+# ── resolve strategy ──────────────────────────────────────────────
+# auto    — try a real 3-way merge of local edits onto the release; on conflict
+#           leave the tree resolvable and exit 3 (the bot then offers a choice).
+# replace — back up local edits, discard them, fast-forward to the release.
+# finalize— user already resolved conflicts in a session; drop our stash and
+#           run the post-update steps (deps + checksums).
+# Legacy AUTO_UPDATE_POLICY maps replace→replace, anything else→auto.
+STRATEGY="${STRATEGY_OVERRIDE}"
+if [ -z "$STRATEGY" ]; then
+    POLICY="${POLICY_OVERRIDE}"
+    if [ -z "$POLICY" ] && [ -f "$BOT_DIR/.env" ]; then
+        POLICY=$(grep '^AUTO_UPDATE_POLICY=' "$BOT_DIR/.env" 2>/dev/null | cut -d= -f2 || true)
+    fi
+    case "${POLICY:-auto}" in
+        replace) STRATEGY=replace ;;
+        *)       STRATEGY=auto ;;
+    esac
 fi
 
-# ── determine policy ──────────────────────────────────────────────
-POLICY="${POLICY_OVERRIDE}"
-if [ -z "$POLICY" ] && [ -f "$BOT_DIR/.env" ]; then
-    POLICY=$(grep '^AUTO_UPDATE_POLICY=' "$BOT_DIR/.env" 2>/dev/null | cut -d= -f2 || true)
-fi
-POLICY="${POLICY:-replace}"
+STASH_MSG="claudelaude-update"
+UPDATE_STATE="$BOT_DIR/.update_state"
 
-# ── handle local changes ─────────────────────────────────────────
-if [ ${#MODIFIED_FILES[@]} -gt 0 ]; then
-    warn "Local changes detected in ${#MODIFIED_FILES[@]} file(s):"
-    for f in "${MODIFIED_FILES[@]}"; do
-        echo "    $f"
-    done
-    echo ""
+# Drop only the stash WE pushed (matched by message), never a user's own.
+drop_our_stash() {
+    local ref
+    ref=$(git stash list 2>/dev/null | grep -F "$STASH_MSG" | head -1 | cut -d: -f1)
+    [ -n "$ref" ] && git stash drop "$ref" >/dev/null 2>&1 || true
+}
 
-    if [ "$POLICY" = "merge" ]; then
-        warn "Policy is 'merge'. Use /update in the bot for guided merge."
-        exit 3
+# ── finalize: conflicts already resolved by the user in a session ─
+if [ "$STRATEGY" = "finalize" ]; then
+    bold "Finalizing resolved update..."
+    git add -A 2>/dev/null || true
+    drop_our_stash
+    rm -f "$UPDATE_STATE"
+    ok "Conflicts finalized at $TARGET_TAG"
+else
+    # ── detect local code changes ──────────────────────────────────
+    MODIFIED_FILES=()
+    if [ -f "$BOT_DIR/.dist_checksums" ]; then
+        while IFS='  ' read -r expected_hash filepath; do
+            [ -z "$filepath" ] && continue
+            [ ! -f "$BOT_DIR/$filepath" ] && continue
+            actual_hash=$("${SHA256[@]}" "$BOT_DIR/$filepath" | cut -d' ' -f1)
+            if [ "$actual_hash" != "$expected_hash" ]; then
+                MODIFIED_FILES+=("$filepath")
+            fi
+        done < "$BOT_DIR/.dist_checksums"
     fi
 
-    # policy = replace: backup modified files, then overwrite
-    BACKUP_DIR="$BOT_DIR/.backup_$(date +%Y%m%d_%H%M%S)/modified"
-    mkdir -p "$BACKUP_DIR"
-    for f in "${MODIFIED_FILES[@]}"; do
-        mkdir -p "$BACKUP_DIR/$(dirname "$f")"
-        cp "$BOT_DIR/$f" "$BACKUP_DIR/$f"
-    done
-    ok "Modified files backed up to $BACKUP_DIR"
-
-    if [ "$NON_INTERACTIVE" = false ]; then
-        echo "  Proceeding will overwrite these files with the new version."
-        read -rp "  Continue? [Y/n]: " CONFIRM
-        if [[ "$CONFIRM" =~ ^[Nn] ]]; then
-            echo "Aborted. Your files are unchanged."
-            exit 0
+    # ── check if bot is running ────────────────────────────────────
+    if pgrep -f "python.*bot\.py" &>/dev/null; then
+        if [ "$NON_INTERACTIVE" = false ]; then
+            warn "Bot appears to be running."
+            echo "  It will be restarted after the update."
+            read -rp "  Continue? [Y/n]: " STOPPED
+            if [[ "$STOPPED" =~ ^[Nn] ]]; then
+                echo "Stop the bot first, then re-run update.sh."
+                exit 0
+            fi
         fi
     fi
 
-    # discard local changes to modified tracked files
-    git checkout -- "${MODIFIED_FILES[@]}" 2>/dev/null || true
-fi
+    bold "Updating..."
 
-# ── check if bot is running ──────────────────────────────────────
-if pgrep -f "python.*bot\.py" &>/dev/null; then
-    if [ "$NON_INTERACTIVE" = false ]; then
-        warn "Bot appears to be running."
-        echo "  It will be restarted after the update."
-        read -rp "  Continue? [Y/n]: " STOPPED
-        if [[ "$STOPPED" =~ ^[Nn] ]]; then
-            echo "Stop the bot first, then re-run update.sh."
-            exit 0
+    if [ ${#MODIFIED_FILES[@]} -eq 0 ]; then
+        # Clean tree → straight fast-forward to the release commit.
+        git merge --ff-only "$TARGET_TAG" || { err "Fast-forward failed."; exit 1; }
+        ok "Code updated to $TARGET_TAG"
+    else
+        warn "Local changes detected in ${#MODIFIED_FILES[@]} file(s):"
+        for f in "${MODIFIED_FILES[@]}"; do echo "    $f"; done
+        echo ""
+
+        # Always back up local edits before touching them.
+        BACKUP_DIR="$BOT_DIR/.backup_$(date +%Y%m%d_%H%M%S)/modified"
+        mkdir -p "$BACKUP_DIR"
+        for f in "${MODIFIED_FILES[@]}"; do
+            mkdir -p "$BACKUP_DIR/$(dirname "$f")"
+            cp "$BOT_DIR/$f" "$BACKUP_DIR/$f"
+        done
+        ok "Local edits backed up to $BACKUP_DIR"
+
+        if [ "$STRATEGY" = "replace" ]; then
+            # Discard local edits and land exactly on the release. reset --hard
+            # also clears a half-finished merge / conflict markers when we're
+            # recovering from a prior auto attempt (HEAD already at the tag).
+            git merge --abort 2>/dev/null || true
+            git reset --hard "$TARGET_TAG" >/dev/null || { err "Reset failed."; exit 1; }
+            drop_our_stash
+            rm -f "$UPDATE_STATE"
+            ok "Code updated to $TARGET_TAG (local edits replaced; backup kept)"
+        else
+            # auto: stash local edits, fast-forward, replay edits 3-way.
+            if [ "$NON_INTERACTIVE" = false ]; then
+                echo "  Will merge your edits onto the new version."
+                read -rp "  Continue? [Y/n]: " CONFIRM
+                if [[ "$CONFIRM" =~ ^[Nn] ]]; then
+                    echo "Aborted. Your files are unchanged."
+                    exit 0
+                fi
+            fi
+            git stash push -m "$STASH_MSG" -- "${MODIFIED_FILES[@]}" >/dev/null 2>&1 \
+                || git stash push -m "$STASH_MSG" >/dev/null 2>&1 || true
+            git merge --ff-only "$TARGET_TAG" || { err "Fast-forward failed."; drop_our_stash; exit 1; }
+            if git stash pop >/dev/null 2>&1; then
+                ok "Code updated to $TARGET_TAG (local edits merged)"
+            else
+                printf '%s\n' "$TARGET_TAG" > "$UPDATE_STATE"
+                err "Merge conflict — local edits clash with the update."
+                echo "  Resolve in the bot, or re-run with --strategy=replace."
+                exit 3
+            fi
         fi
     fi
 fi
-
-# ── pull updates ──────────────────────────────────────────────────
-bold "Updating..."
-git pull origin main --ff-only
-ok "Code updated"
 
 # ── update venv ───────────────────────────────────────────────────
 bold "Updating dependencies..."

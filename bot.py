@@ -12,11 +12,11 @@ import time
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from config import (OWNER_ID, AUTO_UPDATE, AUTO_UPDATE_POLICY,
+from config import (OWNER_ID, AUTO_UPDATE, AUTO_UPDATE_POLICY, BOT_DIR,
                     UNLOCK_WORD, add_pending_delete,
                     get_default_mode, set_default_mode,
                     get_forum_chat_id, get_tour_shown, set_tour_shown,
-                    get_uploads_warned_at,
+                    get_uploads_warned_at, migrate_state,
                     set_uploads_warned_at, set_env,
                     is_killed, activate_kill, deactivate_kill)
 import audit
@@ -35,7 +35,8 @@ from turncontroller import TurnController, TurnState
 from sessions import MODE_PRESETS, SessionManager, valid_mode
 from questions import QuestionAsker
 from updater import (
-    _check_update, _has_local_changes, _restart_bot, _run_update,
+    _check_update, _conflicted_files, _has_local_changes, _restart_bot,
+    _run_update,
 )
 from hooks import HookBridge
 from terminal_mirror import (
@@ -205,25 +206,25 @@ def _auto_update_loop():
         try:
             result = _check_update()
             if result:
-                current, latest = result
+                current, latest, _changelog = result
                 modified = _has_local_changes()
                 if not modified:
                     print(f"[auto-update] {current} → {latest}, no local changes, updating",
                           file=sys.stderr, flush=True)
-                    ok, output = _run_update(non_interactive=True)
-                    if ok:
+                    rc, output = _run_update(non_interactive=True)
+                    if rc == 0:
                         _restart_bot()
                     else:
-                        print(f"[auto-update] failed: {output[:200]}",
+                        print(f"[auto-update] failed (rc={rc}): {output[:200]}",
                               file=sys.stderr, flush=True)
                 elif AUTO_UPDATE_POLICY == "replace":
                     print(f"[auto-update] {current} → {latest}, {len(modified)} modified, policy=replace",
                           file=sys.stderr, flush=True)
-                    ok, output = _run_update(non_interactive=True, policy="replace")
-                    if ok:
+                    rc, output = _run_update(non_interactive=True, policy="replace")
+                    if rc == 0:
                         _restart_bot()
                     else:
-                        print(f"[auto-update] failed: {output[:200]}",
+                        print(f"[auto-update] failed (rc={rc}): {output[:200]}",
                               file=sys.stderr, flush=True)
                 else:
                     fid = forum()
@@ -238,6 +239,48 @@ def _auto_update_loop():
             if not bot_running:
                 return
             time.sleep(1)
+
+
+def _spawn_merge_resolve_session():
+    """Open a guided bot session in BOT_DIR to resolve an update merge conflict.
+
+    The working tree is already at the new release tag with conflict markers in
+    the clashing files (update.sh left it resolvable). The session helps the
+    owner decide what to keep; finishing it runs the `finalize` strategy and
+    restarts. Edit/Write are blocked in bot sessions, so the prompt steers
+    Claude to git/sed/python for the edits."""
+    fid = forum()
+    files = _conflicted_files()
+    s = lifecycle.spawn_session(BOT_DIR, name="Update merge")
+    if not s:
+        if fid:
+            ui.ephemeral(fid, "❌ Couldn't open a resolve session. "
+                         "Run <code>bash update.sh --strategy=replace</code> "
+                         "to take the new version.", seconds=30)
+        return
+    flist = "\n".join(f"  • {f}" for f in files) or "  (see `git status`)"
+    prompt = (
+        "This topic is a self-update merge-conflict workspace for the "
+        f"ClaudeLaude bot itself, at `{BOT_DIR}`.\n\n"
+        "The bot tried to update to a new release, but local edits to tracked "
+        "files clash with it. The repo is already checked out at the new "
+        "release; these files have git conflict markers "
+        "(`<<<<<<<` / `=======` / `>>>>>>>`):\n"
+        f"{flist}\n\n"
+        "Help me decide, per file, what to keep from my version vs the new "
+        "one, then resolve the markers. Note: Edit/Write are blocked here — "
+        "use Bash with `git`, `sed`, or a `python3` heredoc to edit files. "
+        "When `git status` shows no unmerged paths, tell me to tap "
+        "“✅ Done — finalize update” below."
+    )
+    mgr.send_user_message(s.sid, prompt)
+    buttons = [
+        [{"text": "✅ Done — finalize update", "callback_data": "upd:finalize"}],
+        [{"text": "⬆️ Give up, take new version", "callback_data": "upd:replace"}],
+    ]
+    ui.send_to_topic(s.topic_id,
+                     "When conflicts are resolved (no unmerged paths in "
+                     "<code>git status</code>), finalize:", buttons=buttons)
 
 
 _KNOWN_COMMANDS = {
@@ -292,6 +335,10 @@ def _validate_help():
 
 # ── main loop ────────────────────────────────────────────────────────
 
+
+# Bring persisted state up to the current schema before anything reads it —
+# SessionManager loads .sessions.json the moment it's constructed below.
+migrate_state()
 
 asker = QuestionAsker(state)
 mgr = SessionManager(
@@ -1839,26 +1886,66 @@ def _handle_callback(cb, data):
 
     elif data.startswith("upd:"):
         action = data[4:]
+
+        def _apply_then_restart(strategy=None):
+            """Run an apply strategy; restart on success, surface conflict /
+            error otherwise. rc contract: 0=ok, 2=up-to-date, 3=conflict."""
+            rc, output = _run_update(non_interactive=True, strategy=strategy)
+            if rc == 0:
+                if cb_chat:
+                    tg.send("✅ Updated. Restarting...", cb_chat,
+                            thread_id=cb_thread)
+                time.sleep(1)
+                _restart_bot()
+            elif rc == 2:
+                if cb_chat:
+                    tg.send("✅ Already up to date.", cb_chat, thread_id=cb_thread)
+            elif rc == 3:
+                _offer_conflict_choice()
+            else:
+                if cb_chat:
+                    tg.send(f"❌ Update failed:\n<code>{tg.esc(output[:500])}</code>",
+                            cb_chat, thread_id=cb_thread)
+
+        def _offer_conflict_choice():
+            """Local edits clash with the update — let the owner pick: take the
+            new version (backup + overwrite) or resolve it in a guided session."""
+            files = _conflicted_files()
+            n = len(files)
+            text = (f"⚠️ <b>Merge conflict</b> — your local edits clash with "
+                    f"the update in {n} file(s).\n\nKeep your changes by "
+                    f"resolving them, or take the new version (your edits are "
+                    f"backed up either way).")
+            buttons = [
+                [{"text": "🧩 Resolve in a session", "callback_data": "upd:resolve"}],
+                [{"text": "⬆️ Take new version", "callback_data": "upd:replace"}],
+            ]
+            if cb_chat:
+                tg.send(text, cb_chat, thread_id=cb_thread, buttons=buttons)
+
         if action == "go":
             if cb_msg and cb_chat:
                 tg.edit(cb_msg, "⬆️ Updating...", cb_chat)
-
-            def _do_update():
-                modified = _has_local_changes()
-                policy = AUTO_UPDATE_POLICY if modified else None
-                ok, output = _run_update(non_interactive=True, policy=policy)
-                if ok:
-                    if cb_chat:
-                        tg.send("✅ Updated. Restarting...", cb_chat,
-                                thread_id=cb_thread)
-                    time.sleep(1)
-                    _restart_bot()
-                else:
-                    msg = f"❌ Update failed:\n<code>{tg.esc(output[:500])}</code>"
-                    if cb_chat:
-                        tg.send(msg, cb_chat, thread_id=cb_thread)
-
-            threading.Thread(target=_do_update, daemon=True, name="bot-bg-update").start()
+            # Always 'auto' here, never the legacy AUTO_UPDATE_POLICY: a manual
+            # /update must try a real merge and offer the conflict choice, not
+            # silently replace local edits.
+            threading.Thread(target=lambda: _apply_then_restart(strategy="auto"),
+                             daemon=True, name="bot-bg-update").start()
+        elif action == "replace":
+            if cb_msg and cb_chat:
+                tg.edit(cb_msg, "⬆️ Taking new version...", cb_chat)
+            threading.Thread(target=lambda: _apply_then_restart(strategy="replace"),
+                             daemon=True, name="bot-bg-update").start()
+        elif action == "finalize":
+            if cb_msg and cb_chat:
+                tg.edit(cb_msg, "⬆️ Finalizing...", cb_chat)
+            threading.Thread(target=lambda: _apply_then_restart(strategy="finalize"),
+                             daemon=True, name="bot-bg-update").start()
+        elif action == "resolve":
+            if cb_msg and cb_chat:
+                tg.edit(cb_msg, "🧩 Opening a resolve session…", cb_chat)
+            threading.Thread(target=_spawn_merge_resolve_session, daemon=True,
+                             name="bot-bg-update").start()
         elif action == "no":
             if cb_msg and cb_chat:
                 tg.delete(cb_msg, cb_chat)

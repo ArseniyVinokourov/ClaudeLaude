@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 import threading
 import time
 
@@ -55,6 +56,56 @@ def _load_state() -> dict:
 def _save_state(state: dict):
     with open(_STATE_FILE, "w") as f:
         json.dump(state, f)
+
+
+# ── state-schema migrations ───────────────────────────────────────────
+# An update can change the on-disk shape of the bot's persisted state. To
+# keep an old install's data working after such an update, bump SCHEMA_VERSION
+# and register a migration here; `migrate_state()` runs them in order at
+# startup, before any state is read. PRE-RELEASE CHECKLIST (see CONTRIBUTING):
+# if a change alters .state.json / .sessions.json / .mirrors.json layout, it
+# MUST ship with a migration + a SCHEMA_VERSION bump — otherwise an updated
+# bot silently misreads the user's existing data.
+#
+# The current shape is defined as v1. Pre-v1 state has no `schema_version`
+# key but is structurally identical, so 0→1 is just a stamp (no transform).
+SCHEMA_VERSION = 1
+
+# from_version -> fn(state_dict) -> migrated_state_dict. A migration may also
+# rewrite sibling files (.sessions.json / .mirrors.json) directly; this dict
+# governs the whole persisted-state generation, not just .state.json.
+_STATE_MIGRATIONS: dict = {}
+
+
+def migrate_state() -> None:
+    """Bring persisted state up to SCHEMA_VERSION. Idempotent; a no-op when the
+    state file is absent (fresh install) or already current. On a migration
+    error it leaves the file untouched rather than stamping a version it never
+    reached — so a failed migration is retried, never silently skipped."""
+    if not os.path.exists(_STATE_FILE):
+        return
+    try:
+        state = _load_state()
+    except Exception as e:
+        print(f"[migrate] could not read state: {e}", file=sys.stderr, flush=True)
+        return
+    version = state.get("schema_version", 0)
+    if version >= SCHEMA_VERSION:
+        return
+    while version < SCHEMA_VERSION:
+        fn = _STATE_MIGRATIONS.get(version)
+        if fn:
+            try:
+                state = fn(state)
+            except Exception as e:
+                print(f"[migrate] {version}->{version + 1} failed: {e}",
+                      file=sys.stderr, flush=True)
+                return
+        version += 1
+    state["schema_version"] = SCHEMA_VERSION
+    _save_state(state)
+    print(f"[migrate] state schema -> v{SCHEMA_VERSION}",
+          file=sys.stderr, flush=True)
 
 
 def get_forum_chat_id() -> int | None:

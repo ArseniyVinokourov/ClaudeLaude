@@ -106,9 +106,23 @@ Format: `vMAJOR.MINOR.PATCH`.
 - `MINOR` — total commits on `main`. Each squash-merged PR adds one commit, so MINOR bumps by 1 per release.
 - `PATCH` — number of commits in the merged PR (i.e. the size of the change). A 1-commit fix → `.1`, a 7-commit feature → `.7`.
 
-The release workflow tags every merge to `main` as `vMAJOR.MINOR.PATCH` automatically and creates a GitHub Release with the squash commit message as the notes body.
+The release workflow tags every merge to `main` as `vMAJOR.MINOR.PATCH` automatically. It does **not** create a GitHub Release — tags are for versioning and traceability only.
 
 At runtime, `version.py` returns the latest tag. On a feature branch with N commits past the tag, it returns `MAJOR.MINOR.PATCH+N` (build identifier — informative, never used as an actual tag).
+
+## Releasing (maintainer)
+
+A **GitHub Release is the manual "available to update" gate**, decoupled from tags. Tags flow on every merge; an installed bot only offers an update when a Release is *published* (it polls `releases/latest`). So you batch as many merges as you like, then ship one Release when ready.
+
+To ship: GitHub → **Releases → Draft a new release** → pick the tag for the commit you want users to land on → write the notes (these become the changelog shown in the bot) → **Publish**. The bot picks it up on its next check and applies up to that tag (never to bare `main` HEAD).
+
+**Pre-release checklist** (before publishing a Release):
+
+1. **State-schema migration check — load-bearing.** Did anything in this batch change the on-disk shape of `.state.json`, `.sessions.json`, or `.mirrors.json` (renamed/removed/restructured keys)?
+   - **Yes** → register a migration in `config._STATE_MIGRATIONS` and bump `config.SCHEMA_VERSION`. Without it, an updated bot silently misreads an existing user's data. Add a revert-and-fail test (see `tests/test_migrations.py`).
+   - **No** → nothing to do; the existing shape carries forward.
+2. Removed/renamed an `.env` setting or a command? Say so plainly in the release notes — that's what users read before tapping Update (there is no separate "breaking" flag).
+3. New dependency? Confirm it's in `requirements.txt` (update.sh runs `pip install -r` on apply).
 
 ## Project conventions worth knowing
 

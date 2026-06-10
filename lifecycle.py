@@ -67,6 +67,7 @@ class SessionLifecycle:
             self.ui.ephemeral(fid, f"▶ {name}",
                               buttons=[[{"text": "Open", "url": url}]],
                               seconds=5)
+        return s
 
     def attach_controls(self, session, text=None):
         """Open the topic with the control panel as its (visually) first
