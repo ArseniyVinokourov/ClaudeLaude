@@ -27,12 +27,19 @@ class FakeTelegram:
         self.deleted_messages: set[int] = set()
         self.pinned_messages: list[int] = []
         self.unpinned_all: int = 0
+        # General's pin stack (message ids, top = last). Only General
+        # messages (thread_id is None) land here — getChat.pinned_message is
+        # scoped to General. unpinAllGeneralForumTopicMessages clears it.
+        self.general_pin_stack: list[int] = []
         # If True, sendMessage with a thread_id that is in `dead_topics`
         # raises 400 (mimics deleted-topic behavior).
         self.dead_topics: set[int] = set()
         # Message ids whose editMessageText / deleteMessage raise 400
         # (mimics "message to edit not found" / a failing delete).
         self.fail_edits: set[int] = set()
+        # Edits that fail with a NON-"gone" 400 (parse error) — the message
+        # still exists, so the caller must not recreate it.
+        self.transient_edits: set[int] = set()
         self.fail_deletes: set[int] = set()
         # Chat ids for which every write raises 400 "chat not found"
         # (mimics a deleted group / kicked bot).
@@ -53,8 +60,16 @@ class FakeTelegram:
 
         if method == "getChat":
             # cmd_setup gates on result.is_forum; the test group is a forum.
-            return {"ok": True, "result": {"id": params.get("chat_id"),
-                                           "is_forum": True}}
+            result = {"id": params.get("chat_id"), "is_forum": True}
+            pinned = None
+            for mid in reversed(self.general_pin_stack):
+                if mid not in self.deleted_messages:
+                    pinned = mid
+                    break
+            if pinned is not None:
+                result["pinned_message"] = {"message_id": pinned,
+                                            "message_thread_id": None}
+            return {"ok": True, "result": result}
 
         if method in ("sendMessage", "editMessageText", "deleteMessage",
                       "pinChatMessage", "createForumTopic"):
@@ -96,19 +111,38 @@ class FakeTelegram:
                 resp = _FakeResponse(
                     400, b'{"ok":false,"description":"Bad Request: message can\'t be deleted"}')
                 raise requests.HTTPError("400", response=resp)
-            self.deleted_messages.add(params.get("message_id"))
+            mid = params.get("message_id")
+            self.deleted_messages.add(mid)
+            if mid in self.general_pin_stack:
+                self.general_pin_stack = [
+                    p for p in self.general_pin_stack if p != mid]
             return {"ok": True, "result": True}
 
         if method == "pinChatMessage":
-            self.pinned_messages.append(params.get("message_id"))
+            mid = params.get("message_id")
+            self.pinned_messages.append(mid)
+            # Pins of General messages (thread_id None) build General's pin
+            # stack; session-topic control-panel pins do not.
+            msg = self.messages.get(mid)
+            if msg is not None and msg.get("thread_id") is None:
+                self.general_pin_stack.append(mid)
             return {"ok": True, "result": True}
 
         if method == "unpinAllForumTopicMessages":
             self.unpinned_all += 1
             return {"ok": True, "result": True}
 
+        if method == "unpinAllGeneralForumTopicMessages":
+            self.general_pin_stack.clear()
+            return {"ok": True, "result": True}
+
         if method == "editMessageText":
             mid = params.get("message_id")
+            if mid in self.transient_edits:
+                import requests
+                resp = _FakeResponse(
+                    400, b'{"ok":false,"description":"Bad Request: can\'t parse entities"}')
+                raise requests.HTTPError("400", response=resp)
             if mid in self.fail_edits:
                 import requests
                 resp = _FakeResponse(
@@ -163,6 +197,18 @@ class FakeTelegram:
             m for m in self.messages.values()
             if m.get("thread_id") == thread_id
         ]
+
+    def add_general_message(self, text: str, chat_id=None,
+                            pinned: bool = False) -> int:
+        """Seed a General-topic message (thread_id None). Optionally mark it
+        pinned (pushes onto General's pin stack). Returns its message id."""
+        mid = self._next_msg_id
+        self._next_msg_id += 1
+        self.messages[mid] = {"chat_id": chat_id, "thread_id": None,
+                              "text": text}
+        if pinned:
+            self.general_pin_stack.append(mid)
+        return mid
 
 
 class _FakeResponse:

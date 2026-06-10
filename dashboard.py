@@ -28,6 +28,17 @@ _USAGE_CACHE_TTL = 300
 # the live delete_after timer first shot before the sweep retries.
 _OVERDUE_GRACE_S = 30.0
 
+# editMessageText errors that mean the dashboard message is GONE upstream
+# (deleted by hand, expired) — the only case where we recreate it. Every
+# other failure (429, network, HTML parse) leaves the message in place, so
+# recreating on it would just spawn a duplicate (that is how stale dashboards
+# piled up). Matched case-insensitively against the API error body.
+_EDIT_GONE_SIGNALS = (
+    "message to edit not found",
+    "message can't be edited",
+    "message_id_invalid",
+)
+
 _MENU_ROWS = [
     [{"text": "\U0001f195 New session", "callback_data": "m:new"},
      {"text": "\U0001f4cb Sessions", "callback_data": "m:sessions"}],
@@ -45,6 +56,11 @@ class Dashboard:
         self._claude_bin = claude_bin
         self._usage_cache: str | None = None
         self._usage_cache_ts: float = 0
+        # Force a full pin-stack collapse on the first sync after startup,
+        # so leftover dashboards pinned beneath ours (e.g. by a crashed run
+        # or a separate-state test build) are cleared even when they are not
+        # on top of the stack. Cleared after the first reconcile.
+        self._force_pin_reconcile: bool = True
 
     def fetch_account_usage(self) -> str | None:
         """Run interactive claude /usage via PTY, parse account limits."""
@@ -200,55 +216,120 @@ class Dashboard:
                   file=sys.stderr, flush=True)
 
     def sync(self):
-        """Send or update the pinned dashboard message in General."""
+        """Keep General showing exactly one pinned dashboard.
+
+        Steady state: edit the tracked dashboard in place. If it is gone
+        upstream, spawn a fresh one. Either way, reconcile General's pin
+        stack against ground truth so any second dashboard (left by a crash,
+        a restart, or a separate-state test build) is deleted — at any moment
+        there is one dashboard, and only one.
+        """
         self._validate_help()
         fid = get_forum_chat_id()
         if not fid:
             return
         text = self.build()
-        old_id = get_dashboard_id()
-        if not old_id:
-            old_id = get_pinned_help_id()
-        if old_id:
-            try:
-                tg._req("editMessageText", {
-                    "chat_id": fid,
-                    "message_id": old_id,
-                    "text": text,
-                    "parse_mode": "HTML",
-                    "reply_markup": {"inline_keyboard": _MENU_ROWS},
-                })
+        cur = get_dashboard_id() or get_pinned_help_id()
+
+        if cur:
+            status = self._edit_dashboard(fid, cur, text)
+            if status == "ok":
                 if not get_dashboard_id():
-                    set_dashboard_id(old_id)
+                    set_dashboard_id(cur)
+                    set_pinned_help_id(None)
+                # Only reconcile the pin stack once, on the first sync after
+                # startup — that collapses any duplicate left pinned while the
+                # bot was down. In steady state the dashboard is edited in
+                # place and stays the sole pin, so polling getChat every tick
+                # would only churn (its chat-level pointer lags behind the
+                # General-topic pins the user actually sees).
+                if self._force_pin_reconcile:
+                    self._reconcile_pin(fid, cur, force=True)
                 return
-            except Exception as e:
-                body = ""
-                if hasattr(e, "response") and e.response is not None:
-                    try:
-                        body = e.response.text
-                    except Exception:
-                        pass
-                if "not modified" in body.lower():
-                    return
-                print(f"[dashboard] edit failed: {e} {body}",
+            if status == "transient":
+                # Message still exists (429 / network / parse error). Do NOT
+                # recreate — that is exactly how duplicate dashboards piled
+                # up. Leave the tracked id alone and retry next tick.
+                return
+            # status == "gone": the tracked message can't be edited (deleted,
+            # or too old to edit). Drop the id and remove the old message so
+            # it never lingers as a second dashboard; if the delete fails it
+            # stays registered for the startup sweep (todo #98). Then spawn a
+            # replacement.
+            set_dashboard_id(None)
+            set_pinned_help_id(None)
+            add_pending_delete(cur, time.time())  # due now
+            if tg.delete(cur, fid):
+                remove_pending_delete(cur)
+
+        self._spawn_dashboard(fid, text)
+
+    def _edit_dashboard(self, fid, msg_id, text) -> str:
+        """Try to edit the dashboard in place. Returns 'ok', 'gone', or
+        'transient'."""
+        try:
+            tg._req("editMessageText", {
+                "chat_id": fid,
+                "message_id": msg_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "reply_markup": {"inline_keyboard": _MENU_ROWS},
+            })
+            return "ok"
+        except Exception as e:
+            body = ""
+            resp = getattr(e, "response", None)
+            if resp is not None:
+                try:
+                    body = resp.text
+                except Exception:
+                    pass
+            low = body.lower()
+            if "not modified" in low:
+                return "ok"
+            if any(s in low for s in _EDIT_GONE_SIGNALS):
+                print(f"[dashboard] message gone, recreating: {body[:120]}",
                       file=sys.stderr, flush=True)
-                set_dashboard_id(None)
-                set_pinned_help_id(None)
-        if old_id:
-            # Deleting the previous dashboard message also drops its pin, so
-            # the fresh pin below becomes General's only pin. Do NOT use
-            # unpinAllChatMessages here — it is chat-wide and would wipe every
-            # session topic's pinned control panel too (#85). Register the id
-            # first: if this delete fails, the orphan is swept by
-            # cleanup_general at next startup instead of leaking forever
-            # (todo #98 — that's exactly how the stale dashboards piled up).
-            add_pending_delete(old_id, time.time())  # due now
-            if tg.delete(old_id, fid):
-                remove_pending_delete(old_id)
+                return "gone"
+            print(f"[dashboard] edit failed (transient): {e} {body[:120]}",
+                  file=sys.stderr, flush=True)
+            return "transient"
+
+    def _spawn_dashboard(self, fid, text):
+        """Send a fresh dashboard as General's only pin."""
         msg_id = tg.send(text, fid, buttons=_MENU_ROWS, persist=True)
-        if msg_id:
-            tg.pin(msg_id, fid)
-            set_dashboard_id(msg_id)
+        if not msg_id:
+            return
+        set_dashboard_id(msg_id)
+        set_pinned_help_id(None)
+        # New dashboard becomes General's single pin: collapse the whole
+        # General pin stack first (scoped to General — does NOT touch any
+        # session topic's control panel, unlike chat-wide
+        # unpinAllChatMessages, #85), then pin just this one, then delete any
+        # other dashboard that was sitting pinned on top.
+        self._reconcile_pin(fid, msg_id, force=True)
+
+    def _reconcile_pin(self, fid, keep_id, force=False):
+        """Ensure `keep_id` is the only pinned dashboard in General.
+
+        Ground truth is getChat.pinned_message (telegram.pinned_message_id),
+        which is scoped to General and yields None for session-topic pins, so
+        a session topic's control panel is never touched here. When something
+        other than `keep_id` is on top of the stack, it is a leftover
+        dashboard: delete it (its id is known from getChat), collapse the
+        stack, and re-pin ours.
+        """
+        force = force or self._force_pin_reconcile
+        top = tg.pinned_message_id(fid)
+        if not force and (top is None or top == keep_id):
+            return
+        if top is not None and top != keep_id:
+            add_pending_delete(top, time.time())  # due now
+            if tg.delete(top, fid):
+                remove_pending_delete(top)
+        tg.unpin_all_general(fid)
+        tg.pin(keep_id, fid)
+        self._force_pin_reconcile = False
 
     def tick(self):
         """One background cycle: refresh usage if stale, push the pin,

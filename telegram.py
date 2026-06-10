@@ -457,6 +457,40 @@ def _unpin_impl(msg_id, chat_id):
         _log(f"unpin error: {e}")
 
 
+def unpin_all_general(chat_id: int):
+    """Clear the entire pin stack of the General forum topic.
+
+    Scoped to General only — unlike chat-wide unpinAllChatMessages, this does
+    NOT touch the pinned control panel of any session topic (#85). Used to
+    collapse leftover dashboard pins so General ends up with a single pin.
+    """
+    try:
+        _req("unpinAllGeneralForumTopicMessages", {"chat_id": chat_id})
+    except Exception as e:
+        _log(f"unpin_all_general error: {e}")
+
+
+def pinned_message_id(chat_id: int) -> int | None:
+    """Ground-truth id of General's currently-pinned message (getChat).
+
+    Returns the id only when the pin belongs to General itself (thread_id is
+    None). A session-topic pin must never be returned here — callers delete
+    whatever this yields, and deleting a session topic's control panel would
+    be catastrophic (#85). Returns None on error or when nothing is pinned.
+    """
+    try:
+        res = _req("getChat", {"chat_id": chat_id}).get("result", {})
+    except Exception as e:
+        _log(f"getChat error: {e}")
+        return None
+    pm = res.get("pinned_message")
+    if not pm:
+        return None
+    if pm.get("message_thread_id") is not None:
+        return None
+    return pm.get("message_id")
+
+
 def edit(msg_id: int, text: str, chat_id: int, buttons: list | None = None,
          prio: int = P1) -> bool:
     """Edit a message. Returns True if it landed (or was a benign no-op),
