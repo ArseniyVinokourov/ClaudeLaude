@@ -369,7 +369,8 @@ if [ -n "$BOT_TOKEN_BRAND" ] && command -v curl &>/dev/null; then
 
     if [ -f assets/bot_avatar.png ]; then
         curl -fsS --max-time 30 -X POST "${API}/setMyProfilePhoto" \
-            -F "photo=@assets/bot_avatar.png" >/dev/null \
+            -F 'photo={"type":"static","photo":"attach://avatar"}' \
+            -F "avatar=@assets/bot_avatar.png" >/dev/null \
             && ok "Bot avatar set from assets/bot_avatar.png" \
             || warn "Failed to set bot avatar."
     fi
