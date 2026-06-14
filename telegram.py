@@ -562,6 +562,66 @@ def _send_photo_impl(chat_id, photo_path, caption, thread_id) -> int | None:
         return None
 
 
+def set_chat_photo(chat_id: int, photo_path: str) -> bool:
+    """Set a group/supergroup photo from a local file. Bot must be admin
+    with can_change_info. Returns True on success."""
+    try:
+        with open(photo_path, "rb") as f:
+            r = _session.post(f"{API}/setChatPhoto", data={"chat_id": chat_id},
+                              files={"photo": f}, timeout=60)
+        r.raise_for_status()
+        return bool(r.json().get("ok"))
+    except Exception as e:
+        _log(f"set_chat_photo error: {e}")
+        return False
+
+
+def set_my_profile_photo(photo_path: str) -> bool:
+    """Set the bot's own profile photo (Bot API 9.4 setMyProfilePhoto).
+
+    The `photo` field is an InputProfilePhoto object, not a bare file — a
+    plain `photo=@file` is rejected with "photo isn't specified". The file
+    is attached under the name referenced by attach://.
+    """
+    try:
+        with open(photo_path, "rb") as f:
+            r = _session.post(
+                f"{API}/setMyProfilePhoto",
+                data={"photo": '{"type":"static","photo":"attach://avatar"}'},
+                files={"avatar": f}, timeout=60)
+        r.raise_for_status()
+        return bool(r.json().get("ok"))
+    except Exception as e:
+        _log(f"set_my_profile_photo error: {e}")
+        return False
+
+
+def chat_has_photo(chat_id: int) -> bool:
+    """True if the chat already has a photo. On error returns True so callers
+    never clobber an existing/unknown photo."""
+    try:
+        res = _req("getChat", {"chat_id": chat_id}).get("result", {})
+        return res.get("photo") is not None
+    except Exception as e:
+        _log(f"chat_has_photo error: {e}")
+        return True
+
+
+def bot_has_photo() -> bool:
+    """True if the bot's own profile already has a photo (or on error, so we
+    never overwrite)."""
+    try:
+        bid = _req("getMe").get("result", {}).get("id")
+        if not bid:
+            return True
+        res = _req("getUserProfilePhotos",
+                   {"user_id": bid, "limit": 1}).get("result", {})
+        return (res.get("total_count") or 0) > 0
+    except Exception as e:
+        _log(f"bot_has_photo error: {e}")
+        return True
+
+
 def copy_messages(chat_id: int, from_chat_id: int, message_ids: list[int],
                   thread_id: int | None = None,
                   remove_caption: bool = False,
