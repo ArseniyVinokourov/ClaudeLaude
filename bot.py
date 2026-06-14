@@ -732,6 +732,33 @@ def _device_monitor_loop():
         time.sleep(300)
 
 
+def _ensure_branding(fid):
+    """Apply the bundled ClaudeLaude icon to the bot profile and forum group.
+
+    Runs once at startup, best-effort and non-destructive: each photo is set
+    only when none exists yet, so a user's own avatar is never overwritten.
+    The group is created by the user after install, so it can't be branded in
+    setup.sh — this is the one place that catches it. Failures are logged,
+    never fatal.
+    """
+    avatar = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "assets", "bot_avatar.png")
+    if not os.path.exists(avatar):
+        return
+    try:
+        if not tg.bot_has_photo() and tg.set_my_profile_photo(avatar):
+            print("[branding] bot avatar set", flush=True)
+    except Exception as e:
+        print(f"[branding] bot avatar error: {e}", file=sys.stderr, flush=True)
+    if fid:
+        try:
+            if not tg.chat_has_photo(fid) and tg.set_chat_photo(fid, avatar):
+                print("[branding] group photo set", flush=True)
+        except Exception as e:
+            print(f"[branding] group photo error: {e}",
+                  file=sys.stderr, flush=True)
+
+
 def main():
     global bot_running
 
@@ -772,6 +799,7 @@ def main():
     dashboard.refresh_usage()
     dashboard.sync()
     _admin_sanity_check()
+    _ensure_branding(fid)
 
     offset = None
     while bot_running:
