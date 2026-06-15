@@ -1,4 +1,12 @@
-	CLAUDELAUDE - the stupid session tracker
+<p align="center">
+  <img src="assets/banner.png" alt="ClaudeLaude — Claude Code behind a Telegram forum UI" width="640">
+</p>
+
+<p align="center">
+  <a href="https://github.com/ArseniyVinokourov/ClaudeLaude/actions/workflows/tests.yml"><img src="https://github.com/ArseniyVinokourov/ClaudeLaude/actions/workflows/tests.yml/badge.svg" alt="Tests"></a>
+  <a href="https://github.com/ArseniyVinokourov/ClaudeLaude/releases"><img src="https://img.shields.io/github/v/release/ArseniyVinokourov/ClaudeLaude" alt="Latest release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License: Apache-2.0"></a>
+</p>
 
 "claudelaude" can mean anything, depending on your mood.
 
@@ -15,6 +23,10 @@ This is a single-user Telegram bot that puts Claude Code behind a
 Forum Topics UI. Each topic is one Claude session. Hooks, permissions,
 status, compact/expand — all through Telegram, all on your machine.
 Nothing leaves the box.
+
+<p align="center">
+  <img src="assets/screens/hero.png" alt="A session topic in Telegram — pinned control panel, a request, and Claude asking a question with inline buttons" width="820">
+</p>
 
 
 What it does
