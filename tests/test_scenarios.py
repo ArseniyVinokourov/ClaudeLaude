@@ -1813,11 +1813,11 @@ def test_media_group_album_combines_into_one_turn(bot, tmp_path, monkeypatch):
     assert [h for h in sess.history if h.kind == "user"] == []
 
     # Cancel the real flush timer and flush deterministically.
-    with bot.mod._media_group_lock:
-        grp = bot.mod._media_groups.get(gid)
+    with bot.mod.media._media_group_lock:
+        grp = bot.mod.media._media_groups.get(gid)
         assert grp is not None and len(grp["items"]) == 3
         grp["timer"].cancel()
-    bot.mod._flush_media_group(gid)
+    bot.mod.media.flush_media_group(gid)
 
     users = [h for h in sess.history if h.kind == "user"]
     assert len(users) == 1, users
@@ -1843,7 +1843,7 @@ def test_voice_message_transcribed_into_turn(bot, tmp_path, monkeypatch):
                         lambda path: {"text": "привет бот как дела",
                                       "segments": [], "language": "ru"})
 
-    bot.mod._handle_voice(sess, "voice-fid", "", bot.forum_chat_id,
+    bot.mod.media.handle_voice(sess, "voice-fid", "", bot.forum_chat_id,
                           777, sess.topic_id)
 
     users = [h for h in sess.history if h.kind == "user"]
@@ -1886,6 +1886,7 @@ def test_voice_unconfigured_offers_install(bot, tmp_path, monkeypatch):
 def test_voice_install_click_installs_and_replays(bot, tmp_path, monkeypatch):
     """Clicking a model button runs the installer and then replays the
     parked voice message through the normal transcription path (#86)."""
+    import stt_install
     import telegram as tg_mod
     _start_bot_session(bot, tmp_path)
     sess = next(iter(bot.mod.mgr._sessions.values()))
@@ -1905,7 +1906,7 @@ def test_voice_install_click_installs_and_replays(bot, tmp_path, monkeypatch):
     (pick_id,) = bot.mod.state.pending_media_installs
 
     installed = []
-    monkeypatch.setattr(bot.mod.stt_install, "install_whisper",
+    monkeypatch.setattr(stt_install, "install_whisper",
                         lambda m: installed.append(m) or True)
     monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
     monkeypatch.setattr(bot.mod.stt, "transcribe",
@@ -1915,7 +1916,7 @@ def test_voice_install_click_installs_and_replays(bot, tmp_path, monkeypatch):
     # that timer would outlive the fixture and hit the real API. Stub it.
     monkeypatch.setattr(bot.mod.ui, "delete_after", lambda *a, **kw: None)
 
-    bot.mod._media_install_clicked(pick_id, "small")
+    bot.mod.media.media_install_clicked(pick_id, "small")
     # The replay hops two threads (installer → session worker); wait for
     # the turn to fully settle or its sends leak past the fake telegram.
     _wait_until(lambda: [h for h in sess.history if h.kind == "user"])
@@ -1945,7 +1946,7 @@ def test_media_install_cancel_removes_offer(bot, tmp_path, monkeypatch):
     _drain_updates(bot)
     (pick_id,) = bot.mod.state.pending_media_installs
 
-    bot.mod._media_install_clicked(pick_id, "x")
+    bot.mod.media.media_install_clicked(pick_id, "x")
 
     assert bot.mod.state.pending_media_installs == {}
     assert bot.tg.calls_of("deleteMessage"), "offer message was not deleted"
@@ -1969,7 +1970,7 @@ def test_video_transcript_and_frames_in_one_turn(bot, tmp_path, monkeypatch):
         {"path": "/tmp/f0.jpg", "t": 0.0},
         {"path": "/tmp/f1.jpg", "t": 6.0}])
 
-    bot.mod._handle_video(sess, "vid-fid", "", bot.forum_chat_id,
+    bot.mod.media.handle_video(sess, "vid-fid", "", bot.forum_chat_id,
                           888, sess.topic_id)
 
     users = [h for h in sess.history if h.kind == "user"]
@@ -2028,7 +2029,7 @@ def test_video_frames_only_notes_missing_whisper(bot, tmp_path, monkeypatch):
     monkeypatch.setattr(bot.mod.ui, "ephemeral",
                         lambda cid, text, **kw: notes.append(text))
 
-    bot.mod._handle_video(sess, "vid-fid", "", bot.forum_chat_id,
+    bot.mod.media.handle_video(sess, "vid-fid", "", bot.forum_chat_id,
                           889, sess.topic_id)
 
     users = [h for h in sess.history if h.kind == "user"]
@@ -2052,7 +2053,7 @@ def test_upload_sweep_ttl_and_references(bot, tmp_path, monkeypatch):
     keeps old ones still referenced in an alive session's JSONL (#87)."""
     updir = tmp_path / "uploads"
     updir.mkdir()
-    monkeypatch.setattr(bot.mod, "_UPLOAD_DIR", str(updir))
+    monkeypatch.setattr(bot.mod.rt, "upload_dir", str(updir))
 
     old_unref = _make_upload(updir, "100_voice.oga", age_s=60 * 3600)
     old_ref = _make_upload(updir, "200_photo.jpg", age_s=60 * 3600)
@@ -2083,8 +2084,8 @@ def test_upload_size_warning_throttled(bot, tmp_path, monkeypatch):
     sweep the same day stays silent (#87)."""
     updir = tmp_path / "uploads"
     updir.mkdir()
-    monkeypatch.setattr(bot.mod, "_UPLOAD_DIR", str(updir))
-    monkeypatch.setattr(bot.mod, "_UPLOAD_WARN_BYTES", 10)
+    monkeypatch.setattr(bot.mod.rt, "upload_dir", str(updir))
+    monkeypatch.setattr(bot.mod.rt, "upload_warn_bytes", 10)
     monkeypatch.setattr(bot.mod, "_known_session_jsonls", lambda: [])
     _make_upload(updir, "big.bin", age_s=60, content=b"y" * 100)
     bot.tg.reset()
@@ -2096,6 +2097,33 @@ def test_upload_size_warning_throttled(bot, tmp_path, monkeypatch):
              if "Media uploads folder" in (c.get("text") or "")]
     assert len(warns) == 1, warns
     assert warns[0]["chat_id"] == bot.owner_id
+
+
+def test_settings_ttl_change_seen_by_sweeper(bot, tmp_path, monkeypatch):
+    """A /settings TTL change must reach bot.py's upload sweeper. The knob
+    lives on the shared runtime.rt, so the settings module and the sweep loop
+    can't drift apart (the bug a per-module `global` would reintroduce)."""
+    import os
+    updir = tmp_path / "uploads"
+    updir.mkdir()
+    monkeypatch.setattr(bot.mod.rt, "upload_dir", str(updir))
+    monkeypatch.setattr(bot.mod, "_known_session_jsonls", lambda: [])
+    # 10h old: survives the 48h default, must die once the TTL drops to 6h.
+    f = _make_upload(updir, "100_voice.oga", age_s=10 * 3600)
+
+    bot.mod._sweep_uploads()
+    assert os.path.exists(f), "must survive under the 48h default"
+
+    # Change the TTL to 6h through the real /settings callback path.
+    bot.tg.inject_update(callback_update(
+        "st:t:21600", owner_id=bot.owner_id,
+        forum_chat_id=bot.forum_chat_id, message_id=900,
+    ))
+    _drain_updates(bot)
+    assert bot.mod.rt.upload_ttl_s == 21600
+
+    bot.mod._sweep_uploads()
+    assert not os.path.exists(f), "sweeper must honour the new 6h TTL"
 
 
 def test_general_media_rejection_is_ephemeral(bot, tmp_path, monkeypatch):
@@ -4193,23 +4221,23 @@ def test_settings_presets_apply_at_runtime_and_persist(bot):
                if "Settings" in m["text"])
 
     # Upload alert: default is 500 MB → switch to 250.
-    assert bot.mod._UPLOAD_WARN_BYTES == 500 * 1024 * 1024
+    assert bot.mod.rt.upload_warn_bytes == 500 * 1024 * 1024
     bot.tg.inject_update(callback_update(
         "st:w:250", owner_id=bot.owner_id,
         forum_chat_id=bot.forum_chat_id, message_id=mid,
     ))
     _drain_updates(bot)
-    assert bot.mod._UPLOAD_WARN_BYTES == 250 * 1024 * 1024
+    assert bot.mod.rt.upload_warn_bytes == 250 * 1024 * 1024
 
     # Cleanup TTL: default 48h → switch to 6h; the temp-note must rebuild.
-    assert bot.mod._UPLOAD_TTL_S == 48 * 3600
+    assert bot.mod.rt.upload_ttl_s == 48 * 3600
     bot.tg.inject_update(callback_update(
         "st:t:21600", owner_id=bot.owner_id,
         forum_chat_id=bot.forum_chat_id, message_id=mid,
     ))
     _drain_updates(bot)
-    assert bot.mod._UPLOAD_TTL_S == 21600
-    assert "6h" in bot.mod._TEMP_NOTE
+    assert bot.mod.rt.upload_ttl_s == 21600
+    assert "6h" in bot.mod.rt.temp_note
 
     import config
     env_txt = open(config._ENV_FILE).read()
@@ -4350,13 +4378,6 @@ def test_tour_open_dedups_previous_message(bot):
     assert config.get_tour_msg_id() != 777          # new id stored
 
 
-def test_tour_msg_id_roundtrip(bot):
-    import config
-    assert config.get_tour_msg_id() is None
-    config.set_tour_msg_id(123)
-    assert config.get_tour_msg_id() == 123
-
-
 # ── /help interactive reference ─────────────────────────────────────
 
 def test_help_opens_category_menu(bot):
@@ -4456,8 +4477,16 @@ def test_send_general_opts_out_of_reap(bot, monkeypatch):
     assert reaped == []
 
 
-def test_bot_commands_menu_includes_new_entries(bot):
-    cmds = {c["command"] for c in bot.mod._BOT_COMMANDS}
+def test_bot_commands_menu_registers_with_telegram(bot):
+    # Exercise the real registration path (set_my_commands → setMyCommands
+    # per scope), not just the literal — this fails if the wiring breaks,
+    # not only if an entry is dropped from _BOT_COMMANDS.
+    import telegram as tg
+    bot.tg.calls.clear()
+    tg.set_my_commands(bot.mod._BOT_COMMANDS)
+    sent = bot.tg.calls_of("setMyCommands")
+    assert sent, "setMyCommands was never issued"
+    cmds = {c["command"] for c in sent[0]["commands"]}
     assert {"tour", "mode", "resume"} <= cmds
 
 
@@ -4476,7 +4505,7 @@ def test_settings_display_default_applies_and_persists(bot):
         forum_chat_id=bot.forum_chat_id, message_id=700,
     ))
     _drain_updates(bot)
-    assert bot.mod.DEFAULT_DISPLAY == "desktop"
+    assert bot.mod.rt.default_display == "desktop"
     # Live copies the components hold were updated too.
     assert bot.mod.turnctl._default_display == "desktop"
     assert bot.mod.commands._default_display == "desktop"
@@ -4503,7 +4532,7 @@ def test_settings_autoupdate_toggle_and_policy(bot):
         forum_chat_id=bot.forum_chat_id, message_id=702,
     ))
     _drain_updates(bot)
-    assert bot.mod.AUTO_UPDATE is True
+    assert bot.mod.rt.auto_update is True
     assert "AUTO_UPDATE=true" in open(config._ENV_FILE).read()
 
     bot.tg.inject_update(callback_update(
@@ -4511,14 +4540,14 @@ def test_settings_autoupdate_toggle_and_policy(bot):
         forum_chat_id=bot.forum_chat_id, message_id=702,
     ))
     _drain_updates(bot)
-    assert bot.mod.AUTO_UPDATE_POLICY == "merge"
+    assert bot.mod.rt.auto_update_policy == "merge"
 
     bot.tg.inject_update(callback_update(
         "st:au:off", owner_id=bot.owner_id,
         forum_chat_id=bot.forum_chat_id, message_id=702,
     ))
     _drain_updates(bot)
-    assert bot.mod.AUTO_UPDATE is False
+    assert bot.mod.rt.auto_update is False
 
 
 def test_settings_stt_timeout_applies_and_persists(bot):
@@ -4536,10 +4565,11 @@ def test_settings_stt_timeout_applies_and_persists(bot):
 def test_whisper_install_result_fresh_msg_when_menu_gone(bot, monkeypatch):
     """If the /settings message TTL'd out during the download, the result is
     delivered as a fresh message instead of a lost edit."""
-    monkeypatch.setattr(bot.mod.stt_install, "install_whisper",
+    import stt_install
+    monkeypatch.setattr(stt_install, "install_whisper",
                         lambda model: True)
     bot.tg.fail_edits.add(800)        # menu message is gone
-    bot.mod._run_settings_model_install(800, bot.forum_chat_id, "base")
+    bot.mod.settings_menu.run_model_install(800, bot.forum_chat_id, "base")
     sent = " ".join(p.get("text", "")
                     for p in bot.tg.calls_of("sendMessage"))
     assert "Whisper base ready" in sent
@@ -4548,9 +4578,10 @@ def test_whisper_install_result_fresh_msg_when_menu_gone(bot, monkeypatch):
 def test_whisper_install_result_edits_when_menu_present(bot, monkeypatch):
     """If the menu message still exists, the result edits it in place — no
     extra fresh message."""
-    monkeypatch.setattr(bot.mod.stt_install, "install_whisper",
+    import stt_install
+    monkeypatch.setattr(stt_install, "install_whisper",
                         lambda model: True)
-    bot.mod._run_settings_model_install(801, bot.forum_chat_id, "base")
+    bot.mod.settings_menu.run_model_install(801, bot.forum_chat_id, "base")
     edit = bot.tg.find_call("editMessageText", message_id=801)
     assert edit is not None
     sent = " ".join(p.get("text", "")

@@ -28,8 +28,8 @@ from dataclasses import dataclass, field
 import audit
 import telegram as tg
 from config import get_forum_chat_id
-from formatting import (_chat_action_for_tool, _compact_tool_msg,
-                        _is_noisy_tool, _md_table_to_list)
+from formatting import (IMAGE_EXTS as _IMAGE_EXTS, _chat_action_for_tool,
+                        _compact_tool_msg, _is_noisy_tool, _md_table_to_list)
 
 _NOISE_TEXTS = {
     "claude is waiting for your input",
@@ -41,7 +41,6 @@ _MAX_SAVED_TURNS = 50
 # extracts the paths, removes the marker from the shown text, and sends the
 # files to the topic at turn end.
 _SEND_FILE_RE = re.compile(r"\[Send file:\s*([^\]]+?)\s*\]")
-_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
 
 
 def _extract_send_files(text, cwd):

@@ -18,6 +18,36 @@ import telegram as tg
 from config import add_pending_delete, get_default_mode, get_forum_chat_id
 from formatting import topic_control_rows
 
+# Standard topic icon color. createForumTopic's green (0x8EEE98) renders as a
+# "?" placeholder, so every topic the bot makes uses this blue. Keep it here,
+# in one place — all four create sites import create_tracked_topic.
+_TOPIC_ICON_COLOR = 0x6FB9F0
+
+
+def make_topic_label(state, name: str) -> str:
+    """Counter-based label: 'name — HH:MM' first, 'name #N — HH:MM' after."""
+    with state.lock:
+        state.topic_counter[name] = state.topic_counter.get(name, 0) + 1
+        n = state.topic_counter[name]
+    ts = time.strftime("%H:%M")
+    return f"{name} #{n} — {ts}" if n > 1 else f"{name} — {ts}"
+
+
+def create_tracked_topic(state, fid, label, *, icon_custom_emoji_id=None):
+    """Create a forum topic with the standard icon color and record its label
+    in state.topic_labels. Returns the topic_id, or None on a falsy id.
+    Propagates the API exception so each caller reports it its own way.
+    """
+    kw = {"icon_color": _TOPIC_ICON_COLOR}
+    if icon_custom_emoji_id:
+        kw["icon_custom_emoji_id"] = icon_custom_emoji_id
+    topic_id = tg.create_forum_topic(fid, label, **kw)
+    if not topic_id:
+        return None
+    with state.lock:
+        state.topic_labels[topic_id] = label
+    return topic_id
+
 
 class SessionLifecycle:
     def __init__(self, state, ui, turnctl):
@@ -34,15 +64,9 @@ class SessionLifecycle:
             return
         if not name:
             name = os.path.basename(cwd.rstrip("/"))
-        with self.state.lock:
-            self.state.topic_counter[name] = (
-                self.state.topic_counter.get(name, 0) + 1)
-            n = self.state.topic_counter[name]
-        ts = time.strftime("%H:%M")
-        label = (f"{name} #{n} — {ts}" if n > 1
-                 else f"{name} — {ts}")
+        label = make_topic_label(self.state, name)
         try:
-            topic_id = tg.create_forum_topic(fid, label, icon_color=0x6FB9F0)
+            topic_id = create_tracked_topic(self.state, fid, label)
         except Exception as e:
             self.ui.ephemeral(fid, f"❌ Failed to create topic: {tg.esc(str(e))}",
                               seconds=7)
@@ -51,8 +75,6 @@ class SessionLifecycle:
             self.ui.ephemeral(fid, "❌ Failed to create topic. Check bot admin rights.",
                               seconds=7)
             return
-        with self.state.lock:
-            self.state.topic_labels[topic_id] = label
         s = self.mgr.create(cwd=cwd, name=name, topic_id=topic_id)
         s.topic_label = label
         # New sessions start in the configured default mode (/settings).
