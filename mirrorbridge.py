@@ -25,6 +25,7 @@ import telegram as tg
 from config import get_forum_chat_id
 from formatting import (_compact_tool_msg, _is_mirror_noisy_tool,
                         _normalize_tool_input)
+from lifecycle import create_tracked_topic
 from terminal_mirror import read_logical_events, reap_if_abandoned
 
 _MIRROR_MODE_CYCLE = ("default", "acceptEdits", "plan", "auto")
@@ -338,15 +339,13 @@ class MirrorProjector:
         # don't double up with another decorative prefix here.
         label = f"{name} mirror — {ts}"[:128]
         try:
-            topic_id = tg.create_forum_topic(
-                fid, label, icon_color=0x6FB9F0,
+            topic_id = create_tracked_topic(
+                self.state, fid, label,
                 icon_custom_emoji_id=self._icon_terminal)
         except Exception as e:
             return {"error": f"create_forum_topic failed: {e}"}
         if not topic_id:
             return {"error": "create_forum_topic returned no id"}
-        with self.state.lock:
-            self.state.topic_labels[topic_id] = label
         m = self.mgr.register(csid, cwd, topic_id, dtach_socket,
                                topic_label=label)
         snapshot_offset = m.last_offset  # JSONL size at registration time

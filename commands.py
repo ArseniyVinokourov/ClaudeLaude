@@ -28,6 +28,7 @@ from config import (HOOK_PORT, get_forum_chat_id, get_help_msg_id,
                     set_forum_chat_id, set_help_msg_id)
 from formatting import (_format_age, _short_cwd, _strip_md,
                         topic_control_rows)
+from lifecycle import create_tracked_topic, make_topic_label
 from session_discovery import (_discover_projects, _live_claude_session_ids,
                                _resolve_session_cwd, _session_last_active)
 from sessions import MODE_PRESETS
@@ -375,22 +376,15 @@ class Commands:
                           f"❌ Can't find cwd for session <code>{tg.esc(claude_session_id[:12])}…</code>")
             return
         name = os.path.basename(cwd.rstrip("/"))
-        with self.state.lock:
-            self.state.topic_counter[name] = self.state.topic_counter.get(name, 0) + 1
-            n = self.state.topic_counter[name]
-        ts = time.strftime("%H:%M")
-        label = (f"{name} #{n} — {ts}" if n > 1
-                 else f"{name} — {ts}")
+        label = make_topic_label(self.state, name)
         try:
-            topic_id = tg.create_forum_topic(fid, label, icon_color=0x6FB9F0)
+            topic_id = create_tracked_topic(self.state, fid, label)
         except Exception as e:
             self.ui.ephemeral(fid, f"❌ Failed to create topic: {tg.esc(str(e))}", seconds=7)
             return
         if not topic_id:
             self.ui.ephemeral(fid, "❌ Failed to create topic.", seconds=7)
             return
-        with self.state.lock:
-            self.state.topic_labels[topic_id] = label
         s = self.mgr.resume(claude_session_id, topic_id, name, cwd)
         s.topic_label = label
         self.lifecycle.attach_controls(s)

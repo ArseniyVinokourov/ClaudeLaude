@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import sys
 import threading
 import time
@@ -12,12 +13,16 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_ID = int(os.environ["OWNER_ID"])
 PROJECTS_DIR = os.environ.get("PROJECTS_DIR", os.path.expanduser("~/Projects"))
 HOOK_PORT = int(os.environ.get("HOOK_PORT", "9853"))
-AUTO_UPDATE = os.environ.get("AUTO_UPDATE", "false").lower() in ("true", "1", "yes")
-AUTO_UPDATE_POLICY = os.environ.get("AUTO_UPDATE_POLICY", "replace")
 UNLOCK_WORD = os.environ.get("UNLOCK_WORD", "")
 BOT_DIR = os.path.dirname(os.path.abspath(__file__))
 _KILL_FILE = os.path.join(BOT_DIR, ".kill")
 _ENV_FILE = os.path.join(BOT_DIR, ".env")
+
+# Resolved once. systemd/cron PATH may not include the user's local bin, so
+# fall back to the conventional install path. All subprocess calls to claude
+# must use this, never a bare 'claude'.
+CLAUDE_BIN = (shutil.which("claude")
+              or os.path.expanduser("~/.local/bin/claude"))
 
 
 def set_env(key: str, value: str):

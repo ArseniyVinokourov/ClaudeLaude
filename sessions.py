@@ -9,7 +9,6 @@ existence for routing notifications.
 import json
 import os
 import queue
-import shutil
 import subprocess
 import sys
 import threading
@@ -18,8 +17,8 @@ import uuid
 from dataclasses import dataclass, field
 from collections.abc import Callable
 
-_CLAUDE_BIN = (shutil.which("claude")
-               or os.path.expanduser("~/.local/bin/claude"))
+from config import CLAUDE_BIN as _CLAUDE_BIN
+from formatting import IMAGE_EXTS as _IMAGE_EXTS
 
 
 MODE_PRESETS: dict[str, dict] = {
@@ -168,7 +167,6 @@ _PERSIST_PATH = os.environ.get(
     "BOT_SESSIONS_FILE",
     os.path.join(os.path.dirname(__file__), ".sessions.json"),
 )
-_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
 
 
 class SessionManager:

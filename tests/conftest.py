@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -29,13 +30,13 @@ FORUM_CHAT_ID = 1001
 def _purge_bot_modules():
     for name in [
         "bot", "telegram", "sessions", "hooks", "config", "version",
-        "audit", "device_monitor", "terminal_mirror",
+        "audit", "device_monitor", "terminal_mirror", "runtime",
         # Component modules cache `import telegram as tg` at import time;
         # purge them too so a fresh bot import rebinds their `tg` to the
         # freshly-patched telegram module (else they hold a stale one).
         "turncontroller", "dashboard", "formatting", "session_discovery",
         "updater", "mirrorbridge", "botui", "lifecycle", "hookhandlers",
-        "commands", "questions", "tour",
+        "commands", "questions", "tour", "media", "settings",
     ]:
         sys.modules.pop(name, None)
 
@@ -59,6 +60,12 @@ def bot_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     (tmp_path / "projects").mkdir()
     (tmp_path / "projects" / "demo").mkdir()
 
+    # /settings persists knobs via config.set_env, which writes os.environ
+    # directly (not through monkeypatch). Snapshot the env now and restore it
+    # on teardown so a knob a test changes (UPLOAD_TTL_S, DEFAULT_DISPLAY, …)
+    # doesn't leak into the next test's fresh runtime.rt.
+    env_snapshot = dict(os.environ)
+
     _purge_bot_modules()
     yield SimpleNamespace(
         tmp_path=tmp_path,
@@ -68,6 +75,8 @@ def bot_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         forum_chat_id=FORUM_CHAT_ID,
     )
     _purge_bot_modules()
+    os.environ.clear()
+    os.environ.update(env_snapshot)
 
 
 @pytest.fixture

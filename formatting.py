@@ -12,6 +12,10 @@ import re
 
 from config import HOOK_PORT
 
+# File extensions the bot treats as inline images (sent via sendPhoto rather
+# than sendDocument). Shared by sessions.py and turncontroller.py.
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+
 # ── markdown tables → vertical lists ─────────────────────────────────
 
 _MD_TABLE_RE = re.compile(

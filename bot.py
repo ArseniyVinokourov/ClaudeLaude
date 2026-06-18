@@ -12,27 +12,28 @@ import time
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from config import (OWNER_ID, AUTO_UPDATE, AUTO_UPDATE_POLICY, BOT_DIR,
+from config import (OWNER_ID, BOT_DIR,
+                    CLAUDE_BIN as _CLAUDE_BIN,
                     UNLOCK_WORD, add_pending_delete,
-                    get_default_mode, set_default_mode,
                     get_forum_chat_id, get_tour_shown, set_tour_shown,
                     get_uploads_warned_at, migrate_state,
-                    set_uploads_warned_at, set_env,
+                    set_uploads_warned_at,
                     is_killed, activate_kill, deactivate_kill)
 import audit
 import frames
 import stt
-import stt_install
 import telegram as tg
 import tour
 from botui import BotUI, CLOSE_ROW
 from commands import Commands
 from dashboard import Dashboard
 from hookhandlers import HookHandlers
-from lifecycle import SessionLifecycle
+from lifecycle import SessionLifecycle, create_tracked_topic
+from media import MediaHandlers
 from mirrorbridge import MirrorProjector
 from turncontroller import TurnController, TurnState
-from sessions import MODE_PRESETS, SessionManager, valid_mode
+from sessions import SessionManager
+from settings import SettingsMenu
 from questions import QuestionAsker
 from updater import (
     _check_update, _conflicted_files, _has_local_changes, _restart_bot,
@@ -44,12 +45,9 @@ from terminal_mirror import (
     reap_if_abandoned,
 )
 from session_discovery import _resolve_session_cwd, _session_jsonl_path
+from runtime import rt
 
 # ── state ────────────────────────────────────────────────────────────
-
-_CLAUDE_BIN = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
-DEFAULT_DISPLAY = os.environ.get("DEFAULT_DISPLAY", "mobile")
-_UPLOAD_DIR = "/tmp/bot_uploads"
 
 _ICON_ACTIVE = "5417915203100613993"   # 💬
 _ICON_TERMINAL = "5350554349074391003" # 💻
@@ -111,7 +109,7 @@ tg.configure_general_guard(
     lambda mid: ui.delete_after(mid, get_forum_chat_id(), _GENERAL_BACKSTOP_TTL))
 turnctl = TurnController(
     state, ui, _CLAUDE_BIN,
-    default_display=DEFAULT_DISPLAY,
+    default_display=rt.default_display,
     icon_stopped=_ICON_STOPPED,
     fork_backfill=_FORK_BACKFILL,
 )
@@ -192,12 +190,12 @@ def _do_kill():
 def _auto_update_loop():
     """Background thread: check for updates at startup + every hour.
 
-    Always runs; honours the live AUTO_UPDATE flag each iteration so toggling
+    Always runs; honours the live rt.auto_update flag each iteration so toggling
     it from /settings takes effect without a restart (when off, idles ~60s and
     rechecks)."""
     time.sleep(10)
     while bot_running:
-        if not AUTO_UPDATE:
+        if not rt.auto_update:
             for _ in range(60):
                 if not bot_running:
                     break
@@ -217,7 +215,7 @@ def _auto_update_loop():
                     else:
                         print(f"[auto-update] failed (rc={rc}): {output[:200]}",
                               file=sys.stderr, flush=True)
-                elif AUTO_UPDATE_POLICY == "replace":
+                elif rt.auto_update_policy == "replace":
                     print(f"[auto-update] {current} → {latest}, {len(modified)} modified, policy=replace",
                           file=sys.stderr, flush=True)
                     rc, output = _run_update(non_interactive=True, policy="replace")
@@ -372,10 +370,12 @@ lifecycle.bridge = bridge
 hooks.bridge = bridge
 commands = Commands(
     state, mgr, ui, dashboard, turnctl, lifecycle,
-    default_display=DEFAULT_DISPLAY,
+    default_display=rt.default_display,
     icon_stopped=_ICON_STOPPED,
     icon_active=_ICON_ACTIVE,
 )
+media = MediaHandlers(state, ui, mgr, turnctl)
+settings_menu = SettingsMenu(ui, turnctl, commands)
 
 
 def _dashboard_loop():
@@ -395,29 +395,19 @@ def _dashboard_loop():
 
 
 # ── upload retention (#87) ──────────────────────────────────────────
-# Downloaded media and extracted frames in _UPLOAD_DIR were never deleted
+# Downloaded media and extracted frames in rt.upload_dir were never deleted
 # (it's /tmp, so only a WSL restart cleaned it). Sweep: anything older than
-# _UPLOAD_TTL_S goes — unless its path still appears in the JSONL transcript
+# rt.upload_ttl_s goes — unless its path still appears in the JSONL transcript
 # of a session the bot knows about (Claude may re-read a path it was given,
-# and a stopped session can be /resume'd). Size guard: past _UPLOAD_WARN_MB
+# and a stopped session can be /resume'd). Size guard: past rt.upload_warn_bytes
 # the owner gets a DM, at most one a day. Claude itself is told the files
-# are temporary (_TEMP_NOTE) so anything long-lived gets copied out.
+# are temporary (rt.temp_note) so anything long-lived gets copied out.
+# The tunable knobs (TTL, warn size, temp note) live on runtime.rt so the
+# settings menu and these loops share one live value.
 
-_UPLOAD_TTL_S = int(os.environ.get("UPLOAD_TTL_S", str(48 * 3600)))
 _UPLOAD_SWEEP_INTERVAL_S = 3600
-_UPLOAD_WARN_BYTES = int(os.environ.get("UPLOAD_WARN_MB", "500")) * 1024 * 1024
 _UPLOAD_WARN_INTERVAL_S = 24 * 3600
 _uploads_last_sweep = 0.0
-
-# Appended to every turn that hands Claude an _UPLOAD_DIR path. Rebuilt
-# when /settings changes the TTL so the stated retention stays accurate.
-def _build_temp_note() -> str:
-    return (f"(note: attached files under {_UPLOAD_DIR} are temporary — "
-            f"auto-deleted after ~{_UPLOAD_TTL_S // 3600}h; copy anything "
-            f"needed long-term into the project)")
-
-
-_TEMP_NOTE = _build_temp_note()
 
 
 def _known_session_jsonls() -> list[str]:
@@ -442,15 +432,15 @@ def _sweep_uploads():
     global _uploads_last_sweep
     _uploads_last_sweep = time.time()
     try:
-        entries = os.listdir(_UPLOAD_DIR)
+        entries = os.listdir(rt.upload_dir)
     except OSError:
         return
     now = time.time()
     due = []
     for name in entries:
-        path = os.path.join(_UPLOAD_DIR, name)
+        path = os.path.join(rt.upload_dir, name)
         try:
-            if now - os.path.getmtime(path) > _UPLOAD_TTL_S:
+            if now - os.path.getmtime(path) > rt.upload_ttl_s:
                 due.append(path)
         except OSError:
             continue
@@ -486,20 +476,20 @@ def _sweep_uploads():
 
 def _warn_uploads_size():
     total = 0
-    for root, _dirs, files in os.walk(_UPLOAD_DIR):
+    for root, _dirs, files in os.walk(rt.upload_dir):
         for fn in files:
             try:
                 total += os.path.getsize(os.path.join(root, fn))
             except OSError:
                 pass
-    if total < _UPLOAD_WARN_BYTES:
+    if total < rt.upload_warn_bytes:
         return
     if time.time() - get_uploads_warned_at() < _UPLOAD_WARN_INTERVAL_S:
         return
     set_uploads_warned_at(time.time())
     mb = total // (1024 * 1024)
-    tg.send(f"📦 Media uploads folder reached {mb} MB ({_UPLOAD_DIR}).\n"
-            f"Files older than {_UPLOAD_TTL_S // 3600}h are cleaned "
+    tg.send(f"📦 Media uploads folder reached {mb} MB ({rt.upload_dir}).\n"
+            f"Files older than {rt.upload_ttl_s // 3600}h are cleaned "
             f"automatically; the rest is recent media still referenced "
             f"by sessions.", OWNER_ID)
 
@@ -859,554 +849,6 @@ def _handle_my_chat_member(mcm: dict):
               f"{title} ({chat_id}): {old_status} -> {new_status}")
 
 
-# ── media-group (album) assembly ────────────────────────────────────
-# Telegram delivers an album (multiple photos/files sent together) as N
-# SEPARATE messages that share one `media_group_id`; the caption rides on
-# the first part only. The parts arrive back-to-back. We buffer them and
-# flush once no new part has shown up for _MEDIA_GROUP_FLUSH_S, then hand
-# Claude a single turn carrying every attachment path. Flushing is done on
-# a daemon Timer (not the poll thread) so it fires even while the long-poll
-# is blocked; the buffer dict is guarded by a lock since two threads touch
-# it. enqueue_user_input is queue-based, so calling it off-thread is safe.
-_MEDIA_GROUP_FLUSH_S = 1.5
-_media_groups: dict = {}
-_media_group_lock = threading.Lock()
-
-
-def _buffer_media_group(gid, session, file_id, filename, caption,
-                        chat_id, msg_id, thread_id):
-    """Append one album part and (re)arm its flush timer."""
-    with _media_group_lock:
-        grp = _media_groups.get(gid)
-        if grp is None:
-            grp = {"session": session, "chat_id": chat_id,
-                   "thread_id": thread_id, "caption": "",
-                   "items": [], "first_msg_id": msg_id, "timer": None}
-            _media_groups[gid] = grp
-        grp["items"].append((file_id, filename))
-        if caption and not grp["caption"]:
-            grp["caption"] = caption
-        if grp["timer"] is not None:
-            grp["timer"].cancel()
-        t = threading.Timer(_MEDIA_GROUP_FLUSH_S, _flush_media_group, args=(gid,))
-        t.name = "bot-bg-album"
-        t.daemon = True
-        grp["timer"] = t
-        t.start()
-
-
-def _flush_media_group(gid):
-    """Download every buffered part and enqueue one combined turn."""
-    with _media_group_lock:
-        grp = _media_groups.pop(gid, None)
-    if not grp:
-        return
-    session = grp["session"]
-    chat_id = grp["chat_id"]
-    thread_id = grp["thread_id"]
-    paths = []
-    for i, (file_id, filename) in enumerate(grp["items"]):
-        # Index the name: album parts download within the same second and
-        # photos all carry filename "photo.jpg", so a bare timestamp would
-        # collide and each download would overwrite the last.
-        dest = os.path.join(_UPLOAD_DIR, f"{int(time.time())}_{i}_{filename}")
-        if tg.download_file(file_id, dest):
-            paths.append(dest)
-    if not paths:
-        tg.send("❌ Download failed", chat_id, thread_id=thread_id)
-        return
-    attach = "\n".join(f"[Attached file: {p}]" for p in paths)
-    caption = grp["caption"]
-    user_text = f"{caption}\n{attach}" if caption else attach
-    user_text += f"\n{_TEMP_NOTE}"
-    audit.log("user_message", f"[album] {len(paths)} files", sid=session.sid)
-    turnctl.enqueue_user_input(session, user_text, chat_id,
-                               grp["first_msg_id"], thread_id)
-
-
-# ── voice transcription (#83) ───────────────────────────────────────
-# A voice note (TG `voice`/`audio`, ogg/opus) is downloaded, transcribed
-# locally by faster-whisper (in its own venv via stt.transcribe), and the
-# text is fed to Claude as a normal turn. Run on a daemon thread so the
-# single poll loop is never blocked by the seconds-long transcription.
-
-def _handle_voice(session, file_id, caption, chat_id, msg_id, thread_id):
-    dest = os.path.join(_UPLOAD_DIR, f"{int(time.time())}_voice.oga")
-    if not tg.download_file(file_id, dest):
-        tg.send("❌ Download failed", chat_id, thread_id=thread_id)
-        return
-    tg.send_chat_action(chat_id, "typing", thread_id=thread_id)
-    result = stt.transcribe(dest)
-    if not result or not result.get("text"):
-        ui.ephemeral(chat_id, "🎙 Could not transcribe the audio",
-                     thread_id=thread_id, seconds=8)
-        return
-    transcript = result["text"]
-    body = f"[Voice message transcript]: {transcript}"
-    user_text = f"{caption}\n{body}" if caption else body
-    audit.log("user_message", f"[voice] {transcript[:200]}", sid=session.sid)
-    turnctl.enqueue_user_input(session, user_text, chat_id, msg_id, thread_id)
-
-
-# ── video transcription + frame sampling (#84) ──────────────────────
-# A video / video-note → its audio is transcribed (faster-whisper reads the
-# video container's audio stream directly via PyAV) AND scene-change frames
-# are sampled (frames.extract, also PyAV — no system ffmpeg). Claude gets ONE
-# turn: transcript with timecodes + the frames as attachments, each tagged
-# with its timecode so words and visuals line up. Runs on a daemon thread.
-
-def _mmss(seconds) -> str:
-    s = int(seconds or 0)
-    return f"{s // 60:02d}:{s % 60:02d}"
-
-
-def _handle_video(session, file_id, caption, chat_id, msg_id, thread_id):
-    ts = int(time.time())
-    dest = os.path.join(_UPLOAD_DIR, f"{ts}_video.mp4")
-    if not tg.download_file(file_id, dest):
-        tg.send("❌ Download failed", chat_id, thread_id=thread_id)
-        return
-    tg.send_chat_action(chat_id, "typing", thread_id=thread_id)
-    # Audio transcript (None if the video has no audio track).
-    result = stt.transcribe(dest)
-    transcript = (result or {}).get("text", "")
-    segments = (result or {}).get("segments") or []
-    # Scene-change frames.
-    shots = frames.extract(dest, os.path.join(_UPLOAD_DIR, f"frames_{ts}"))
-
-    parts = []
-    if transcript:
-        if segments:
-            lines = "\n".join(f"[{_mmss(s['start'])}] {s['text']}"
-                              for s in segments)
-            parts.append(f"[Video transcript]\n{lines}")
-        else:
-            parts.append(f"[Video transcript]: {transcript}")
-    if shots:
-        flines = "\n".join(f"[Attached file: {s['path']}] (t={_mmss(s['t'])})"
-                           for s in shots)
-        parts.append(f"[Video frames at scene changes]\n{flines}\n{_TEMP_NOTE}")
-    if not parts:
-        ui.ephemeral(chat_id,
-                     "🎬 Could not read the video (no audio track, no frames)",
-                     thread_id=thread_id, seconds=8)
-        return
-    if caption:
-        parts.insert(0, caption)
-    # Decoder-only tier (#86): frames extracted, speech silently absent —
-    # tell the user once per video so the missing transcript isn't a mystery.
-    if shots and not transcript and not stt.available():
-        ui.ephemeral(chat_id,
-                     "🎬 Frames only — Whisper isn't installed, "
-                     "speech not transcribed",
-                     thread_id=thread_id, seconds=8)
-    user_text = "\n\n".join(parts)
-    audit.log("user_message",
-              f"[video] {len(shots)} frames, transcript {len(transcript)} chars",
-              sid=session.sid)
-    turnctl.enqueue_user_input(session, user_text, chat_id, msg_id, thread_id)
-
-
-# ── user reactions on bot messages (#77) ───────────────────────────
-# A reaction the owner puts on a bot message is forwarded to Claude as a
-# plain user action — Claude decides what (if anything) it means. The
-# update carries no thread id, so routing goes through the recent-send
-# registry in telegram.py. Removals, reactions on unknown/old messages
-# and reactions outside a live bot session are dropped silently.
-
-def _handle_reaction(mr):
-    if mr.get("user", {}).get("id") != OWNER_ID:
-        return
-    new = mr.get("new_reaction") or []
-    if not new:
-        return  # reaction removed — nothing to forward
-    r0 = new[-1]
-    emoji = r0.get("emoji") if r0.get("type") == "emoji" else "(custom emoji)"
-    chat_id = mr.get("chat", {}).get("id")
-    info = tg.recent_send_info(chat_id, mr.get("message_id"))
-    if not info:
-        return
-    thread_id, excerpt = info
-    session = mgr.by_topic(thread_id) if thread_id else None
-    if not (session and session.is_bot_spawned and session.alive):
-        return
-    if excerpt:
-        text = f'[User reacted {emoji} to your message: "{excerpt}"]'
-    else:
-        text = f"[User reacted {emoji} to your message]"
-    audit.log("user_message", text[:200], sid=session.sid)
-    turnctl.enqueue_user_input(session, text, chat_id, None, thread_id)
-
-
-# ── sticker media (#77) ─────────────────────────────────────────────
-# Static stickers (webp) are downloaded and attached so Claude can see the
-# image. Video stickers (webm) get scene frames via frames.extract — same
-# PyAV path as #84, so it runs on a daemon thread. Animated tgs stickers
-# are Lottie vectors PyAV can't decode; their static thumbnail is attached
-# instead when available.
-
-def _handle_video_sticker(session, file_id, descr, chat_id, msg_id, thread_id):
-    ts = int(time.time())
-    dest = os.path.join(_UPLOAD_DIR, f"{ts}_sticker.webm")
-    if not tg.download_file(file_id, dest):
-        tg.send("❌ Download failed", chat_id, thread_id=thread_id)
-        return
-    shots = frames.extract(dest, os.path.join(_UPLOAD_DIR, f"frames_{ts}"))
-    if shots:
-        flines = "\n".join(f"[Attached file: {s['path']}]" for s in shots)
-        user_text = f"{descr}\n{flines}\n{_TEMP_NOTE}"
-    else:
-        user_text = descr
-    audit.log("user_message", f"[sticker video] {len(shots)} frames",
-              sid=session.sid)
-    turnctl.enqueue_user_input(session, user_text, chat_id, msg_id, thread_id)
-
-
-# ── runtime STT install offers (#86) ────────────────────────────────
-# setup.sh makes the ~1GB transcription stack opt-in; a voice/video that
-# arrives without it gets an inline install offer instead of a dead end.
-# The message's file_id is parked in state.pending_media_installs and
-# replayed through the normal handler once the install finishes (Telegram
-# file_ids stay downloadable, so nothing is fetched until then).
-
-def _offer_media_install(session, kind, file_id, caption,
-                         chat_id, msg_id, thread_id):
-    pick_id = str(time.time_ns())[-10:]
-    model_rows = [
-        [{"text": f"base — fast, {stt_install.MODELS['base']}",
-          "callback_data": f"mi:{pick_id}:base"}],
-        [{"text": f"small — better, {stt_install.MODELS['small']}",
-          "callback_data": f"mi:{pick_id}:small"}],
-        [{"text": f"medium — best, {stt_install.MODELS['medium']}",
-          "callback_data": f"mi:{pick_id}:medium"}],
-    ]
-    frames_row = [{"text": "🎞 Frames only — ~250MB",
-                   "callback_data": f"mi:{pick_id}:frames"}]
-    cancel_row = [{"text": "✗ Not now", "callback_data": f"mi:{pick_id}:x"}]
-    if kind == "voice":
-        text = ("🎙 Voice transcription isn't installed.\n"
-                "Whisper runs fully on this machine — pick a model:")
-        rows = model_rows + [cancel_row]
-    elif kind == "video":
-        text = ("🎬 Video processing isn't installed.\n"
-                "Whisper transcribes speech (fully local); the decoder "
-                "alone extracts frames without transcription:")
-        rows = model_rows + [frames_row, cancel_row]
-    else:  # video sticker — decoder is all it needs
-        text = ("🎞 Video stickers need the video decoder (~250MB), "
-                "which isn't installed:")
-        rows = [[{"text": "Install decoder — ~250MB",
-                  "callback_data": f"mi:{pick_id}:frames"}], cancel_row]
-    offer_mid = tg.send(text, chat_id, thread_id=thread_id, buttons=rows)
-    with state.lock:
-        state.pending_media_installs[pick_id] = {
-            "kind": kind, "file_id": file_id, "caption": caption,
-            "sid": session.sid, "chat_id": chat_id, "msg_id": msg_id,
-            "thread_id": thread_id, "offer_mid": offer_mid,
-        }
-
-
-def _media_install_clicked(pick_id, choice):
-    with state.lock:
-        entry = state.pending_media_installs.get(pick_id)
-    if not entry:
-        return
-    if choice == "x":
-        with state.lock:
-            state.pending_media_installs.pop(pick_id, None)
-        if entry["offer_mid"]:
-            tg.delete(entry["offer_mid"], entry["chat_id"])
-        return
-    if choice not in ("frames", *stt_install.MODELS):
-        return
-    if stt_install.busy():
-        ui.ephemeral(entry["chat_id"], "⏳ Another install is already running",
-                     thread_id=entry["thread_id"], seconds=6)
-        return
-    with state.lock:
-        state.pending_media_installs.pop(pick_id, None)
-    threading.Thread(target=_run_media_install, args=(entry, choice),
-                     daemon=True, name="bot-bg-install").start()
-
-
-def _run_media_install(entry, choice):
-    chat_id, thread_id = entry["chat_id"], entry["thread_id"]
-    offer_mid = entry["offer_mid"]
-    if choice == "frames":
-        what = "video decoder (~250MB)"
-    else:
-        what = f"Whisper {choice} ({stt_install.MODELS[choice]})"
-    if offer_mid:
-        tg.edit(offer_mid,
-                f"⏳ Installing {what} — this can take a few minutes…",
-                chat_id)
-    ok = (stt_install.install_decoder() if choice == "frames"
-          else stt_install.install_whisper(choice))
-    audit.log("stt_install", f"{choice} {'ok' if ok else 'FAILED'}")
-    if not ok:
-        if offer_mid:
-            tg.edit(offer_mid, "✗ Install failed — see bot.log", chat_id)
-        return
-    if offer_mid:
-        tg.edit(offer_mid, f"✓ Installed {what}", chat_id)
-        ui.delete_after(offer_mid, chat_id, 8)
-    session = mgr._sessions.get(entry["sid"])
-    if not (session and session.alive):
-        return  # session died while pip ran; user can re-send the media
-    handler = {"voice": _handle_voice, "video": _handle_video,
-               "sticker": _handle_video_sticker}[entry["kind"]]
-    handler(session, entry["file_id"], entry["caption"],
-            chat_id, entry["msg_id"], thread_id)
-
-
-# ── /settings runtime menu (#102) ───────────────────────────────────
-# Owner-level, bot-wide knobs changed at runtime and persisted to .env.
-# Presets only — no free-text capture. The live value is the bot.py global
-# above (_UPLOAD_TTL_S / _UPLOAD_WARN_BYTES, plus WHISPER_MODEL in the env);
-# a change reassigns the global AND writes .env so it survives a restart.
-# A Whisper change first downloads the model (stt_install) in the background.
-
-_SETTINGS_TTL_S = 120
-_WARN_MB_PRESETS = [100, 250, 500, 1000, 2000]
-_TTL_PRESETS = [6 * 3600, 24 * 3600, 48 * 3600, 7 * 86400, 14 * 86400]
-_STT_PRESETS = [60, 120, 180, 300, 600]  # voice/video transcription timeout
-
-
-def _fmt_ttl(seconds: int) -> str:
-    if seconds >= 86400 and seconds % 86400 == 0:
-        return f"{seconds // 86400}d"
-    return f"{seconds // 3600}h"
-
-
-def _settings_root_rows():
-    return [
-        [{"text": "🎙 Whisper model", "callback_data": "st:m"}],
-        [{"text": "📦 Upload alert", "callback_data": "st:w"}],
-        [{"text": "🗑 Cleanup TTL", "callback_data": "st:t"}],
-        [{"text": "📱 Display default", "callback_data": "st:d"}],
-        [{"text": "🎚 Default mode", "callback_data": "st:dm"}],
-        [{"text": "🕒 Transcription timeout", "callback_data": "st:st"}],
-        [{"text": "⬆️ Auto-update", "callback_data": "st:au"}],
-        CLOSE_ROW,
-    ]
-
-
-def _settings_text():
-    au = "on" if AUTO_UPDATE else "off"
-    return (
-        "⚙️ <b>Settings</b>\n\n"
-        f"🎙 Whisper model: <b>{tg.esc(stt.model_name())}</b>\n"
-        f"📦 Upload alert: <b>{_UPLOAD_WARN_BYTES // (1024 * 1024)} MB</b>\n"
-        f"🗑 Cleanup after: <b>{_fmt_ttl(_UPLOAD_TTL_S)}</b>\n"
-        f"📱 Display default: <b>{tg.esc(DEFAULT_DISPLAY)}</b>\n"
-        f"🎚 Default mode: <b>{tg.esc(get_default_mode())}</b>\n"
-        f"🕒 Transcription timeout: <b>{stt._TIMEOUT}s</b>\n"
-        f"⬆️ Auto-update: <b>{au}</b> ({tg.esc(AUTO_UPDATE_POLICY)})"
-    )
-
-
-def _settings_menu(chat_id, thread_id=None):
-    mid = tg.send(_settings_text(), chat_id, thread_id=thread_id,
-                  buttons=_settings_root_rows())
-    if not thread_id and mid:
-        ui.delete_after(mid, chat_id, _SETTINGS_TTL_S)
-
-
-def _settings_show(cb_msg, cb_chat, which):
-    """Expand a root item into its preset picker, in place."""
-    if which == "m":
-        cur = stt.model_name()
-        rows = [[{"text": f"{'• ' if k == cur else ''}{k} — {size}",
-                  "callback_data": f"st:m:{k}"}]
-                for k, size in stt_install.MODELS.items()]
-        rows.append([{"text": "↩ Back", "callback_data": "st:root"}])
-        tg.edit(cb_msg, "🎙 <b>Whisper model</b>\nChanging downloads the "
-                "model if needed (runs in background).", cb_chat, buttons=rows)
-    elif which == "w":
-        cur = _UPLOAD_WARN_BYTES // (1024 * 1024)
-        rows = [[{"text": f"{'• ' if mb == cur else ''}{mb} MB",
-                  "callback_data": f"st:w:{mb}"}] for mb in _WARN_MB_PRESETS]
-        rows.append([{"text": "↩ Back", "callback_data": "st:root"}])
-        tg.edit(cb_msg, "📦 <b>Upload-folder size alert</b>\nDM the owner "
-                "once a day past this size.", cb_chat, buttons=rows)
-    elif which == "t":
-        cur = _UPLOAD_TTL_S
-        rows = [[{"text": f"{'• ' if s == cur else ''}{_fmt_ttl(s)}",
-                  "callback_data": f"st:t:{s}"}] for s in _TTL_PRESETS]
-        rows.append([{"text": "↩ Back", "callback_data": "st:root"}])
-        tg.edit(cb_msg, "🗑 <b>Cleanup TTL</b>\nDelete uploaded media older "
-                "than this (kept if a session still references it).",
-                cb_chat, buttons=rows)
-    elif which == "d":
-        rows = [[{"text": f"{'• ' if v == DEFAULT_DISPLAY else ''}{v}",
-                  "callback_data": f"st:d:{v}"}] for v in ("mobile", "desktop")]
-        rows.append([{"text": "↩ Back", "callback_data": "st:root"}])
-        tg.edit(cb_msg, "📱 <b>Display default</b>\nLayout new topics start "
-                "in. /display overrides it per topic.", cb_chat, buttons=rows)
-    elif which == "dm":
-        cur = get_default_mode()
-        rows = [[{"text": f"{'• ' if k == cur else ''}{k} — {p['label']}",
-                  "callback_data": f"st:dm:{k}"}]
-                for k, p in MODE_PRESETS.items()]
-        rows.append([{"text": "↩ Back", "callback_data": "st:root"}])
-        tg.edit(cb_msg, "🎚 <b>Default mode</b>\nWhich response style new "
-                "sessions start in.", cb_chat, buttons=rows)
-    elif which == "st":
-        cur = stt._TIMEOUT
-        rows = [[{"text": f"{'• ' if s == cur else ''}{s}s",
-                  "callback_data": f"st:st:{s}"}] for s in _STT_PRESETS]
-        rows.append([{"text": "↩ Back", "callback_data": "st:root"}])
-        tg.edit(cb_msg, "🕒 <b>Transcription timeout</b>\nHow long to wait "
-                "for voice/video transcription before giving up.",
-                cb_chat, buttons=rows)
-    elif which == "au":
-        on = AUTO_UPDATE
-        rows = [
-            [{"text": f"{'• ' if on else ''}On", "callback_data": "st:au:on"},
-             {"text": f"{'• ' if not on else ''}Off",
-              "callback_data": "st:au:off"}],
-            [{"text": f"{'• ' if AUTO_UPDATE_POLICY == 'replace' else ''}"
-              "policy: replace", "callback_data": "st:au:replace"}],
-            [{"text": f"{'• ' if AUTO_UPDATE_POLICY == 'merge' else ''}"
-              "policy: merge", "callback_data": "st:au:merge"}],
-            [{"text": "↩ Back", "callback_data": "st:root"}],
-        ]
-        tg.edit(cb_msg, "⬆️ <b>Auto-update</b>\nCheck hourly and update. On "
-                "local changes: replace (back up + overwrite) or merge "
-                "(wait, /update to review).", cb_chat, buttons=rows)
-
-
-def _settings_set_warn(cb_msg, cb_chat, mb):
-    global _UPLOAD_WARN_BYTES
-    _UPLOAD_WARN_BYTES = mb * 1024 * 1024
-    set_env("UPLOAD_WARN_MB", str(mb))
-    audit.log("settings", f"upload_warn_mb={mb}")
-    tg.edit(cb_msg, _settings_text(), cb_chat, buttons=_settings_root_rows())
-
-
-def _settings_set_ttl(cb_msg, cb_chat, seconds):
-    global _UPLOAD_TTL_S, _TEMP_NOTE
-    _UPLOAD_TTL_S = seconds
-    _TEMP_NOTE = _build_temp_note()
-    set_env("UPLOAD_TTL_S", str(seconds))
-    audit.log("settings", f"upload_ttl_s={seconds}")
-    tg.edit(cb_msg, _settings_text(), cb_chat, buttons=_settings_root_rows())
-
-
-def _settings_set_display(cb_msg, cb_chat, value):
-    if value not in ("mobile", "desktop"):
-        return
-    global DEFAULT_DISPLAY
-    DEFAULT_DISPLAY = value
-    # Update the live copies the components captured at construction, so new
-    # topics pick up the change without a restart.
-    turnctl._default_display = value
-    commands._default_display = value
-    set_env("DEFAULT_DISPLAY", value)
-    audit.log("settings", f"default_display={value}")
-    tg.edit(cb_msg, _settings_text(), cb_chat, buttons=_settings_root_rows())
-
-
-def _settings_set_default_mode(cb_msg, cb_chat, mode):
-    if not valid_mode(mode):
-        return
-    set_default_mode(mode)
-    audit.log("settings", f"default_mode={mode}")
-    tg.edit(cb_msg, _settings_text(), cb_chat, buttons=_settings_root_rows())
-
-
-def _settings_set_stt(cb_msg, cb_chat, seconds):
-    if seconds not in _STT_PRESETS:
-        return
-    stt._TIMEOUT = seconds
-    set_env("STT_TIMEOUT", str(seconds))
-    audit.log("settings", f"stt_timeout={seconds}")
-    tg.edit(cb_msg, _settings_text(), cb_chat, buttons=_settings_root_rows())
-
-
-def _settings_set_autoupdate(cb_msg, cb_chat, value):
-    global AUTO_UPDATE, AUTO_UPDATE_POLICY
-    if value in ("on", "off"):
-        AUTO_UPDATE = (value == "on")
-        set_env("AUTO_UPDATE", "true" if AUTO_UPDATE else "false")
-        audit.log("settings", f"auto_update={value}")
-    elif value in ("replace", "merge"):
-        AUTO_UPDATE_POLICY = value
-        set_env("AUTO_UPDATE_POLICY", value)
-        audit.log("settings", f"auto_update_policy={value}")
-    else:
-        return
-    # Re-render the picker so the • marker moves to the new selection.
-    _settings_show(cb_msg, cb_chat, "au")
-
-
-def _settings_set_model(cb_msg, cb_chat, model):
-    if model not in stt_install.MODELS:
-        return
-    if model == stt.model_name() and stt.pkg_present("faster_whisper"):
-        tg.edit(cb_msg, _settings_text(), cb_chat,
-                buttons=_settings_root_rows())
-        return
-    if stt_install.busy():
-        ui.ephemeral(cb_chat, "⏳ Another install is already running",
-                     seconds=6)
-        return
-    tg.edit(cb_msg, f"⏳ Downloading Whisper <b>{tg.esc(model)}</b> — "
-            "this can take a few minutes…", cb_chat)
-    threading.Thread(target=_run_settings_model_install,
-                     args=(cb_msg, cb_chat, model),
-                     daemon=True, name="bot-bg-install").start()
-
-
-def _run_settings_model_install(cb_msg, cb_chat, model):
-    # install_whisper persists WHISPER_MODEL (.env + env) on success, so
-    # stt.model_name() reflects the switch once this returns ok.
-    ok = stt_install.install_whisper(model)
-    audit.log("settings", f"whisper_model={model} {'ok' if ok else 'FAILED'}")
-    if ok:
-        body = _settings_text()
-    else:
-        body = f"❌ Failed to install Whisper {tg.esc(model)} — see bot.log."
-    # The download can run for minutes — longer than the /settings message's
-    # own TTL — so the menu message may already be gone. Try to edit it back;
-    # only if that fails (message deleted) send a fresh result notice, so the
-    # outcome is never silently lost.
-    if not tg.edit(cb_msg, body, cb_chat, buttons=_settings_root_rows()):
-        result = (f"✅ Whisper {tg.esc(model)} ready" if ok else body)
-        ui.ephemeral(cb_chat, result, seconds=30)
-
-
-def _settings_clicked(cb_msg, cb_chat, rest):
-    if rest == "root":
-        tg.edit(cb_msg, _settings_text(), cb_chat,
-                buttons=_settings_root_rows())
-    elif rest in ("m", "w", "t", "d", "dm", "st", "au"):
-        _settings_show(cb_msg, cb_chat, rest)
-    elif rest.startswith("m:"):
-        _settings_set_model(cb_msg, cb_chat, rest[2:])
-    elif rest.startswith("w:"):
-        try:
-            _settings_set_warn(cb_msg, cb_chat, int(rest[2:]))
-        except ValueError:
-            pass
-    elif rest.startswith("t:"):
-        try:
-            _settings_set_ttl(cb_msg, cb_chat, int(rest[2:]))
-        except ValueError:
-            pass
-    elif rest.startswith("dm:"):
-        _settings_set_default_mode(cb_msg, cb_chat, rest[3:])
-    elif rest.startswith("st:"):
-        try:
-            _settings_set_stt(cb_msg, cb_chat, int(rest[3:]))
-        except ValueError:
-            pass
-    elif rest.startswith("d:"):
-        _settings_set_display(cb_msg, cb_chat, rest[2:])
-    elif rest.startswith("au:"):
-        _settings_set_autoupdate(cb_msg, cb_chat, rest[3:])
-
-
 def _reject_no_session(chat_id, thread_id, what):
     """Notice for media/stickers dropped without an active bot session.
 
@@ -1438,7 +880,7 @@ def _handle_update(u):
 
     mr = u.get("message_reaction")
     if mr:
-        _handle_reaction(mr)
+        media.handle_reaction(mr)
         return
 
     msg = u.get("message", {})
@@ -1535,15 +977,16 @@ def _handle_update(u):
         # a single turn instead of one turn per image.
         media_group_id = msg.get("media_group_id")
         if media_group_id:
-            _buffer_media_group(media_group_id, session, file_id, filename,
-                                caption, chat_id, msg_id, thread_id)
+            media.buffer_media_group(media_group_id, session, file_id,
+                                     filename, caption, chat_id, msg_id,
+                                     thread_id)
             return
-        dest = os.path.join(_UPLOAD_DIR,
+        dest = os.path.join(rt.upload_dir,
                             f"{int(time.time())}_{filename}")
         if tg.download_file(file_id, dest):
             user_text = (f"{caption}\n[Attached file: {dest}]" if caption
                          else f"[Attached file: {dest}]")
-            user_text += f"\n{_TEMP_NOTE}"
+            user_text += f"\n{rt.temp_note}"
             audit.log("user_message", f"[file] {filename}",
                       sid=session.sid)
             turnctl.enqueue_user_input(session, user_text, chat_id, msg_id, thread_id)
@@ -1581,11 +1024,11 @@ def _handle_update(u):
         )
         if sticker.get("is_video"):
             if not frames.available():
-                _offer_media_install(session, "sticker", sticker["file_id"],
+                media.offer_media_install(session, "sticker", sticker["file_id"],
                                      descr, chat_id, msg_id, thread_id)
                 return
             threading.Thread(
-                target=_handle_video_sticker,
+                target=media.handle_video_sticker,
                 args=(session, sticker["file_id"], descr,
                       chat_id, msg_id, thread_id),
                 daemon=True, name="bot-bg-sticker",
@@ -1602,10 +1045,10 @@ def _handle_update(u):
         audit.log("user_message",
                   f"[sticker]{ident}".strip(), sid=session.sid)
         if image_id:
-            dest = os.path.join(_UPLOAD_DIR,
+            dest = os.path.join(rt.upload_dir,
                                 f"{int(time.time())}_sticker.{ext}")
             if tg.download_file(image_id, dest):
-                descr += f"\n[Attached file: {dest}]\n{_TEMP_NOTE}"
+                descr += f"\n[Attached file: {dest}]\n{rt.temp_note}"
         turnctl.enqueue_user_input(session, descr, chat_id, msg_id, thread_id)
         return
 
@@ -1616,11 +1059,11 @@ def _handle_update(u):
             _reject_no_session(chat_id, thread_id, "voice")
             return
         if not stt.available():
-            _offer_media_install(session, "voice", voice["file_id"],
+            media.offer_media_install(session, "voice", voice["file_id"],
                                  caption, chat_id, msg_id, thread_id)
             return
         threading.Thread(
-            target=_handle_voice,
+            target=media.handle_voice,
             args=(session, voice["file_id"], caption, chat_id, msg_id, thread_id),
             daemon=True, name="bot-bg-voice",
         ).start()
@@ -1633,11 +1076,11 @@ def _handle_update(u):
             _reject_no_session(chat_id, thread_id, "video")
             return
         if not (frames.available() or stt.available()):
-            _offer_media_install(session, "video", video["file_id"],
+            media.offer_media_install(session, "video", video["file_id"],
                                  caption, chat_id, msg_id, thread_id)
             return
         threading.Thread(
-            target=_handle_video,
+            target=media.handle_video,
             args=(session, video["file_id"], caption, chat_id, msg_id, thread_id),
             daemon=True, name="bot-bg-video",
         ).start()
@@ -1721,7 +1164,7 @@ def _handle_command(cmd, args, chat_id, thread_id, session):
     elif cmd == "/menu":
         commands.cmd_menu(chat_id, thread_id, session)
     elif cmd == "/settings":
-        _settings_menu(chat_id, thread_id)
+        settings_menu.menu(chat_id, thread_id)
     else:
         if session and session.is_bot_spawned:
             ok = mgr.send_user_message(session.sid,
@@ -1753,12 +1196,12 @@ def _handle_callback(cb, data):
     if data.startswith("mi:"):
         parts = data.split(":")
         if len(parts) == 3:
-            _media_install_clicked(parts[1], parts[2])
+            media.media_install_clicked(parts[1], parts[2])
         return
 
     if data.startswith("st:"):
         if cb_msg and cb_chat:
-            _settings_clicked(cb_msg, cb_chat, data[3:])
+            settings_menu.clicked(cb_msg, cb_chat, data[3:])
         return
 
     if data.startswith("tr:"):
@@ -1915,10 +1358,8 @@ def _handle_callback(cb, data):
             if fid:
                 ts = time.strftime("%H:%M")
                 label = f"{parent.name} fork — {ts}"
-                topic_id = tg.create_forum_topic(fid, label, icon_color=0x6FB9F0)
+                topic_id = create_tracked_topic(state, fid, label)
                 if topic_id:
-                    with state.lock:
-                        state.topic_labels[topic_id] = label
                     session = mgr.fork(parent, topic_id, parent.name)
                     if session:
                         session.topic_label = label
