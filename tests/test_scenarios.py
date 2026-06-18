@@ -1038,7 +1038,7 @@ def test_terminal_permission_routes_to_aggregator(bot, tmp_path):
             and "ls -la" in p.get("text", "")]
     assert hits, "permission must land in aggregator topic, project-tagged"
     markup = str(hits[0].get("reply_markup", {}))
-    assert "✅ Allow" in markup and "❌ Deny" in markup
+    assert "✓ Allow" in markup and "✗ Deny" in markup
     with bot.mod.state.lock:
         assert "agg-perm-csid" in bot.mod.state.pending_terminal_msgs
 
@@ -1439,12 +1439,12 @@ def test_status_text_is_time_free(bot):
     _format_status = bot.mod.turnctl._format_status
     now = time.time()
     turn = TurnState()
-    # No tool ops yet: a stable "Думаю…" line, regardless of elapsed time.
+    # No tool ops yet: a stable "Thinking…" line, regardless of elapsed time.
     turn.started_at = now
     a = _format_status(turn)
     turn.started_at = now - 30
     b = _format_status(turn)
-    assert a == b == "⏳ Думаю…", (a, b)
+    assert a == b == "⏳ Thinking…", (a, b)
     # Once a tool op lands the indicator switches; still time-free.
     turn.tool_ops.append("$ ls")
     text = _format_status(turn)
@@ -1454,7 +1454,7 @@ def test_status_text_is_time_free(bot):
 
 
 def test_status_cleared_when_reply_sent(bot, tmp_path):
-    """The '⏳ Думаю…' status must be removed the moment the assistant reply
+    """The '⏳ Thinking…' status must be removed the moment the assistant reply
     is sent, not linger next to the finished answer."""
     _start_bot_session(bot, tmp_path)
     session = next(iter(bot.mod.mgr._sessions.values()))
@@ -4214,13 +4214,13 @@ def test_settings_presets_apply_at_runtime_and_persist(bot):
     labels = [b["text"] for row in root["reply_markup"]["inline_keyboard"]
               for b in row]
     assert any("Whisper" in s for s in labels)
-    assert any("Upload alert" in s for s in labels)
-    assert any("Cleanup TTL" in s for s in labels)
+    assert any("Storage alert" in s for s in labels)
+    assert any("Cleanup after" in s for s in labels)
 
     mid = next(m_id for m_id, m in bot.tg.messages.items()
                if "Settings" in m["text"])
 
-    # Upload alert: default is 500 MB → switch to 250.
+    # Storage alert: default is 500 MB → switch to 250.
     assert bot.mod.rt.upload_warn_bytes == 500 * 1024 * 1024
     bot.tg.inject_update(callback_update(
         "st:w:250", owner_id=bot.owner_id,
@@ -4229,7 +4229,7 @@ def test_settings_presets_apply_at_runtime_and_persist(bot):
     _drain_updates(bot)
     assert bot.mod.rt.upload_warn_bytes == 250 * 1024 * 1024
 
-    # Cleanup TTL: default 48h → switch to 6h; the temp-note must rebuild.
+    # Cleanup after: default 48h → switch to 6h; the temp-note must rebuild.
     assert bot.mod.rt.upload_ttl_s == 48 * 3600
     bot.tg.inject_update(callback_update(
         "st:t:21600", owner_id=bot.owner_id,

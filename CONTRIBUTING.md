@@ -8,7 +8,7 @@ Thanks for the interest. This is a single-maintainer project; every change ships
 2. Branch off `main`.
 3. Open a PR into `main`. CI runs automatically.
 4. Maintainer reviews, requests changes, eventually approves and squash-merges.
-5. The merge into `main` auto-creates a `vX.Y.Z` tag and a GitHub Release. Each PR = one new version.
+5. The merge into `main` auto-creates a `vX.Y.Z` tag — one per PR. A GitHub Release (the signal that prompts installed bots to update) is published **manually** by the maintainer, batching one or more tagged merges. See "Releasing" below.
 
 ## Branch names
 

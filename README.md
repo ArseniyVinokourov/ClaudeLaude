@@ -49,7 +49,8 @@ What it does
  - When Claude asks a question (AskUserQuestion), you answer with
    inline buttons.
  - Topics rename themselves from the conversation context.
- - /compact folds long output into a preview; /expand puts it back.
+ - A Compact button folds a long finished turn into a one-line
+   preview; tap it again to expand the full output.
  - One live status message per turn from the worker thread, instead
    of a tool-call-per-message firehose.
  - Permission requests from terminal Claude sessions arrive with
@@ -127,10 +128,18 @@ setup.sh asks for:
  - OWNER_ID      — your Telegram user ID (ask @userinfobot)
  - PROJECTS_DIR  — where your projects live (default: ~/Projects)
  - HOOK_PORT     — local port for hooks (default: 9853)
+ - UNLOCK_WORD   — secret phrase to reverse the /kill switch from
+   Telegram (without it, /kill is undone only on the machine)
+ - device monitoring (optional) — Telethon API credentials to watch
+   your account for unauthorized devices
  - speech recognition (optional) — Whisper model base/small/medium,
    or a frames-only video decoder; skip and the bot offers the
    install in-chat on the first voice/video message
- - media alert threshold — DM when /tmp/bot_uploads outgrows it
+ - storage alert threshold — DM when /tmp/bot_uploads outgrows it
+ - Claude Code hooks (optional) — catch events from terminal Claude
+   sessions, not just the ones the bot spawns
+ - /bot-mirror command (optional) — installs the slash command that
+   mirrors a terminal session into Telegram
 
 Tunables in .env (all optional, setup.sh fills the first two):
 
@@ -156,17 +165,21 @@ Commands
 --------
 
 	/setup                        bind a forum group to the bot
+	/tour                         guided walkthrough
 	/new [path] [name]            new session, or open the project picker
-	/sessions                     list active sessions
-	/resume                       resume a JSONL session
+	/sessions                     your sessions (running + stopped), tap to fork
+	/resume                       adopt a Claude session from outside the bot
+	/mode [name]                  response style for this session
 	/history [N]                  last N events in the current topic
 	/usage                        real context-window % for this session
 	/display [mobile|desktop]     formatting mode for this topic
+	/settings                     Whisper model, media-cleanup knobs
 	/menu                         inline menu with quick actions
 	/help                         full reference
 	/update                       check for and apply bot updates
 	/stop                         stop the session in this topic
-	/restart                      restart the bot
+	/interrupt                    abort the current turn
+	/restart                      restart the stopped session in this topic
 	/stop_bot                     shut the bot down
 
 

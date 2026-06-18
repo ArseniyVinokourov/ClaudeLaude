@@ -116,7 +116,7 @@ class TurnController:
             return
         if msg_id and chat_id:
             # Auto-reaction 👀 removed — each reaction costs a budget unit
-            # and the "⏳ Думаю…" status + typing indicator already signal
+            # and the "⏳ Thinking…" status + typing indicator already signal
             # "got it, working on it" for free.
             turn = self._get_turn(session)
             turn.user_msg_ids.append(msg_id)
@@ -169,7 +169,7 @@ class TurnController:
         """
         n = len(turn.tool_ops)
         if n == 0:
-            return "⏳ Думаю…"
+            return "⏳ Thinking…"
         last = turn.tool_ops[-1]
         if n > 1:
             return f"⚙️ <code>{tg.esc(last)}</code> ({n})"
@@ -198,7 +198,7 @@ class TurnController:
         """Remove status message (timer thread keeps running).
 
         P1, not the default P3: this is part of the live turn UX (the
-        "⏳ Думаю…" indicator must vanish the moment the reply lands), so the
+        "⏳ Thinking…" indicator must vanish the moment the reply lands), so the
         throughput budget must not drop it the way it can a housekeeping
         delete.
         """
@@ -363,7 +363,7 @@ class TurnController:
             text = _md_table_to_list(text)
         fid = get_forum_chat_id()
         if fid:
-            # Drop the "⏳ Думаю…"/⚙️ status right before the reply lands so
+            # Drop the "⏳ Thinking…"/⚙️ status right before the reply lands so
             # the working indicator never sits next to the finished answer.
             # If more work follows (a tool after this text), on_tool_use
             # recreates the status; end_turn is the final fallback.
@@ -419,7 +419,7 @@ class TurnController:
                 compact_id = str(time.time_ns())[-10:]
                 self.state.saved_turns[compact_id] = (
                     turn.msg_ids[:], turn.msg_texts[:], turn.tool_ops[:])
-            btn = [[{"text": "\U0001f5dc Compact",
+            btn = [[{"text": "\U0001f53c Compact",
                      "callback_data": f"c:{compact_id}"}]]
             last_mid = turn.msg_ids[-1]
             try:
@@ -583,7 +583,7 @@ class TurnController:
             return
         turn = self._get_turn(session)
         if turn._timer_thread is None:
-            mid = tg.send("⏳ Думаю…", fid, thread_id=session.topic_id,
+            mid = tg.send("⏳ Thinking…", fid, thread_id=session.topic_id,
                           buttons=self._interrupt_button(session))
             turn.status_msg_id = mid
             tg.send_chat_action(fid, thread_id=session.topic_id)

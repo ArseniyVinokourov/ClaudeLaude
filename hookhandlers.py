@@ -215,8 +215,8 @@ class HookHandlers:
             short_id = req_id[-12:]
             body = f"<b>{tg.esc(tool)}</b>\n<code>{detail}</code>"
             buttons = [[
-                {"text": "✅ Allow", "callback_data": f"p:{short_id}:a"},
-                {"text": "❌ Deny", "callback_data": f"p:{short_id}:d"},
+                {"text": "✓ Allow", "callback_data": f"p:{short_id}:a"},
+                {"text": "✗ Deny", "callback_data": f"p:{short_id}:d"},
             ]]
 
             terminal_csid = None

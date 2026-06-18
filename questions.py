@@ -173,6 +173,6 @@ class QuestionAsker:
             rows.append([{"text": label,
                           "callback_data": f"aq:{qid}:{qi}:{i}"}])
         if multi:
-            rows.append([{"text": "✅ Done",
+            rows.append([{"text": "✓ Done",
                           "callback_data": f"aq:{qid}:{qi}:done"}])
         return "\n".join(p for p in body if p), rows

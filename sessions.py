@@ -43,7 +43,7 @@ MODE_PRESETS: dict[str, dict] = {
             "items are genuinely distinct entities."
         ),
         "permission_mode": "auto",
-        "label": "1-3 sentence answers",
+        "label": "short answers",
     },
     "verbose": {
         "style": (

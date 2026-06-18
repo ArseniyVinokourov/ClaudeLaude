@@ -44,8 +44,8 @@ class SettingsMenu:
     def _root_rows(self):
         return [
             [{"text": "🎙 Whisper model", "callback_data": "st:m"}],
-            [{"text": "📦 Upload alert", "callback_data": "st:w"}],
-            [{"text": "🗑 Cleanup TTL", "callback_data": "st:t"}],
+            [{"text": "📦 Storage alert", "callback_data": "st:w"}],
+            [{"text": "🗑 Cleanup after", "callback_data": "st:t"}],
             [{"text": "📱 Display default", "callback_data": "st:d"}],
             [{"text": "🎚 Default mode", "callback_data": "st:dm"}],
             [{"text": "🕒 Transcription timeout", "callback_data": "st:st"}],
@@ -58,7 +58,7 @@ class SettingsMenu:
         return (
             "⚙️ <b>Settings</b>\n\n"
             f"🎙 Whisper model: <b>{tg.esc(stt.model_name())}</b>\n"
-            f"📦 Upload alert: <b>{rt.upload_warn_bytes // (1024 * 1024)} MB</b>\n"
+            f"📦 Storage alert: <b>{rt.upload_warn_bytes // (1024 * 1024)} MB</b>\n"
             f"🗑 Cleanup after: <b>{_fmt_ttl(rt.upload_ttl_s)}</b>\n"
             f"📱 Display default: <b>{tg.esc(rt.default_display)}</b>\n"
             f"🎚 Default mode: <b>{tg.esc(get_default_mode())}</b>\n"
@@ -79,7 +79,7 @@ class SettingsMenu:
             rows = [[{"text": f"{'• ' if k == cur else ''}{k} — {size}",
                       "callback_data": f"st:m:{k}"}]
                     for k, size in stt_install.MODELS.items()]
-            rows.append([{"text": "↩ Back", "callback_data": "st:root"}])
+            rows.append([{"text": "◀ Back", "callback_data": "st:root"}])
             tg.edit(cb_msg, "🎙 <b>Whisper model</b>\nChanging downloads the "
                     "model if needed (runs in background).", cb_chat,
                     buttons=rows)
@@ -87,22 +87,23 @@ class SettingsMenu:
             cur = rt.upload_warn_bytes // (1024 * 1024)
             rows = [[{"text": f"{'• ' if mb == cur else ''}{mb} MB",
                       "callback_data": f"st:w:{mb}"}] for mb in _WARN_MB_PRESETS]
-            rows.append([{"text": "↩ Back", "callback_data": "st:root"}])
-            tg.edit(cb_msg, "📦 <b>Upload-folder size alert</b>\nDM the owner "
-                    "once a day past this size.", cb_chat, buttons=rows)
+            rows.append([{"text": "◀ Back", "callback_data": "st:root"}])
+            tg.edit(cb_msg, "📦 <b>Storage alert</b>\nDM the owner once a day "
+                    "when the uploads folder grows past this size.",
+                    cb_chat, buttons=rows)
         elif which == "t":
             cur = rt.upload_ttl_s
             rows = [[{"text": f"{'• ' if s == cur else ''}{_fmt_ttl(s)}",
                       "callback_data": f"st:t:{s}"}] for s in _TTL_PRESETS]
-            rows.append([{"text": "↩ Back", "callback_data": "st:root"}])
-            tg.edit(cb_msg, "🗑 <b>Cleanup TTL</b>\nDelete uploaded media older "
+            rows.append([{"text": "◀ Back", "callback_data": "st:root"}])
+            tg.edit(cb_msg, "🗑 <b>Cleanup after</b>\nDelete uploaded media older "
                     "than this (kept if a session still references it).",
                     cb_chat, buttons=rows)
         elif which == "d":
             rows = [[{"text": f"{'• ' if v == rt.default_display else ''}{v}",
                       "callback_data": f"st:d:{v}"}]
                     for v in ("mobile", "desktop")]
-            rows.append([{"text": "↩ Back", "callback_data": "st:root"}])
+            rows.append([{"text": "◀ Back", "callback_data": "st:root"}])
             tg.edit(cb_msg, "📱 <b>Display default</b>\nLayout new topics start "
                     "in. /display overrides it per topic.", cb_chat,
                     buttons=rows)
@@ -111,14 +112,14 @@ class SettingsMenu:
             rows = [[{"text": f"{'• ' if k == cur else ''}{k} — {p['label']}",
                       "callback_data": f"st:dm:{k}"}]
                     for k, p in MODE_PRESETS.items()]
-            rows.append([{"text": "↩ Back", "callback_data": "st:root"}])
+            rows.append([{"text": "◀ Back", "callback_data": "st:root"}])
             tg.edit(cb_msg, "🎚 <b>Default mode</b>\nWhich response style new "
                     "sessions start in.", cb_chat, buttons=rows)
         elif which == "st":
             cur = stt._TIMEOUT
             rows = [[{"text": f"{'• ' if s == cur else ''}{s}s",
                       "callback_data": f"st:st:{s}"}] for s in _STT_PRESETS]
-            rows.append([{"text": "↩ Back", "callback_data": "st:root"}])
+            rows.append([{"text": "◀ Back", "callback_data": "st:root"}])
             tg.edit(cb_msg, "🕒 <b>Transcription timeout</b>\nHow long to wait "
                     "for voice/video transcription before giving up.",
                     cb_chat, buttons=rows)
@@ -133,7 +134,7 @@ class SettingsMenu:
                   "policy: replace", "callback_data": "st:au:replace"}],
                 [{"text": f"{'• ' if rt.auto_update_policy == 'merge' else ''}"
                   "policy: merge", "callback_data": "st:au:merge"}],
-                [{"text": "↩ Back", "callback_data": "st:root"}],
+                [{"text": "◀ Back", "callback_data": "st:root"}],
             ]
             tg.edit(cb_msg, "⬆️ <b>Auto-update</b>\nCheck hourly and update. On "
                     "local changes: replace (back up + overwrite) or merge "

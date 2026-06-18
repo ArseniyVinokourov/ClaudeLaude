@@ -244,7 +244,7 @@ class MediaHandlers:
             [{"text": f"medium — best, {stt_install.MODELS['medium']}",
               "callback_data": f"mi:{pick_id}:medium"}],
         ]
-        frames_row = [{"text": "🎞 Frames only — ~250MB",
+        frames_row = [{"text": "🎞 Frames only, no speech — 250MB",
                        "callback_data": f"mi:{pick_id}:frames"}]
         cancel_row = [{"text": "✗ Not now", "callback_data": f"mi:{pick_id}:x"}]
         if kind == "voice":
@@ -259,7 +259,7 @@ class MediaHandlers:
         else:  # video sticker — decoder is all it needs
             text = ("🎞 Video stickers need the video decoder (~250MB), "
                     "which isn't installed:")
-            rows = [[{"text": "Install decoder — ~250MB",
+            rows = [[{"text": "🎞 Install video support — 250MB",
                       "callback_data": f"mi:{pick_id}:frames"}], cancel_row]
         offer_mid = tg.send(text, chat_id, thread_id=thread_id, buttons=rows)
         with self.state.lock:

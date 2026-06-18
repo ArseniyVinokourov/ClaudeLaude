@@ -56,8 +56,8 @@ _HELP_SECTIONS: list[tuple[str, str, str]] = [
      "shown as a forum topic.\n\n"
      "/new — pick a project, open a topic\n"
      "/new &lt;path&gt; [name] — in a set dir\n"
-     "/sessions — sessions running in the\n"
-     "  bot; tap one to fork it\n"
+     "/sessions — your bot sessions,\n"
+     "  running or stopped; tap to fork\n"
      "/resume — pull in a Claude session\n"
      "  from outside the bot (e.g. one you\n"
      "  ran in a terminal)\n"
@@ -132,7 +132,7 @@ _HELP_SECTIONS: list[tuple[str, str, str]] = [
      "/tour — guided walkthrough\n"
      "/new — new session (or picker)\n"
      "/sessions — list + fork\n"
-     "/resume — resume a session\n"
+     "/resume — adopt a terminal session\n"
      "/stop · /restart · /interrupt\n"
      "/mode — response style\n"
      "/display — mobile/desktop\n"
@@ -390,7 +390,7 @@ class Commands:
         self.lifecycle.attach_controls(s)
         url = self.ui.topic_url(topic_id)
         if url:
-            self.ui.ephemeral(fid, f"▶ {name}",
+            self.ui.ephemeral(fid, f"▶️ {name}",
                               buttons=[[{"text": "Open", "url": url}]],
                               seconds=5)
 
@@ -686,6 +686,7 @@ class Commands:
         """Simulate a permission request to test the hook flow end-to-end."""
         def _do_test():
             payload = json.dumps({
+                "hook_event_name": "PermissionRequest",
                 "tool_name": "Bash",
                 "tool_input": {"command": "echo 'test permission flow'"},
                 "session_id": f"test-{uuid.uuid4().hex[:8]}",
@@ -755,7 +756,7 @@ class Commands:
 
             buttons = [[
                 {"text": "⬆️ Update now", "callback_data": "upd:go"},
-                {"text": "❌ Cancel", "callback_data": "upd:no"},
+                {"text": "✗ Cancel", "callback_data": "upd:no"},
             ]]
             self.ui.reply(chat_id, thread_id, text, buttons=buttons)
 
@@ -827,7 +828,7 @@ class Commands:
             marker = "• " if key == session.mode else ""
             rows.append([{"text": f"{marker}{key} — {preset['label']}",
                           "callback_data": f"m:mode:{key}"}])
-        rows.append([{"text": "↩ Back", "callback_data": "m:controls"}])
+        rows.append([{"text": "◀ Back", "callback_data": "m:controls"}])
         tg.edit(session.controls_msg_id, "🎯 <b>Choose mode:</b>",
                 chat_id, buttons=rows)
 

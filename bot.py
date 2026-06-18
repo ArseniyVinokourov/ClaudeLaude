@@ -154,7 +154,9 @@ def _try_unkill(text: str, chat_id: int, msg_id: int | None,
         audit.log("kill_switch", "unlock failed attempt")
         left = _UNKILL_MAX_ATTEMPTS - len(_unkill_attempts)
         if left > 0:
-            ui.ephemeral(chat_id, f"Wrong. {left} attempt(s) left.", seconds=5)
+            plural = "" if left == 1 else "s"
+            ui.ephemeral(chat_id, f"Wrong. {left} attempt{plural} left.",
+                         seconds=5)
         if msg_id:
             tg.delete(msg_id, chat_id)
         return True
@@ -269,12 +271,12 @@ def _spawn_merge_resolve_session():
         "one, then resolve the markers. Note: Edit/Write are blocked here — "
         "use Bash with `git`, `sed`, or a `python3` heredoc to edit files. "
         "When `git status` shows no unmerged paths, tell me to tap "
-        "“✅ Done — finalize update” below."
+        "“✓ Done — finalize update” below."
     )
     mgr.send_user_message(s.sid, prompt)
     buttons = [
-        [{"text": "✅ Done — finalize update", "callback_data": "upd:finalize"}],
-        [{"text": "⬆️ Give up, take new version", "callback_data": "upd:replace"}],
+        [{"text": "✓ Done — finalize update", "callback_data": "upd:finalize"}],
+        [{"text": "⬆️ Discard mine, take new version", "callback_data": "upd:replace"}],
     ]
     ui.send_to_topic(s.topic_id,
                      "When conflicts are resolved (no unmerged paths in "
@@ -303,11 +305,12 @@ _HIDDEN_COMMANDS = {"/setup", "/test_perm", "/start", "/kill", "/audit"}
 _BOT_COMMANDS = [
     {"command": "tour", "description": "Guided walkthrough"},
     {"command": "new", "description": "New Claude session"},
-    {"command": "resume", "description": "Resume a session"},
-    {"command": "sessions", "description": "Active sessions"},
+    {"command": "resume", "description": "Adopt a terminal session"},
+    {"command": "sessions", "description": "Your sessions (tap to fork)"},
     {"command": "menu", "description": "Quick actions"},
     {"command": "mode", "description": "Response style"},
     {"command": "stop", "description": "Stop session"},
+    {"command": "interrupt", "description": "Abort the current turn"},
     {"command": "restart", "description": "Restart stopped session"},
     {"command": "history", "description": "Last N events"},
     {"command": "usage", "description": "Token usage"},
@@ -315,6 +318,7 @@ _BOT_COMMANDS = [
     {"command": "settings", "description": "Bot settings"},
     {"command": "update", "description": "Check for bot updates"},
     {"command": "help", "description": "Show help"},
+    {"command": "stop_bot", "description": "Shut the bot down"},
 ]
 
 
@@ -583,7 +587,7 @@ def _on_429_notify(retry_after_s: int) -> None:
             return
         # Send fresh notice.
         try:
-            mid = tg.send("⏳ Перегружено, секунду", OWNER_ID)
+            mid = tg.send("⏳ Overloaded, one sec", OWNER_ID)
         except Exception:
             mid = None
         _rate_notice_msg_id = mid
@@ -614,7 +618,7 @@ def _on_429_notify(retry_after_s: int) -> None:
 def _mirror_continue_buttons(csid: str) -> list:
     """Inline button offering to continue a dead-terminal mirror as a
     regular bot session in the same topic (callback mr:<csid>)."""
-    return [[{"text": "▶ Continue as bot session",
+    return [[{"text": "▶️ Continue as bot session",
               "callback_data": f"mr:{csid}"}]]
 
 
@@ -1314,7 +1318,7 @@ def _handle_callback(cb, data):
 
             def _do_compact():
                 summary = turnctl.build_summary(texts, ops)
-                btn = [[{"text": "\U0001f4c2 Expand",
+                btn = [[{"text": "\U0001f53d Expand",
                           "callback_data": f"uc:{compact_id}"}]]
                 if cb_msg:
                     tg.edit(cb_msg, summary, cb_chat, buttons=btn)
@@ -1334,7 +1338,7 @@ def _handle_callback(cb, data):
                 new_ids.extend(
                     tg.send_long(t, cb_chat, thread_id=cb_thread,
                                  markdown=True))
-            btn = [[{"text": "\U0001f5dc Compact",
+            btn = [[{"text": "\U0001f53c Compact",
                       "callback_data": f"c:{compact_id}"}]]
             if new_ids:
                 try:
@@ -1520,7 +1524,7 @@ def _handle_callback(cb, data):
                         print(f"[mirror] welcome edit failed: {e}",
                               file=sys.stderr, flush=True)
             elif cb_chat:
-                tg.send("⚠️ couldn't push Shift+Tab — dtach socket gone?",
+                tg.send("⚠️ Couldn't push Shift+Tab — dtach socket gone?",
                         cb_chat, thread_id=cb_thread)
 
     elif data.startswith("mr:"):
@@ -1583,7 +1587,7 @@ def _handle_callback(cb, data):
                     m, cb_chat, mode, entry["snapshot"])
             elif cb_msg and cb_chat:
                 tg.edit(cb_msg,
-                        "История больше недоступна (сессия пересоздана).",
+                        "History no longer available (session was recreated).",
                         cb_chat)
 
     elif data.startswith("m:"):
