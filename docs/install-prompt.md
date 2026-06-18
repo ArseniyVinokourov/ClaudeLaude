@@ -32,7 +32,14 @@ The setup script will ask for:
 2. **OWNER_ID** — my Telegram user ID. Explain how to get it via @userinfobot.
 3. **PROJECTS_DIR** — directory with my projects.
 4. **HOOK_PORT** — just press Enter for default.
-5. **Hooks** — answer Y when asked.
+5. **UNLOCK_WORD** — a secret phrase to reverse the `/kill` safety switch from Telegram. Explain why it matters, then let me pick one.
+
+It then offers several optional steps — all safe to skip with Enter, the bot still works without them:
+- **Device monitoring** — needs API credentials from my.telegram.org; watches my account for unauthorized devices.
+- **Speech recognition** — a Whisper model, or a frames-only video decoder. Can also be installed later, on the first voice/video message.
+- **Media storage alert threshold** — when to DM me about the uploads folder size.
+- **Claude Code hooks** — answer Y to also catch events from terminal Claude sessions, not just bot-spawned ones.
+- **/bot-mirror command** — answer Y to enable mirroring a terminal session into Telegram.
 
 ## Telegram setup
 

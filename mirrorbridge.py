@@ -383,15 +383,15 @@ class MirrorProjector:
             else:
                 eta_sec = max(n_events, 1)  # ~1 msg/sec rate-gate
                 buttons = [[
-                    {"text": f"Полная история (~{eta_sec}с)",
+                    {"text": f"Full history (~{eta_sec}s)",
                      "callback_data": f"mirror_history:full:{csid[:24]}"},
-                    {"text": "Кратко (последние 12)",
+                    {"text": "Brief (last 12)",
                      "callback_data": f"mirror_history:short:{csid[:24]}"},
                 ]]
                 prompt = (
-                    f"В этой сессии уже {n_events} сообщений. "
-                    f"Загрузить полностью (медленно, по ~1 сек/сообщение из-за "
-                    f"TG rate-limit) или короткую сводку одним сообщением?"
+                    f"This session already has {n_events} messages. "
+                    f"Load the full history (slow, ~1 sec/message due to the "
+                    f"TG rate limit) or a short summary in one message?"
                 )
                 msg_id = tg.send(prompt, fid, thread_id=topic_id,
                                  buttons=buttons)

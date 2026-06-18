@@ -217,7 +217,7 @@ else
 fi
 
 # ── temp media folder limits ─────────────────────────────────────────
-bold "\nMedia storage alerts"
+bold "\nStorage alert"
 echo "Incoming photos/voice/videos land in /tmp/bot_uploads; files older"
 echo "than 48h are cleaned automatically (referenced ones are kept). The"
 echo "bot DMs you when the folder outgrows a threshold (max once a day)."
