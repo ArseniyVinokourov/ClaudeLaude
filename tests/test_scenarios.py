@@ -4587,3 +4587,24 @@ def test_whisper_install_result_edits_when_menu_present(bot, monkeypatch):
     sent = " ".join(p.get("text", "")
                     for p in bot.tg.calls_of("sendMessage"))
     assert "ready" not in sent
+
+
+def test_startup_reconcile_reaps_deleted_session_topics(bot, tmp_path):
+    """A restored session whose forum topic was deleted while the bot was
+    down is reaped by the startup reconcile; a session with a live topic is
+    left untouched.
+
+    Regression for the #117 ghost-record investigation: an idle restored
+    session with a deleted topic never hits the lazy TOPIC_ID_INVALID-on-send
+    path, so its alive=True record lingered in .sessions.json forever and a
+    message to the ghost topic vanished silently."""
+    bot.mod.mgr.create(str(tmp_path / "live"), "live-session", 200)
+    bot.mod.mgr.create(str(tmp_path / "dead"), "dead-session", 201)
+    bot.tg.dead_topics.add(201)   # topic 201 was deleted while the bot was down
+
+    bot.mod._reconcile_dead_session_topics()
+
+    topics = {s.topic_id for s in bot.mod.mgr.list_sessions()}
+    assert 200 in topics, "live-topic session was wrongly reaped"
+    assert 201 not in topics, "deleted-topic session was not reaped"
+    assert bot.mod.mgr.by_topic(201) is None

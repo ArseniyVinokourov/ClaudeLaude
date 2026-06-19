@@ -645,6 +645,37 @@ def _reconcile_output_only_mirror_topics():
                   file=sys.stderr, flush=True)
 
 
+def _reconcile_dead_session_topics():
+    """One-shot at startup: reap restored sessions whose forum topic was
+    deleted while the bot was down.
+
+    A session's dead topic is normally caught lazily — the next send there
+    fails with TOPIC_ID_INVALID and the set_on_topic_dead callback stops the
+    session. But a restored session that is never written to (idle since
+    restart) keeps its alive=True record in .sessions.json indefinitely, and
+    a message to the ghost topic just vanishes (there is nowhere to reply).
+    This probes each restored session's topic once, silently (editForumTopic
+    with the session's name — a no-op on a live topic) at P3, and invalidates
+    only the confirmed-deleted ones; a transient failure is left alone.
+    Verified 2026-06-19: 34 of 36 records pointed at deleted topics."""
+    fid = forum()
+    if not fid:
+        return
+    for s in mgr.list_sessions():  # snapshot of alive sessions
+        if not s.topic_id or s.topic_id == 1:
+            continue  # no topic / General
+        try:
+            if tg.topic_gone(fid, s.topic_id, s.name or "session"):
+                print(f"[session reconcile] {s.sid[:8]} topic "
+                      f"{s.topic_id} gone — invalidating",
+                      file=sys.stderr, flush=True)
+                lifecycle.invalidate_and_stop(
+                    s, "topic deleted (startup reconcile)")
+        except Exception as e:
+            print(f"[session reconcile] probe error {s.sid[:8]}: {e}",
+                  file=sys.stderr, flush=True)
+
+
 def _mirror_socket_watcher():
     """Local-only watcher: flip mirrors to output-only when their dtach
     socket vanishes, and reap claudes whose terminal closed (zero
@@ -777,6 +808,8 @@ def main():
     # TOPIC_ID_INVALID on the next send (set_on_topic_dead callback).
     # The dtach-socket watcher only does local filesystem checks.
     threading.Thread(target=_mirror_socket_watcher, daemon=True).start()
+    threading.Thread(target=_reconcile_dead_session_topics, daemon=True,
+                     name="bot-bg-sessreap").start()
     threading.Thread(target=_dashboard_loop, daemon=True).start()
     threading.Thread(target=hooks.terminal_watcher, daemon=True).start()
     threading.Thread(target=_device_monitor_loop, daemon=True).start()
