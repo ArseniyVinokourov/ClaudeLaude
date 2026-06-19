@@ -2,20 +2,11 @@
 
 ## Threat model
 
-ClaudeLaude is a Telegram bot that runs Claude Code as a local subprocess. Claude Code has unrestricted shell access — it can read and write files, run arbitrary commands, and modify system state. The bot relays this power through Telegram messages.
+ClaudeLaude runs Claude Code as a local subprocess and relays it through a Telegram bot — which means **anyone who can message the bot as the owner has a shell on your machine.**
 
-**This means: anyone who can send messages to the bot as the owner has full shell access to the host machine.**
+The full model — assets, in-scope threats and their mitigations, what is explicitly out of scope, and the residual risk — lives in [`THREAT_MODEL.md`](THREAT_MODEL.md). Read it before deciding whether and how to run the bot.
 
-Attack vectors to be aware of:
-
-- **Stolen Telegram session** — if an attacker gains access to your Telegram account (session hijack, SIM swap, unlocked phone, malware on a device with an active session), they control the bot and, through it, the machine.
-- **Bot token leak** — the bot token alone does not grant access (the bot only responds to `OWNER_ID`), but a leaked token combined with a spoofed or compromised Telegram account is a path to exploitation.
-- **Local network exposure** — the hooks HTTP server listens on `localhost` only. If your machine exposes the hook port to the network (misconfigured firewall, port forwarding, VPN split tunnel), an attacker on that network can send hook responses and approve operations on your behalf.
-- **Prompt injection via untrusted input** — if a Claude session processes untrusted content (pastes from the web, files from unknown sources), that content could manipulate Claude into running destructive commands. This is a Claude Code risk in general, not specific to the bot, but the bot makes it easier to trigger remotely.
-
-### What is NOT in scope yet
-
-The bot currently relies solely on Telegram's `OWNER_ID` check. There is no secondary authentication (PIN, passphrase, 2FA), no idle timeout, no audit log, and no kill switch. These are tracked as future work (see issue backlog). Until they ship, treat your Telegram account security as the single line of defense.
+In short: the bot answers only `OWNER_ID`. There is a one-directional kill switch, an append-only audit log, brute-force protection on unlock, and optional device monitoring. There is **no** secondary authentication (PIN, passphrase, 2FA) and no idle re-lock — so your Telegram account security remains the single line of defense for normal operation.
 
 ## Supported versions
 
@@ -42,3 +33,4 @@ If you run the bot:
 - **Treat the bot token as a secret.** It lives in `.env`, which is gitignored. Never commit it. Rotate it via @BotFather if you suspect a leak.
 - **Run with least privilege.** The bot does not need root. Run it as a normal user. Consider a dedicated user account with limited filesystem access if your machine hosts sensitive data.
 - **Monitor your sessions.** Review what Claude is doing in the Telegram topics. The bot shows tool calls and permission requests inline — read them.
+- **Watch the cost of Burn mode.** Burn mode (`/mode burn`) deliberately maximizes capability: Opus with the 1M-context model, `max` reasoning effort, and parallel agents. It can spend real money fast over a single session. There is a per-run budget cap (`--max-budget-usd`, currently `$5.0` in `sessions.py`), but no global daily limit — switch back out of Burn mode when you no longer need it, and keep an eye on `/usage`. This is a self-inflicted operational risk, not an attack, but it is the easiest way to lose money with the bot.

@@ -242,7 +242,7 @@ Security
 --------
 
 This bot gives shell access to your machine through Telegram.
-Threat model and hardening advice in SECURITY.md.
+Threat model in THREAT_MODEL.md; hardening advice in SECURITY.md.
 Report vulnerabilities to a.vinokourov418@gmail.com — not in public issues.
 
 
