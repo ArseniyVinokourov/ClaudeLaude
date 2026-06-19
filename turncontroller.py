@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 
 import audit
 import telegram as tg
+from branding import PRODUCT_NAME
 from config import get_forum_chat_id
 from formatting import (IMAGE_EXTS as _IMAGE_EXTS, _chat_action_for_tool,
                         _compact_tool_msg, _is_noisy_tool, _md_table_to_list)
@@ -301,8 +302,8 @@ class TurnController:
                 display = self.state.topic_display_mode.get(
                     session.topic_id, self._default_display)
         lines = [
-            "## ClaudeLaude bot session",
-            "You are running inside ClaudeLaude — a Telegram bot that exposes "
+            f"## {PRODUCT_NAME} bot session",
+            f"You are running inside {PRODUCT_NAME} — a Telegram bot that exposes "
             "Claude Code over Telegram Forum Topics. Each topic is one session; "
             "the owner reads your output in the Telegram client.",
             "",

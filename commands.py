@@ -24,6 +24,7 @@ import audit
 import session_discovery
 import telegram as tg
 from botui import CLOSE_ROW
+from branding import PRODUCT_NAME
 from config import (HOOK_PORT, get_forum_chat_id, get_help_msg_id,
                     set_forum_chat_id, set_help_msg_id)
 from formatting import (_format_age, _short_cwd, _strip_md,
@@ -44,7 +45,7 @@ _RESUME_RECENT_LIMIT = 4
 # bot.py) flip between the menu and a section, both editing one message.
 
 _HELP_INTRO = (
-    "<b>ClaudeLaude — Reference</b>\n\n"
+    f"<b>{PRODUCT_NAME} — Reference</b>\n\n"
     "Tap a topic to explore:"
 )
 

@@ -16,6 +16,7 @@ import sys
 import time
 
 import telegram as tg
+from branding import PRODUCT_NAME
 from config import (PENDING_DELETE_RETRY_BACKOFF_S, add_pending_delete,
                     defer_pending_delete, get_dashboard_id,
                     get_forum_chat_id, get_pending_deletes,
@@ -162,7 +163,7 @@ class Dashboard:
           🔒 KILLED        (only when locked)
         """
         ver = get_version().split("+")[0]
-        parts = [f"<b>ClaudeLaude</b> v{tg.esc(ver)}"]
+        parts = [f"<b>{tg.esc(PRODUCT_NAME)}</b> v{tg.esc(ver)}"]
         with self.state.lock:
             n_waiting = len(self.state.pending_permissions)
         n_mirror = sum(1 for m in self.mirror_mgr.list()

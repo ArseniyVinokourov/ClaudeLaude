@@ -10,6 +10,7 @@ from collections import OrderedDict
 import requests
 
 import budget as _budget_mod
+from branding import ICON_ACTIVE as _TOPIC_ICON_EMOJI_ID  # 💬 default topic icon
 from config import BOT_TOKEN
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
@@ -902,9 +903,6 @@ def _set_reaction_impl(chat_id, msg_id, emoji):
         _req("setMessageReaction", params)
     except Exception as e:
         _log(f"set_message_reaction error: {e}")
-
-
-_TOPIC_ICON_EMOJI_ID = "5417915203100613993"  # 💬 — default (bot session)
 
 
 def create_forum_topic(chat_id: int, label: str,
