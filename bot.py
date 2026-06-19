@@ -46,25 +46,17 @@ from terminal_mirror import (
 )
 from session_discovery import _resolve_session_cwd, _session_jsonl_path
 from runtime import rt
+from branding import (ICON_ACTIVE as _ICON_ACTIVE,
+                      ICON_STOPPED as _ICON_STOPPED,
+                      ICON_TERMINAL as _ICON_TERMINAL,
+                      PRODUCT_NAME)
 
 # ── state ────────────────────────────────────────────────────────────
-
-_ICON_ACTIVE = "5417915203100613993"   # 💬
-_ICON_TERMINAL = "5350554349074391003" # 💻
-_ICON_STOPPED = ""                     # removes custom emoji → color dot
 
 # How many recent messages to copy from the parent topic into a fork.
 # 5 is enough to see the last user prompt + assistant answer; more clutters
 # the fresh fork. copyMessages is capped at 100 by the API anyway.
 _FORK_BACKFILL = 5
-
-# Telegram free-tier reaction set is small; these are picked for clarity.
-_REACT_RECEIVED = "👀"   # bot got the message
-_REACT_STREAMING = "🔥"  # claude is producing text
-_REACT_TOOL = "⚡"        # claude reached for a tool
-_REACT_DONE = "👍"
-_REACT_INTERRUPTED = "🤷"
-_REACT_ERROR = "😨"
 
 
 class BotState:
@@ -261,7 +253,7 @@ def _spawn_merge_resolve_session():
     flist = "\n".join(f"  • {f}" for f in files) or "  (see `git status`)"
     prompt = (
         "This topic is a self-update merge-conflict workspace for the "
-        f"ClaudeLaude bot itself, at `{BOT_DIR}`.\n\n"
+        f"{PRODUCT_NAME} bot itself, at `{BOT_DIR}`.\n\n"
         "The bot tried to update to a new release, but local edits to tracked "
         "files clash with it. The repo is already checked out at the new "
         "release; these files have git conflict markers "

@@ -13,6 +13,7 @@ callback wiring lives in bot.py's dispatch (`tr:` branch).
 """
 
 import telegram as tg
+from branding import PRODUCT_NAME
 from config import get_tour_msg_id, set_tour_msg_id
 
 # Mode blurbs kept deliberately plain and tour-specific (NOT the technical
@@ -38,7 +39,7 @@ _TRY_HELP = [{"text": "❓ Full help", "callback_data": "tr:go:help"}]
 # universally-rendered set (Unicode 6.0) — newer glyphs showed as boxes.
 TOUR: list[dict] = [
     {
-        "title": "\U0001f44b ClaudeLaude",
+        "title": f"\U0001f44b {PRODUCT_NAME}",
         "body": (
             "Claude Code, driven from Telegram.\n"
             "Each session is its own topic —\n"
