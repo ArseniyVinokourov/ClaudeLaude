@@ -155,7 +155,15 @@ def _via_budget(chat_id, prio: int, fn, *args, **kwargs):
 
 
 def _log(msg):
-    print(f"[tg] {msg}", file=sys.stderr, flush=True)
+    # Redact the bot token: requests' ConnectionError/Timeout/HTTPError
+    # strings embed the full request URL, which carries the token in its
+    # path (".../bot<TOKEN>/..."). Logging them verbatim would leak the
+    # token into bot.log — a file users are told to read and may attach to
+    # bug reports.
+    text = str(msg)
+    if BOT_TOKEN:
+        text = text.replace(BOT_TOKEN, "<BOT_TOKEN>")
+    print(f"[tg] {text}", file=sys.stderr, flush=True)
 
 
 def esc(text: str) -> str:
