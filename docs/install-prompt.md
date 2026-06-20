@@ -47,7 +47,8 @@ After install, walk me through:
 1. Create a Telegram group (any name)
 2. Enable Topics: Group Settings > Topics > On
 3. Add bot as admin with permissions: Manage Topics, Delete Messages
-4. Send /setup in the group
+
+(The bot must be running before /setup can answer — start it first, below.)
 
 ## First run
 
@@ -55,8 +56,12 @@ After install, walk me through:
 cd ~/claude-bot && .venv/bin/python bot.py
 ```
 
-Then send /new to create the first session. Make sure replies come through.
+With the bot running, send /setup in the group to link it, then /new to create the first session. Make sure replies come through.
 
 ## Autostart (optional)
 
-If I want the bot to start automatically, help me set up a systemd service or bashrc autostart for my OS.
+If I want the bot to start automatically, help me set up a systemd service or bashrc autostart for my OS. On Windows/WSL, `scripts/windows/Install-KeepWSLAlive.ps1` keeps WSL (and the bot) alive.
+
+## Uninstall
+
+To remove the bot completely later, run `bash uninstall.sh` from the bot directory — it clears state, virtualenvs, the `~/.claude` hooks and `/bot-mirror` command, the shell wrapper, Whisper models, and temp files. `--dry-run` previews; `--purge-dir` also deletes the folder. Deleting the bot on @BotFather and the Telegram group is manual.

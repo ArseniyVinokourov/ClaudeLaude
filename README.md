@@ -160,6 +160,21 @@ In Telegram:
  3. Send /setup in the group.
  4. Send /new to start your first session.
 
+The bot runs in the foreground; to keep it up after the terminal closes,
+background it (`nohup .venv/bin/python bot.py > bot.log 2>&1 &`) or run it
+under your own service manager. On Windows/WSL, keep WSL alive with
+scripts/windows/Install-KeepWSLAlive.ps1.
+
+Update with /update in Telegram (or `bash update.sh`). To remove the bot
+and every trace it left — state, virtualenvs, the ~/.claude hooks and
+/bot-mirror command, the shell wrapper, Whisper models, temp files:
+
+	bash uninstall.sh
+
+Add --dry-run to preview, --purge-dir to also delete the bot folder. It
+can't touch the bot on @BotFather or the Telegram group — delete those
+yourself.
+
 
 Commands
 --------
@@ -225,6 +240,7 @@ Files
 	setup.sh           interactive first-run config
 	install.sh         clone + setup (one-liner)
 	update.sh          git-based update with backup
+	uninstall.sh       remove the bot and all its traces
 	docs/              install/update instructions
 	.env.example       config template
 	.env               your config (not tracked)

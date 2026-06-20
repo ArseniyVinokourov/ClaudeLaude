@@ -114,11 +114,6 @@ if [ -z "$TARGET_HEAD" ]; then
     exit 1
 fi
 
-if [ "$LOCAL_HEAD" = "$TARGET_HEAD" ]; then
-    ok "Already up to date."
-    exit 2
-fi
-
 # ── resolve strategy ──────────────────────────────────────────────
 # auto    — try a real 3-way merge of local edits onto the release; on conflict
 #           leave the tree resolvable and exit 3 (the bot then offers a choice).
@@ -126,6 +121,8 @@ fi
 # finalize— user already resolved conflicts in a session; drop our stash and
 #           run the post-update steps (deps + checksums).
 # Legacy AUTO_UPDATE_POLICY maps replace→replace, anything else→auto.
+# Resolved BEFORE the up-to-date guard below: finalize runs with HEAD already at
+# the release commit and must not be short-circuited by it.
 STRATEGY="${STRATEGY_OVERRIDE}"
 if [ -z "$STRATEGY" ]; then
     POLICY="${POLICY_OVERRIDE}"
@@ -138,13 +135,37 @@ if [ -z "$STRATEGY" ]; then
     esac
 fi
 
+# ── up-to-date / ahead guard ──────────────────────────────────────
+# Skip when finalizing: after an in-place conflict resolution HEAD is already at
+# the release commit, so this guard would otherwise exit 2 and the stash /
+# .update_state cleanup + deps + checksums would never run.
+if [ "$STRATEGY" != "finalize" ] \
+   && git merge-base --is-ancestor "$TARGET_HEAD" "$LOCAL_HEAD" 2>/dev/null; then
+    # HEAD already contains the release commit: either exactly equal, or a newer
+    # dev / pre-release build that is ahead of the latest published release.
+    # A naive `git merge --ff-only <ancestor>` would no-op while we printed a
+    # misleading "updated to <older>" — report the real state instead.
+    if [ "$LOCAL_HEAD" = "$TARGET_HEAD" ]; then
+        ok "Already up to date."
+    else
+        ok "Already up to date (your build $CURRENT_VER is newer than the latest release $LATEST_VER)."
+    fi
+    exit 2
+fi
+
 STASH_MSG="claudelaude-update"
 UPDATE_STATE="$BOT_DIR/.update_state"
+# Declared up front so the trailing "files backed up" block is always defined,
+# including on the finalize path (which never populates it). `set -u` would
+# otherwise abort on ${#MODIFIED_FILES[@]} when finalizing.
+MODIFIED_FILES=()
 
 # Drop only the stash WE pushed (matched by message), never a user's own.
 drop_our_stash() {
     local ref
-    ref=$(git stash list 2>/dev/null | grep -F "$STASH_MSG" | head -1 | cut -d: -f1)
+    # grep exits 1 when no stash matches (the normal case for a direct replace);
+    # `|| true` keeps that from tripping `set -e` and aborting mid-update.
+    ref=$(git stash list 2>/dev/null | grep -F "$STASH_MSG" | head -1 | cut -d: -f1) || true
     [ -n "$ref" ] && git stash drop "$ref" >/dev/null 2>&1 || true
 }
 
@@ -261,26 +282,11 @@ if [ "$NON_INTERACTIVE" = false ]; then
         HOOK_PORT="${HOOK_PORT:-9853}"
 
         SETTINGS_FILE="$HOME/.claude/settings.json"
-        mkdir -p "$(dirname "$SETTINGS_FILE")"
-
-        NOTIFY_CMD="INPUT=\$(cat); printf '%s' \"\$INPUT\" | curl -sf --max-time 8 -X POST http://127.0.0.1:${HOOK_PORT}/hook/notification -H 'Content-Type: application/json' -d @- 2>/dev/null"
-        PERM_CMD="INPUT=\$(cat); printf '%s' \"\$INPUT\" | curl -sf --max-time 125 -X POST http://127.0.0.1:${HOOK_PORT}/hook/permission -H 'Content-Type: application/json' -d @- 2>/dev/null"
-
-        if [ -f "$SETTINGS_FILE" ]; then
-            EXISTING=$(cat "$SETTINGS_FILE")
+        if bash "$BOT_DIR/scripts/configure-claude-hooks.sh" "$SETTINGS_FILE" "$HOOK_PORT"; then
+            ok "Hooks updated"
         else
-            EXISTING='{}'
+            warn "Could not update hooks (see message above) — settings.json left untouched."
         fi
-
-        python3 -c "
-import json
-settings = json.loads('''$EXISTING''')
-hooks = settings.setdefault('hooks', {})
-hooks['Notification'] = [{'hooks': [{'type': 'command', 'command': '''$NOTIFY_CMD''', 'timeout': 10}]}]
-hooks['PermissionRequest'] = [{'hooks': [{'type': 'command', 'command': '''$PERM_CMD''', 'timeout': 130}]}]
-json.dump(settings, open('$SETTINGS_FILE', 'w'), indent=2)
-"
-        ok "Hooks updated"
     fi
 fi
 

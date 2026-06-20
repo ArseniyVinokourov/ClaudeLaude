@@ -123,6 +123,7 @@ To ship: GitHub → **Releases → Draft a new release** → pick the tag for th
    - **No** → nothing to do; the existing shape carries forward.
 2. Removed/renamed an `.env` setting or a command? Say so plainly in the release notes — that's what users read before tapping Update (there is no separate "breaking" flag).
 3. New dependency? Confirm it's in `requirements.txt` (update.sh runs `pip install -r` on apply).
+4. New persisted file or global artifact? If the batch adds a state/cache file, or anything written outside the repo (under `~/.claude`, a shell rc, `~/.cache`), teach `uninstall.sh` to remove it — otherwise "remove the bot and all its traces" quietly stops being true. Add coverage in `tests/test_uninstall.py`.
 
 ## Project conventions worth knowing
 

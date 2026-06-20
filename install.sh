@@ -56,17 +56,21 @@ bash setup.sh
 git ls-files | xargs "${SHA256[@]}" > .dist_checksums 2>/dev/null || true
 
 # ── post-install instructions ──────────────────────────────────────
+# Order matters: the bot must be running before /setup can answer in the group.
 echo ""
-bold "--- Telegram setup ---"
+bold "--- Telegram group ---"
 echo ""
 echo "  1. Create a Telegram group (any name)"
 echo "  2. Enable Topics: Group Settings > Topics > On"
 echo "  3. Add bot as admin (Manage Topics, Delete Messages)"
-echo "  4. Send /setup in the group"
 echo ""
-bold "--- Start the bot ---"
+bold "--- Start the bot, then link the group ---"
 echo ""
 echo "  cd $INSTALL_DIR && .venv/bin/python bot.py"
 echo ""
-echo "  Then send /new to create your first session."
+echo "  4. With the bot running, send /setup in the group to link it"
+echo "  5. Send /new to create your first session"
+echo ""
+echo "  (See setup.sh output above for how to keep the bot running and how to"
+echo "   uninstall.)"
 echo ""

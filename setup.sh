@@ -42,6 +42,7 @@ fi
 if [ -f .env ]; then
     warn ".env already exists. Skipping creation."
     echo "  Edit it manually if needed: $SCRIPT_DIR/.env"
+    chmod 600 .env 2>/dev/null || true   # tighten perms on older installs
 else
     bold "\nCreating .env config..."
     echo ""
@@ -95,6 +96,8 @@ PROJECTS_DIR=$PROJECTS_DIR
 HOOK_PORT=$HOOK_PORT
 UNLOCK_WORD=$UNLOCK_WORD
 EOF
+    # .env holds the bot token and unlock word — keep it owner-only.
+    chmod 600 .env 2>/dev/null || true
 
     ok ".env created"
 fi
@@ -252,30 +255,11 @@ if [[ "$SETUP_HOOKS" =~ ^[Yy] ]]; then
     HOOK_PORT="${HOOK_PORT:-9853}"
 
     SETTINGS_FILE="$HOME/.claude/settings.json"
-    mkdir -p "$(dirname "$SETTINGS_FILE")"
-
-    NOTIFY_CMD="INPUT=\$(cat); printf '%s' \"\$INPUT\" | curl -sf --max-time 8 -X POST http://127.0.0.1:${HOOK_PORT}/hook/notification -H 'Content-Type: application/json' -d @- 2>/dev/null"
-    PERM_CMD="INPUT=\$(cat); printf '%s' \"\$INPUT\" | curl -sf --max-time 125 -X POST http://127.0.0.1:${HOOK_PORT}/hook/permission -H 'Content-Type: application/json' -d @- 2>/dev/null"
-
-    if [ -f "$SETTINGS_FILE" ]; then
-        EXISTING=$(cat "$SETTINGS_FILE")
+    if bash "$SCRIPT_DIR/scripts/configure-claude-hooks.sh" "$SETTINGS_FILE" "$HOOK_PORT"; then
+        ok "Claude Code hooks configured in $SETTINGS_FILE"
     else
-        EXISTING='{}'
+        warn "Could not configure hooks (see message above) — settings.json left untouched."
     fi
-
-    python3 -c "
-import json, sys
-
-settings = json.loads('''$EXISTING''')
-hooks = settings.setdefault('hooks', {})
-
-hooks['Notification'] = [{'hooks': [{'type': 'command', 'command': '''$NOTIFY_CMD''', 'timeout': 10}]}]
-hooks['PermissionRequest'] = [{'hooks': [{'type': 'command', 'command': '''$PERM_CMD''', 'timeout': 130}]}]
-
-json.dump(settings, open('$SETTINGS_FILE', 'w'), indent=2)
-print('ok')
-"
-    ok "Claude Code hooks configured in $SETTINGS_FILE"
 fi
 
 # ── Claude slash command: /bot-mirror ────────────────────────────────
@@ -344,7 +328,15 @@ echo "Press Enter to keep current values."
 echo ""
 
 BOT_TOKEN_BRAND=$(grep '^BOT_TOKEN=' .env 2>/dev/null | cut -d= -f2-)
-if [ -n "$BOT_TOKEN_BRAND" ] && command -v curl &>/dev/null; then
+if [ -z "$BOT_TOKEN_BRAND" ] || ! command -v curl &>/dev/null; then
+    warn "Skipping profile setup (no BOT_TOKEN or curl)."
+elif ! curl -fsS --max-time 10 "https://api.telegram.org/bot${BOT_TOKEN_BRAND}/getMe" 2>/dev/null | grep -q '"ok":true'; then
+    # Validate the token before branding so a wrong token gives one clear line,
+    # not a cascade of raw `curl: (22) 401` errors from each setMy* call.
+    warn "Bot token looks invalid (Telegram getMe failed) — skipping profile setup."
+    echo "  Fix BOT_TOKEN in $SCRIPT_DIR/.env and re-run setup.sh to brand the bot."
+    TOKEN_BAD=1
+else
     read -rp "   Bot name [ClaudeLaude]: " BOT_NAME
     BOT_NAME="${BOT_NAME:-ClaudeLaude}"
     read -rp "   Short description [Claude Code in Telegram]: " BOT_SHORT
@@ -356,11 +348,11 @@ if [ -n "$BOT_TOKEN_BRAND" ] && command -v curl &>/dev/null; then
     API="https://api.telegram.org/bot${BOT_TOKEN_BRAND}"
     brand_ok=true
     curl -fsS --max-time 10 -X POST "${API}/setMyName" \
-        --data-urlencode "name=${BOT_NAME}" >/dev/null || brand_ok=false
+        --data-urlencode "name=${BOT_NAME}" >/dev/null 2>&1 || brand_ok=false
     curl -fsS --max-time 10 -X POST "${API}/setMyShortDescription" \
-        --data-urlencode "short_description=${BOT_SHORT}" >/dev/null || brand_ok=false
+        --data-urlencode "short_description=${BOT_SHORT}" >/dev/null 2>&1 || brand_ok=false
     curl -fsS --max-time 10 -X POST "${API}/setMyDescription" \
-        --data-urlencode "description=${BOT_LONG}" >/dev/null || brand_ok=false
+        --data-urlencode "description=${BOT_LONG}" >/dev/null 2>&1 || brand_ok=false
     if $brand_ok; then
         ok "Bot profile updated"
     else
@@ -370,12 +362,10 @@ if [ -n "$BOT_TOKEN_BRAND" ] && command -v curl &>/dev/null; then
     if [ -f assets/bot_avatar.png ]; then
         curl -fsS --max-time 30 -X POST "${API}/setMyProfilePhoto" \
             -F 'photo={"type":"static","photo":"attach://avatar"}' \
-            -F "avatar=@assets/bot_avatar.png" >/dev/null \
+            -F "avatar=@assets/bot_avatar.png" >/dev/null 2>&1 \
             && ok "Bot avatar set from assets/bot_avatar.png" \
             || warn "Failed to set bot avatar."
     fi
-else
-    warn "Skipping profile setup (no BOT_TOKEN or curl)."
 fi
 
 # ── smoke test ───────────────────────────────────────────────────────
@@ -387,10 +377,12 @@ else
     warn "Python import check failed (see /tmp/claudelaude_smoke.log)"
 fi
 
-if command -v curl &>/dev/null; then
+if [ -n "${TOKEN_BAD:-}" ]; then
+    warn "Telegram getMe failed — check BOT_TOKEN in .env (see above)"
+elif command -v curl &>/dev/null; then
     BOT_TOKEN_CHECK=$(grep '^BOT_TOKEN=' .env 2>/dev/null | cut -d= -f2-)
     if [ -n "$BOT_TOKEN_CHECK" ]; then
-        if curl -fsS --max-time 10 "https://api.telegram.org/bot${BOT_TOKEN_CHECK}/getMe" \
+        if curl -fsS --max-time 10 "https://api.telegram.org/bot${BOT_TOKEN_CHECK}/getMe" 2>/dev/null \
             | grep -q '"ok":true'; then
             ok "Telegram getMe OK"
         else
@@ -411,4 +403,13 @@ bold "     cd $SCRIPT_DIR && .venv/bin/python bot.py"
 echo ""
 echo "  4. Send /setup in the group to link it"
 echo "  5. Send /new to create your first Claude session"
+echo ""
+bold "Keep it running"
+echo "  The command above runs in the foreground and stops when you close the"
+echo "  terminal. To keep the bot up:"
+echo "    • Background it:  nohup .venv/bin/python bot.py > bot.log 2>&1 &"
+echo "    • Windows/WSL:    keep WSL alive — scripts/windows/Install-KeepWSLAlive.ps1"
+echo "    • Or run it under your own service manager (systemd, etc.)."
+echo ""
+echo "To remove the bot later: bash uninstall.sh"
 echo ""
