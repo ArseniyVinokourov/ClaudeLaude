@@ -1000,8 +1000,14 @@ def _handle_update(u):
             _reject_no_session(chat_id, thread_id, "files")
             return
         file_id = photos[-1]["file_id"] if photos else document["file_id"]
+        # basename() the sender-supplied document name: it flows into the
+        # download path (here and via the album buffer), and a name with
+        # path separators ("x/../../.ssh/authorized_keys") would otherwise
+        # escape upload_dir on write — download_file even mkdir -p's the
+        # parent. Strip any directory component before it reaches a path.
         filename = ("photo.jpg" if photos
-                    else document.get("file_name", "file"))
+                    else os.path.basename(document.get("file_name", "file"))
+                    or "file")
         # Album? Buffer this part and let the flush timer combine them into
         # a single turn instead of one turn per image.
         media_group_id = msg.get("media_group_id")
@@ -1207,6 +1213,14 @@ def _handle_command(cmd, args, chat_id, thread_id, session):
 
 
 def _handle_callback(cb, data):
+    # Kill switch freezes the bot. Buttons are not a recovery path — unlock
+    # is the text word in General (_try_unkill) or deleting .kill on the
+    # machine — so ignore every callback while killed. Without this, inline
+    # buttons left on-screen (mode toggle into a live terminal mirror,
+    # device-trust, media installs, session/topic creation, update) would
+    # still take effect for whoever holds the Telegram account.
+    if is_killed():
+        return
     cb_chat = cb.get("message", {}).get("chat", {}).get("id")
     cb_msg = cb.get("message", {}).get("message_id")
     cb_thread = cb.get("message", {}).get("message_thread_id")

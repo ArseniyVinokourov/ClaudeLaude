@@ -877,6 +877,91 @@ def test_unlock_word_injection_resistance(bot, tmp_path, monkeypatch):
         config.deactivate_kill()
 
 
+def test_kill_switch_blocks_callbacks(bot, monkeypatch):
+    """Inline buttons are not a recovery path. While killed, every callback
+    must be ignored — otherwise a held Telegram account could still act
+    through leftover buttons (device trust, mode toggle into a live mirror,
+    installs, session creation). Unlock is the text word in General only."""
+    import config
+    import device_monitor
+    trusted = []
+    monkeypatch.setattr(device_monitor, "trust_device",
+                        lambda key: trusted.append(key))
+
+    config.activate_kill()
+    try:
+        bot.tg.inject_update(callback_update(
+            "dt:devkey",
+            owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
+        ))
+        _drain_updates(bot)
+        assert trusted == [], "callback acted while killed"
+    finally:
+        config.deactivate_kill()
+
+    # Sanity: the SAME callback acts when not killed, proving the test drives
+    # a real handler path (not a vacuous pass).
+    bot.tg.inject_update(callback_update(
+        "dt:devkey",
+        owner_id=bot.owner_id, forum_chat_id=bot.forum_chat_id,
+    ))
+    _drain_updates(bot)
+    assert trusted == ["devkey"]
+
+
+def test_log_redacts_bot_token(bot, capsys):
+    """telegram._log must never emit the bot token. requests' Connection /
+    HTTP error strings embed the request URL, which carries the token in its
+    path (".../bot<TOKEN>/..."); logging them verbatim leaks it into bot.log
+    — a file users are told to read and may attach to bug reports."""
+    import telegram
+    assert telegram.BOT_TOKEN  # the fixture sets a token
+    capsys.readouterr()  # drop any prior thread noise
+    telegram._log(
+        f"network error (sendMessage): url: /bot{telegram.BOT_TOKEN}/sendMessage")
+    err = capsys.readouterr().err
+    assert telegram.BOT_TOKEN not in err
+    assert "<BOT_TOKEN>" in err
+
+
+def test_document_filename_cannot_escape_upload_dir(bot, tmp_path, monkeypatch):
+    """A sender-supplied document name with path separators must not let the
+    download escape upload_dir. download_file mkdir -p's the parent and
+    writes, so an unsanitised "x/../../.ssh/authorized_keys" would be an
+    arbitrary file write outside the upload area."""
+    import os
+    import telegram as tg_mod
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    tid = sess.topic_id
+
+    captured = []
+    monkeypatch.setattr(
+        tg_mod, "download_file",
+        lambda fid, dest: (captured.append(dest), True)[1])
+
+    bot.tg.inject_update({
+        "update_id": 7001,
+        "message": {
+            "message_id": 7001,
+            "from": {"id": bot.owner_id},
+            "chat": {"id": bot.forum_chat_id, "type": "supergroup"},
+            "date": int(time.time()),
+            "message_thread_id": tid,
+            "document": {"file_id": "d1",
+                         "file_name": "../../../../tmp/escaped.sh"},
+        },
+    })
+    _drain_updates(bot)
+
+    assert captured, "download_file was not called"
+    dest = captured[-1]
+    upload_dir = os.path.realpath(bot.mod.rt.upload_dir)
+    assert os.path.realpath(dest).startswith(upload_dir + os.sep), dest
+    assert os.path.basename(dest).endswith("escaped.sh")
+    assert ".." not in os.path.relpath(dest, upload_dir)
+
+
 # ── security: audit log ───────────────────────────────────────────
 
 def test_audit_log_writes_events(bot, tmp_path):
