@@ -31,30 +31,20 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          # Read MAJOR from VERSION file
-          raw=$(cat VERSION 2>/dev/null | tr -d '[:space:]')
-          if [[ "$raw" == *.* ]]; then
-            # Distribution build with full version baked in — use as-is
-            v="$raw"
+          # PATCH = commits in the merged PR (from the squash subject "... (#NN)").
+          subj=$(git log -1 --format='%s')
+          pr_num=$(printf '%s' "$subj" | grep -oE '\(#[0-9]+\)' | tail -1 | tr -d '(#)')
+          if [ -n "$pr_num" ]; then
+            patch=$(gh api "/repos/$REPO/pulls/$pr_num" --jq '.commits' 2>/dev/null || echo 0)
           else
-            major="${raw:-0}"
-            minor=$(git rev-list --count main)
-
-            # Extract PR number from the squash commit subject ("... (#NN)")
-            subj=$(git log -1 --format='%s')
-            pr_num=$(printf '%s' "$subj" | grep -oE '\(#[0-9]+\)' | tail -1 | tr -d '(#)')
-
-            if [ -n "$pr_num" ]; then
-              patch=$(gh api "/repos/$REPO/pulls/$pr_num" --jq '.commits' 2>/dev/null || echo 0)
-            else
-              patch=0
-            fi
-
-            v="$major.$minor.$patch"
+            patch=0
           fi
 
+          # MAJOR/MINOR + milestone handling live in the script (unit-tested).
+          v=$(bash scripts/compute-version.sh "$patch")
+
           if [ -z "$v" ] || [ "$v" = ".." ]; then
-            echo "::error::Failed to compute version (raw=$raw)"
+            echo "::error::Failed to compute version"
             exit 1
           fi
           echo "version=$v" >> "$GITHUB_OUTPUT"

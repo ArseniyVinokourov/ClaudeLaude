@@ -33,12 +33,15 @@ def get_version() -> str:
             raw = f.read().strip()
     except Exception:
         raw = "0"
-    if "." in raw:
-        return raw
-    major = raw or "0"
-    if not _git("rev-parse", "--git-dir"):
-        return f"{major}.0.0"
 
+    # No .git/ -> packaged build: VERSION holds the full version baked at
+    # packaging time (or a bare MAJOR). Use it as-is.
+    if not _git("rev-parse", "--git-dir"):
+        return raw if "." in raw else f"{(raw or '0')}.0.0"
+
+    # In a repo, the latest tag is the source of truth (a dotted VERSION like
+    # "1.0.0" is the milestone the next tag flows from, not a frozen value).
+    major = (raw.split(".")[0] or "0")
     tag = _git("describe", "--tags", "--abbrev=0", "--match=v*")
     m = _TAG_RE.match(tag) if tag else None
     if not m:
