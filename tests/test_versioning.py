@@ -9,7 +9,6 @@ how to make it go red by reverting the change it guards.
 """
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 from pathlib import Path
