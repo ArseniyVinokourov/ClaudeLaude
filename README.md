@@ -112,6 +112,21 @@ You need:
  - A Telegram bot token from @BotFather
  - A Telegram group with Topics enabled
 
+A note on your Anthropic plan: the bot runs Claude Code on your machine
+with whatever account you already logged in to — it adds and changes no
+credentials of its own. As with any tool that automates Claude, make sure
+the way you use it fits the terms of your Anthropic plan.
+
+Platform notes — the install flow is identical everywhere (it's all
+bash); only these differ:
+
+ - Linux — native. For typing back into a terminal from /bot-mirror,
+   install dtach with your package manager (e.g. apt install dtach).
+ - macOS — native. Install dtach with brew install dtach.
+ - Windows — no native path; run everything inside WSL (Ubuntu or
+   similar). WSL must stay awake for the bot to keep running (see the
+   keep-it-up note below).
+
 Then:
 
 	bash <(curl -s https://raw.githubusercontent.com/ArseniyVinokourov/ClaudeLaude/main/install.sh)
@@ -266,3 +281,12 @@ License
 -------
 
 Apache-2.0. See LICENSE.
+
+ClaudeLaude is an independent project, not affiliated with or endorsed
+by Anthropic or Telegram. "Claude" and "Claude Code" are trademarks of
+Anthropic; "Telegram" is a trademark of Telegram Messenger.
+
+A note on your Anthropic plan: the bot runs Claude Code on your machine
+with whatever account you already logged in to — it adds and changes no
+credentials of its own. As with any tool that automates Claude, make sure
+the way you use it fits the terms of your Anthropic plan.
