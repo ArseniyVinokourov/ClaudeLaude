@@ -14,8 +14,10 @@ import pytest
 def _isolated(tmp_path, monkeypatch):
     # Never touch the real .state.json — the running bot uses it.
     monkeypatch.setattr(config, "_STATE_FILE", str(tmp_path / "state.json"))
-    # _ENABLED is read from env at import; force it on for deterministic tests.
+    # _ENABLED / _ALLOWED are read from env at import; pin them for
+    # deterministic tests (and so a real STICKER_ALLOW in .env can't leak in).
     monkeypatch.setattr(stickers, "_ENABLED", True)
+    monkeypatch.setattr(stickers, "_ALLOWED", None)
     yield
 
 
@@ -116,6 +118,41 @@ def test_disabled_is_inactive():
         assert stickers.session_suffix() == ""
     finally:
         stickers._ENABLED = True
+
+
+def test_parse_allow_range():
+    a = stickers._parse_allow("s43-s63")
+    assert a == {f"s{n}" for n in range(43, 64)}
+    assert len(a) == 21
+
+
+def test_parse_allow_mixed_and_whitespace():
+    assert stickers._parse_allow("s2-s3, s10 , s2") == {"s2", "s3", "s10"}
+
+
+def test_parse_allow_empty_is_none():
+    assert stickers._parse_allow("") is None
+    assert stickers._parse_allow("   ") is None
+
+
+def test_allowlist_filters_catalog_and_extract(monkeypatch):
+    for i in range(5):
+        stickers.add(f"F{i}", emoji="x")          # s1..s5 → F0..F4
+    monkeypatch.setattr(stickers, "_ALLOWED", {"s2", "s3"})
+    prompt = stickers.catalog_prompt()
+    assert "s2" in prompt and "s3" in prompt
+    assert "s1" not in prompt and "s4" not in prompt
+    # Disallowed markers are stripped from text but never sent.
+    clean, fids = stickers.extract("a ⟦sticker:s1⟧ b ⟦sticker:s2⟧")
+    assert clean == "a b"
+    assert fids == ["F1"]                          # s2 → F1; s1 dropped
+
+
+def test_allowlist_inactive_when_nothing_allowed(monkeypatch):
+    stickers.add("F", emoji="x")                   # s1
+    monkeypatch.setattr(stickers, "_ALLOWED", {"s99"})
+    assert stickers.is_active() is False
+    assert stickers.catalog_prompt() == ""
 
 
 def test_build_from_set(monkeypatch):

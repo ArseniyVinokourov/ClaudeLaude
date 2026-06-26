@@ -47,6 +47,7 @@ Two sources, both feeding the same deduped catalog (`sticker_catalog` in
 |--------------------|---------|----------------------------------------------------------------|
 | `STICKERS_ENABLED` | `1`     | `0` disables the feature entirely (no prompt injection).       |
 | `STICKER_SETS`     | (empty) | Comma-separated sticker-set names to seed at startup.          |
+| `STICKER_ALLOW`    | (empty) | Restrict sendable stickers to these ids — comma-separated ids and/or ranges, e.g. `s43-s63,s10`. Empty = all. Useful to limit a mixed pack to one character's stickers; also trims the prompt to just those ids. |
 
 ## Components
 

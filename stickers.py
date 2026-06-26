@@ -45,6 +45,34 @@ _MARKER_LINE = re.compile(r"(?m)^[ \t]*⟦sticker:[^⟧]+⟧[ \t]*\n?")
 _MARKER_INLINE = re.compile(r"[ \t]*⟦sticker:[^⟧]+⟧[ \t]*")
 
 
+def _parse_allow(raw: str) -> "set[str] | None":
+    """Parse STICKER_ALLOW into a set of allowed ids, or None (unrestricted).
+    Accepts comma-separated ids and ranges, e.g. ``s43-s63,s10``."""
+    raw = raw.strip()
+    if not raw:
+        return None
+    allowed: set[str] = set()
+    for tok in (t.strip() for t in raw.split(",")):
+        if not tok:
+            continue
+        m = re.fullmatch(r"s(\d+)-s(\d+)", tok)
+        if m:
+            lo, hi = sorted((int(m.group(1)), int(m.group(2))))
+            allowed.update(f"s{n}" for n in range(lo, hi + 1))
+        else:
+            allowed.add(tok)
+    return allowed
+
+
+# Ids the bot may actually send (None = no restriction). Used to limit a mixed
+# pack to one character's stickers — e.g. STICKER_ALLOW=s43-s63.
+_ALLOWED = _parse_allow(os.environ.get("STICKER_ALLOW", ""))
+
+
+def _is_allowed(sid: str) -> bool:
+    return _ALLOWED is None or sid in _ALLOWED
+
+
 # ── catalog storage ──────────────────────────────────────────────────────
 
 def items() -> list[dict]:
@@ -122,19 +150,25 @@ def seed_from_env() -> int:
 
 # ── prompt surface ─────────────────────────────────────────────────────────
 
+def _visible_items() -> list[dict]:
+    """Catalog entries the bot is allowed to send (STICKER_ALLOW filter)."""
+    return [e for e in items() if _is_allowed(e.get("id", ""))]
+
+
 def is_active() -> bool:
-    """True when the feature should touch a session at all: enabled AND the
-    catalog has at least one sticker to offer."""
-    return _ENABLED and bool(items())
+    """True when the feature should touch a session at all: enabled AND there
+    is at least one allowed sticker to offer."""
+    return _ENABLED and bool(_visible_items())
 
 
 def catalog_prompt() -> str:
     """Compact catalog listing for the system prompt: one line per sticker,
-    ``id emoji desc``. Empty string when inactive (caller skips injection)."""
+    ``id emoji desc``. Only allowed stickers are listed (which also keeps the
+    prompt small). Empty string when inactive (caller skips injection)."""
     if not is_active():
         return ""
     lines = []
-    for e in items():
+    for e in _visible_items():
         tag = e.get("emoji", "") or "—"
         desc = e.get("desc", "")
         lines.append(f"{e['id']} {tag}" + (f" — {desc}" if desc else ""))
@@ -150,13 +184,14 @@ MARKER_INSTRUCTION = (
     "right after your text. Because of that, put the marker on its own line at "
     "the very END of your reply — never mid-sentence or between paragraphs, "
     "where it would only leave an empty gap in the text. "
-    "Use a sticker ONLY when it genuinely fits as a reaction or accent — a "
-    "real emotional beat, a joke landing, a greeting/farewell. NEVER in "
-    "neutral, technical or informational replies, and never as a filler or "
-    "reflexive sign-off. Most replies have NO sticker. Send at most one or "
-    "two, and only when the chosen id's meaning actually matches the moment; "
-    "if no id fits, send none. Do not write the bare word 'sticker' or invent "
-    "ids that are not in the list."
+    "Lean into stickers in casual, emotional or playful exchanges — when one "
+    "genuinely fits the moment (a reaction, a joke landing, a greeting or "
+    "farewell, a tease), send it; don't hold back. Skip them in purely "
+    "technical or informational replies, and never use one as meaningless "
+    "filler or a reflexive every-message sign-off. Send at most one or two per "
+    "reply, and only when the chosen id's emoji/meaning actually matches the "
+    "moment; if nothing fits, send none. Do not write the bare word 'sticker' "
+    "or invent ids that are not in the list."
 )
 
 
@@ -188,6 +223,8 @@ def extract(text: str) -> tuple[str, list[str]]:
     file_ids: list[str] = []
     for m in _MARKER.finditer(text):
         sid = m.group(1).strip()
+        if not _is_allowed(sid):
+            continue   # disallowed id — stripped from text below, never sent
         fid = index.get(sid)
         if fid and fid not in file_ids and len(file_ids) < MAX_PER_TURN:
             file_ids.append(fid)
