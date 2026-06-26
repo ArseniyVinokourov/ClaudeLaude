@@ -165,6 +165,19 @@ def set_default_mode(name: str):
     _save_state(state)
 
 
+def get_sticker_catalog() -> dict:
+    """The bot's sticker catalog: {"items": [{id, file_id, emoji, set_name,
+    desc}, ...]}. Additive, optional key — absent on old installs, read with
+    an empty default, so no schema migration is needed."""
+    return _load_state().get("sticker_catalog", {"items": []})
+
+
+def set_sticker_catalog(catalog: dict):
+    state = _load_state()
+    state["sticker_catalog"] = catalog
+    _save_state(state)
+
+
 def get_tour_shown() -> bool:
     return _load_state().get("tour_shown", False)
 

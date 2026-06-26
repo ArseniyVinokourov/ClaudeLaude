@@ -751,6 +751,40 @@ def _send_document_impl(chat_id, doc_path, caption, thread_id) -> int | None:
         return None
 
 
+def send_sticker(chat_id: int, sticker: str, thread_id: int | None = None,
+                 prio: int = P1) -> int | None:
+    """Send a sticker by file_id (or HTTP URL / attach://). Returns the
+    message_id, or None on failure. Goes through the budget worker like
+    other paid writes to the forum chat."""
+    return _via_budget(chat_id, prio, _send_sticker_impl,
+                       chat_id, sticker, thread_id)
+
+
+def _send_sticker_impl(chat_id, sticker, thread_id) -> int | None:
+    params: dict = {"chat_id": chat_id, "sticker": sticker}
+    if thread_id:
+        params["message_thread_id"] = thread_id
+    try:
+        r = _session.post(f"{API}/sendSticker", json=params, timeout=60)
+        r.raise_for_status()
+        return r.json().get("result", {}).get("message_id")
+    except Exception as e:
+        _log(f"send_sticker error: {e}")
+        return None
+
+
+def get_sticker_set(name: str) -> dict | None:
+    """Fetch a sticker set by name. Returns the StickerSet dict (with a
+    `stickers` list, each carrying `file_id`/`emoji`), or None on failure.
+    A bot may send any sticker from a set it can fetch."""
+    try:
+        r = _req("getStickerSet", {"name": name})
+        return r.get("result")
+    except Exception as e:
+        _log(f"get_sticker_set error: {e}")
+        return None
+
+
 def download_file(file_id: str, dest_path: str) -> bool:
     try:
         r = _req("getFile", {"file_id": file_id})
