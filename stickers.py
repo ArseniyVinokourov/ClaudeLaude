@@ -37,6 +37,12 @@ STICKER_SETS = [s.strip() for s in os.environ.get("STICKER_SETS", "").split(",")
 MAX_PER_TURN = 2
 
 _MARKER = re.compile(r"⟦sticker:([^⟧]+)⟧")
+# A marker sitting alone on its own line — stripped with the whole line so it
+# leaves no blank gap mid-message.
+_MARKER_LINE = re.compile(r"(?m)^[ \t]*⟦sticker:[^⟧]+⟧[ \t]*\n?")
+# An inline marker plus the spaces hugging it — replaced with a single space so
+# "word ⟦…⟧ word" closes up cleanly without a triple-space hole.
+_MARKER_INLINE = re.compile(r"[ \t]*⟦sticker:[^⟧]+⟧[ \t]*")
 
 
 # ── catalog storage ──────────────────────────────────────────────────────
@@ -139,8 +145,11 @@ def catalog_prompt() -> str:
 # inline-marker conventions: rare, deliberate, never a tic.
 MARKER_INSTRUCTION = (
     "STICKERS: you may send a Telegram sticker by writing the marker "
-    "⟦sticker:<id>⟧ inline, using an <id> from the AVAILABLE STICKERS list. "
-    "The bot strips the marker and sends that sticker right after your text. "
+    "⟦sticker:<id>⟧, using an <id> from the AVAILABLE STICKERS list. "
+    "The bot strips the marker and sends that sticker as a SEPARATE message "
+    "right after your text. Because of that, put the marker on its own line at "
+    "the very END of your reply — never mid-sentence or between paragraphs, "
+    "where it would only leave an empty gap in the text. "
     "Use a sticker ONLY when it genuinely fits as a reaction or accent — a "
     "real emotional beat, a joke landing, a greeting/farewell. NEVER in "
     "neutral, technical or informational replies, and never as a filler or "
@@ -182,8 +191,13 @@ def extract(text: str) -> tuple[str, list[str]]:
         fid = index.get(sid)
         if fid and fid not in file_ids and len(file_ids) < MAX_PER_TURN:
             file_ids.append(fid)
-    clean = _MARKER.sub("", text)
-    # Tidy the hole the marker left: stray double spaces and space-before-punct.
-    clean = re.sub(r"[ \t]{2,}", " ", clean)
-    clean = re.sub(r"[ \t]+([,.!?;:…\n])", r"\1", clean)
+    # Strip markers without leaving a hole. Own-line markers take their whole
+    # line (and its newline); inline markers collapse to a single space. Spaces
+    # and tabs are otherwise left alone so any code indentation in the reply
+    # survives — only blank-line runs left by a removed line get capped.
+    clean = _MARKER_LINE.sub("", text)
+    clean = _MARKER_INLINE.sub(" ", clean)
+    clean = re.sub(r" +([,.!?;:…])", r"\1", clean)   # no space before punct
+    clean = re.sub(r"[ \t]+\n", "\n", clean)          # no trailing line spaces
+    clean = re.sub(r"\n{3,}", "\n\n", clean)          # cap blank-line runs
     return clean.strip(), file_ids

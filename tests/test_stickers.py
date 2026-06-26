@@ -65,6 +65,29 @@ def test_extract_dedup_and_cap():
     assert fids == ["F0", "F1"]            # deduped + capped at MAX_PER_TURN
 
 
+def test_extract_marker_on_own_line_leaves_no_gap():
+    stickers.add("FID", emoji="x")     # → s1
+    text = "Hello there!\n\n⟦sticker:s1⟧\n\nHow are you?"
+    clean, fids = stickers.extract(text)
+    assert clean == "Hello there!\n\nHow are you?"
+    assert fids == ["FID"]
+
+
+def test_extract_trailing_marker_clean():
+    stickers.add("FID", emoji="x")
+    clean, fids = stickers.extract("Nice work!\n\n⟦sticker:s1⟧")
+    assert clean == "Nice work!"
+    assert fids == ["FID"]
+
+
+def test_extract_preserves_code_indentation():
+    stickers.add("FID", emoji="x")
+    text = "Here:\n\n    code_line()\n        nested()\n\n⟦sticker:s1⟧"
+    clean, _ = stickers.extract(text)
+    assert "    code_line()" in clean
+    assert "        nested()" in clean
+
+
 def test_no_marker_no_work():
     assert stickers.extract("plain text") == ("plain text", [])
     assert stickers.has_marker("plain") is False
