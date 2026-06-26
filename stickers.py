@@ -30,7 +30,12 @@ import telegram as tg
 # so leaving it on costs nothing until stickers exist.
 _ENABLED = os.environ.get("STICKERS_ENABLED", "1") not in ("0", "false", "")
 # Comma-separated sticker-set names to seed the catalog from at startup.
-STICKER_SETS = [s.strip() for s in os.environ.get("STICKER_SETS", "").split(",")
+# Defaults to a neutral, expressive official Telegram pack so stickers work out
+# of the box on a public install. Persona-specific packs (e.g. a character set)
+# are an env override in .env — never the baked-in public default.
+_DEFAULT_STICKER_SET = "HotCherry"
+STICKER_SETS = [s.strip() for s in
+                os.environ.get("STICKER_SETS", _DEFAULT_STICKER_SET).split(",")
                 if s.strip()]
 # Hard cap on stickers sent per turn — a reply is text first, a sticker is an
 # accent, not a flood.

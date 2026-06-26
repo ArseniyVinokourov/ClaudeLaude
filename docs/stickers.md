@@ -9,8 +9,12 @@ inline marker. When a reply genuinely calls for a sticker, the model writes
 `⟦sticker:<id>⟧` at the right spot; the bot strips the marker and fires
 `sendSticker` right after the text lands.
 
-The feature is **inert** when the catalog is empty or `STICKERS_ENABLED=0` — a
-zero-config install behaves exactly as before.
+Out of the box the bot seeds one neutral official pack (`HotCherry`) and stickers
+are on, so a fresh install can react with a sticker right away. The feature goes
+**inert** — no prompt injection, no markers honored — when `STICKERS_ENABLED=0`,
+or when `STICKER_SETS` is cleared and nothing has been auto-learned yet (empty
+catalog). The marker instruction keeps stickers rare and deliberate, so a purely
+technical session effectively never sends one.
 
 ## How a sticker gets sent
 
@@ -35,18 +39,21 @@ Two sources, both feeding the same deduped catalog (`sticker_catalog` in
 `.state.json`):
 
 - **Seed a pack** — `build_from_set(name)` pulls a whole sticker set via
-  `getStickerSet`. Configure `STICKER_SETS` (comma-separated set names) and the
-  bot seeds them at startup (off the startup path, idempotent).
+  `getStickerSet`. `STICKER_SETS` (comma-separated set names) controls which
+  packs seed at startup; it defaults to the neutral `HotCherry` pack and the bot
+  seeds it off the startup path (idempotent). Set it to your own packs to
+  override, or leave it empty to seed nothing and rely on auto-learn.
 - **Auto-learn** — every sticker the owner sends to the bot is remembered
   (`stickers.learn`), so the catalog grows toward the stickers actually in use.
-  Cold start: empty until a pack is seeded or a sticker is received.
+  Cold start: the default pack is already seeded; with `STICKER_SETS` cleared,
+  the catalog stays empty until a sticker is received.
 
 ## Configuration
 
 | Variable           | Default | Meaning                                                        |
 |--------------------|---------|----------------------------------------------------------------|
 | `STICKERS_ENABLED` | `1`     | `0` disables the feature entirely (no prompt injection).       |
-| `STICKER_SETS`     | (empty) | Comma-separated sticker-set names to seed at startup.          |
+| `STICKER_SETS`     | `HotCherry` | Comma-separated sticker-set names to seed at startup. Defaults to a neutral official pack; override with your own, or set empty to seed nothing (auto-learn only). |
 | `STICKER_ALLOW`    | (empty) | Restrict sendable stickers to these ids — comma-separated ids and/or ranges, e.g. `s43-s63,s10`. Empty = all. Useful to limit a mixed pack to one character's stickers; also trims the prompt to just those ids. |
 
 ## Components
@@ -65,4 +72,6 @@ Two sources, both feeding the same deduped catalog (`sticker_catalog` in
 
 - Vision-generated descriptions per sticker (the catalog currently keys on
   emoji + set name; richer descriptions would sharpen the model's choice).
-- A `setup.sh` opt-in block.
+- In-Telegram pack management (a `/stickers` command). For now packs are
+  configured via the `STICKER_SETS` env var (see `.env.example`) plus
+  auto-learn.
