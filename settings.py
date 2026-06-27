@@ -149,20 +149,48 @@ class SettingsMenu:
                     "(wait, /update to review).", cb_chat, buttons=rows)
         elif which == "sp":
             active = speech.active_analyzers()
-            rows = [[{"text": f"{'• ' if a['id'] in active else ''}{a['title']}",
-                      "callback_data": f"st:sp:{a['id']}"}]
-                    for a in speech.registry()]
+            rows = []
+            for a in speech.registry():
+                if a["id"] in active:
+                    label = f"• {a['title']}"
+                elif a["needs_install"] and not a["available"]:
+                    label = f"{a['title']} — install"
+                else:
+                    label = a["title"]
+                rows.append([{"text": label,
+                              "callback_data": f"st:sp:{a['id']}"}])
             rows.append([{"text": "◀ Back", "callback_data": "st:root"}])
             tg.edit(cb_msg, "🗣 <b>Speech analysis</b>\nExtra signals about HOW a "
-                    "voice/video message was said (tempo, pauses…). Tap to turn "
-                    "each on or off. Results reach Claude as an attached file; "
-                    "the transcript itself is unchanged.", cb_chat, buttons=rows)
+                    "voice/video message was said (tempo, pauses, tone…). Tap to "
+                    "turn each on or off. Results reach Claude as an attached "
+                    "file; the transcript itself is unchanged.", cb_chat,
+                    buttons=rows)
 
     def _toggle_analyzer(self, cb_msg, cb_chat, aid):
-        if not any(a["id"] == aid for a in speech.registry()):
+        a = next((x for x in speech.registry() if x["id"] == aid), None)
+        if not a:
+            return
+        # A worker analyzer (e.g. prosody) needs its side-venv deps before it
+        # can be enabled. First tap installs (in the background), then enables.
+        if a["needs_install"] and not a["available"]:
+            if stt_install.busy():
+                return
+            tg.edit(cb_msg, f"⬇️ Installing <b>{tg.esc(a['title'])}</b>…\nThis "
+                    "can take a minute — the menu refreshes when it's done.",
+                    cb_chat)
+            threading.Thread(target=self._install_then_enable,
+                             args=(cb_msg, cb_chat, aid), daemon=True).start()
             return
         ids = speech.toggle(aid)
         audit.log("settings", f"speech_analyzers={','.join(ids) or 'off'}")
+        self._show(cb_msg, cb_chat, "sp")
+
+    def _install_then_enable(self, cb_msg, cb_chat, aid):
+        ok = speech.install(aid)
+        if ok:
+            speech.toggle(aid)  # enable now that its deps are present
+        audit.log("settings",
+                  f"speech_install {'ok' if ok else 'FAILED'} aid={aid}")
         self._show(cb_msg, cb_chat, "sp")
 
     def _set_warn(self, cb_msg, cb_chat, mb):

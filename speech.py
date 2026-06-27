@@ -8,15 +8,22 @@ the detail on demand.
 
 Design: a small registry of analyzers. Each declares an id, a human title for
 the settings menu, whether extra packages must be installed, an availability
-check, and a ``run(result, audio_path) -> dict`` returning ITS signals only.
-The runner merges whatever is enabled AND available; an analyzer that raises is
-dropped (its section is simply absent) so one failure never blocks the turn.
+check, and where it runs (``where``):
 
-Phase 1 ships one analyzer: ``timing`` — speech tempo, pauses and rhythm,
-computed purely from the Whisper word timestamps. No extra dependency, no model,
-runs in-process. Heavier analyzers (voice acoustics, emotion, audio events) plug
-into the same registry in later phases and run via the ``.venv-stt`` worker.
+  - ``inprocess`` — runs here in the bot via ``run(result, audio_path)`` on the
+    transcript (e.g. ``timing``: pure-python tempo/pauses from word timestamps,
+    no dependency, no model).
+  - ``worker`` — needs the heavy side-venv (audio decode / a model), so the
+    compute lives in ``speech_worker`` and runs inside ``.venv-stt`` DURING
+    transcription; its section arrives pre-computed in ``result`` under the
+    analyzer id (e.g. ``prosody``: voice tone/pitch via parselmouth). The bot
+    only declares it here and reads the section back.
+
+The runner merges whatever is enabled AND available; a section that is missing
+(in-process analyzer raised, or worker analyzer produced nothing) is simply
+absent, so one failure never blocks the turn.
 """
+import glob
 import json
 import os
 import sys
@@ -66,17 +73,40 @@ def _timing_run(result, audio_path):
     }
 
 
+# ── analyzer: prosody (Phase 3, worker-side — parselmouth in .venv-stt) ─
+# Voice tone/pitch/strain from the waveform. The compute lives in
+# `speech_worker._prosody` (heavy venv, lazy parselmouth); the bot only knows
+# it exists, whether it's installed, and reads its section back out of the
+# transcription result. So there is no `run` here — `where: "worker"`.
+def _prosody_available():
+    """True if parselmouth is installed in the STT side-venv. parselmouth ships
+    as a compiled extension (parselmouth.cpython-*.so), not a package dir, so
+    match the glob rather than stt.pkg_present (which checks for a dir)."""
+    import stt
+    return bool(glob.glob(os.path.join(
+        stt._STT_VENV, "lib", "python*", "site-packages", "parselmouth*")))
+
+
 # ── registry ───────────────────────────────────────────────────────────
+# `where`: "inprocess" runs in the bot on the transcript result; "worker" runs
+# in `.venv-stt` during transcription and arrives pre-computed in `result`.
+# `deps`: pip packages installed into `.venv-stt` for a worker analyzer.
 _REGISTRY = [
     {"id": "timing", "title": "Tempo & pauses", "needs_install": False,
+     "where": "inprocess", "deps": [],
      "available": _timing_available, "run": _timing_run},
+    {"id": "prosody", "title": "Voice tone & pitch", "needs_install": True,
+     "where": "worker", "deps": ["praat-parselmouth"],
+     "available": _prosody_available, "run": None},
 ]
 
 
 def registry():
-    """Descriptors for the settings menu: id, title, needs_install, available."""
+    """Descriptors for the settings menu: id, title, needs_install, available,
+    where."""
     return [{"id": a["id"], "title": a["title"],
-             "needs_install": a["needs_install"], "available": a["available"]()}
+             "needs_install": a["needs_install"], "available": a["available"](),
+             "where": a.get("where", "inprocess")}
             for a in _REGISTRY]
 
 
@@ -89,6 +119,28 @@ def active_analyzers():
     /settings toggle takes effect without a restart."""
     raw = os.environ.get("SPEECH_ANALYZERS", "")
     return [x for x in (s.strip() for s in raw.split(",")) if x]
+
+
+def active_worker_analyzers():
+    """Enabled worker-side analyzers that are installed — the ids
+    ``stt.transcribe`` must hand to the side-venv so their sections come back
+    in the result. In-process analyzers (run by the bot) are excluded."""
+    out = []
+    for aid in active_analyzers():
+        a = _by_id(aid)
+        if a and a.get("where") == "worker" and a["available"]():
+            out.append(aid)
+    return out
+
+
+def install(aid):
+    """Install a worker analyzer's deps into ``.venv-stt``. Blocks (pip), so
+    callers run it on a daemon thread. Returns True on success."""
+    a = _by_id(aid)
+    if not a or not a.get("deps"):
+        return False
+    import stt_install
+    return stt_install.install_analyzer(a["deps"])
 
 
 def set_active(ids):
@@ -123,12 +175,18 @@ def analyze(result, audio_path):
         a = _by_id(aid)
         if not a or not a["available"]():
             continue
-        try:
-            section = a["run"](result, audio_path)
-        except Exception as e:  # noqa: BLE001 — never let one analyzer block the turn
-            print(f"[speech] analyzer {aid} failed: {e}",
-                  file=sys.stderr, flush=True)
-            continue
+        if a.get("where") == "worker":
+            # Computed in .venv-stt during transcription; already in `result`
+            # under its id (absent if the worker analyzer found/produced
+            # nothing — then it's simply dropped here, same as a failure).
+            section = result.get(aid)
+        else:
+            try:
+                section = a["run"](result, audio_path)
+            except Exception as e:  # noqa: BLE001 — never let one analyzer block the turn
+                print(f"[speech] analyzer {aid} failed: {e}",
+                      file=sys.stderr, flush=True)
+                continue
         if section:
             out[aid] = section
             ran.append(aid)

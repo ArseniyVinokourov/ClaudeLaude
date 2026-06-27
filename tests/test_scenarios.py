@@ -1925,7 +1925,7 @@ def test_voice_message_transcribed_into_turn(bot, tmp_path, monkeypatch):
     monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
     monkeypatch.setattr(bot.mod.stt, "available", lambda: True)
     monkeypatch.setattr(bot.mod.stt, "transcribe",
-                        lambda path: {"text": "привет бот как дела",
+                        lambda path, **kw: {"text": "привет бот как дела",
                                       "segments": [], "language": "ru"})
 
     bot.mod.media.handle_voice(sess, "voice-fid", "", bot.forum_chat_id,
@@ -1995,7 +1995,7 @@ def test_voice_install_click_installs_and_replays(bot, tmp_path, monkeypatch):
                         lambda m: installed.append(m) or True)
     monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
     monkeypatch.setattr(bot.mod.stt, "transcribe",
-                        lambda path: {"text": "after install",
+                        lambda path, **kw: {"text": "after install",
                                       "segments": [], "language": "en"})
     # The success path schedules an 8s delete of the "✓ Installed" notice;
     # that timer would outlive the fixture and hit the real API. Stub it.
@@ -2046,7 +2046,7 @@ def test_video_transcript_and_frames_in_one_turn(bot, tmp_path, monkeypatch):
     sess = next(iter(bot.mod.mgr._sessions.values()))
 
     monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
-    monkeypatch.setattr(bot.mod.stt, "transcribe", lambda path: {
+    monkeypatch.setattr(bot.mod.stt, "transcribe", lambda path, **kw: {
         "text": "intro then demo",
         "segments": [{"start": 0.0, "end": 2.0, "text": "intro"},
                      {"start": 6.0, "end": 8.0, "text": "then demo"}],
@@ -2107,7 +2107,7 @@ def test_video_frames_only_notes_missing_whisper(bot, tmp_path, monkeypatch):
 
     monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
     monkeypatch.setattr(bot.mod.stt, "available", lambda: False)
-    monkeypatch.setattr(bot.mod.stt, "transcribe", lambda path: None)
+    monkeypatch.setattr(bot.mod.stt, "transcribe", lambda path, **kw: None)
     monkeypatch.setattr(bot.mod.frames, "extract", lambda v, d: [
         {"path": "/tmp/f0.jpg", "t": 0.0}])
     notes = []
@@ -2134,7 +2134,7 @@ def test_voice_speech_analysis_off_by_default(bot, tmp_path, monkeypatch):
     monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
     monkeypatch.setattr(bot.mod.stt, "available", lambda: True)
     monkeypatch.setattr(bot.mod.stt, "transcribe",
-                        lambda path: {"text": "привет бот", "segments": [
+                        lambda path, **kw: {"text": "привет бот", "segments": [
                             {"start": 0.0, "end": 1.0, "text": "привет бот",
                              "words": [{"word": "привет", "start": 0.0, "end": 0.5},
                                        {"word": "бот", "start": 0.6, "end": 1.0}]}],
@@ -2161,7 +2161,7 @@ def test_voice_speech_analysis_timing_attaches_json(bot, tmp_path, monkeypatch):
     monkeypatch.setattr(bot.mod.stt, "available", lambda: True)
     # 1.5s pause between "как" (ends 0.9) and "дела" (starts 2.4); 4 words / 3.4s.
     monkeypatch.setattr(bot.mod.stt, "transcribe",
-                        lambda path: {"text": "привет как дела друзья", "language": "ru",
+                        lambda path, **kw: {"text": "привет как дела друзья", "language": "ru",
                             "segments": [{"start": 0.0, "end": 3.4,
                                 "text": "привет как дела друзья", "words": [
                                     {"word": "привет", "start": 0.0, "end": 0.5},
@@ -2183,6 +2183,106 @@ def test_voice_speech_analysis_timing_attaches_json(bot, tmp_path, monkeypatch):
     t = data["timing"]
     assert t["pause_count"] == 1 and t["longest_pause_sec"] == 1.5
     assert t["word_count"] == 4 and t["speech_rate_wpm"] == 71
+
+
+def _force_prosody_available(monkeypatch):
+    """Pretend parselmouth is installed in .venv-stt regardless of the host —
+    the registry holds the availability fn by reference, so patch the entry."""
+    import speech
+    for a in speech._REGISTRY:
+        if a["id"] == "prosody":
+            monkeypatch.setitem(a, "available", lambda: True)
+
+
+def test_voice_prosody_attaches_when_enabled(bot, tmp_path, monkeypatch):
+    """With the worker-side `prosody` analyzer enabled: the bot tells the STT
+    worker to run it (worker_analyzers), the worker's section rides back in the
+    result, and it reaches Claude as the attached JSON — transcript unchanged."""
+    import json
+    import telegram as tg_mod
+    from runtime import rt
+    monkeypatch.setenv("SPEECH_ANALYZERS", "prosody")
+    monkeypatch.setattr(rt, "upload_dir", str(tmp_path))
+    _force_prosody_available(monkeypatch)
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
+    monkeypatch.setattr(bot.mod.stt, "available", lambda: True)
+    seen = {}
+
+    def fake_transcribe(path, **kw):
+        seen.update(kw)  # the worker section is computed in .venv-stt; simulate it
+        return {"text": "привет бот", "language": "ru",
+                "segments": [{"start": 0.0, "end": 1.0, "text": "привет бот",
+                              "words": []}],
+                "prosody": {"pitch_mean_hz": 142.0, "pitch_range_hz": 210.0,
+                            "jitter_pct": 2.1, "hnr_db": 11.5}}
+    monkeypatch.setattr(bot.mod.stt, "transcribe", fake_transcribe)
+
+    bot.mod.media.handle_voice(sess, "v", "", bot.forum_chat_id, 1, sess.topic_id)
+
+    assert seen.get("worker_analyzers") == ["prosody"]
+    users = [h for h in sess.history if h.kind == "user"]
+    assert len(users) == 1
+    text = users[0].text
+    assert "привет бот" in text                       # transcript unchanged
+    assert "[Attached file:" in text and "_speech.json" in text
+    path = text.split("[Attached file:", 1)[1].split("]", 1)[0].strip()
+    with open(path) as f:
+        data = json.load(f)
+    assert data["analyzers"] == ["prosody"]
+    assert data["prosody"]["pitch_mean_hz"] == 142.0
+
+
+def test_voice_prosody_missing_section_degrades(bot, tmp_path, monkeypatch):
+    """prosody enabled + installed, but the worker produced no section (clip too
+    short / parselmouth errored). The turn is the plain transcript with NO
+    attachment — never a broken or empty analysis file."""
+    import telegram as tg_mod
+    from runtime import rt
+    monkeypatch.setenv("SPEECH_ANALYZERS", "prosody")
+    monkeypatch.setattr(rt, "upload_dir", str(tmp_path))
+    _force_prosody_available(monkeypatch)
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
+    monkeypatch.setattr(bot.mod.stt, "available", lambda: True)
+    monkeypatch.setattr(bot.mod.stt, "transcribe",
+                        lambda path, **kw: {"text": "привет бот", "language": "ru",
+                            "segments": [{"start": 0.0, "end": 1.0,
+                                          "text": "привет бот", "words": []}]})
+
+    bot.mod.media.handle_voice(sess, "v", "", bot.forum_chat_id, 1, sess.topic_id)
+
+    users = [h for h in sess.history if h.kind == "user"]
+    assert len(users) == 1
+    assert "[Attached file:" not in users[0].text
+
+
+def test_prosody_worker_real_clip():
+    """Real compute (regression vs. parselmouth/PyAV drift): the .venv-stt
+    worker extracts prosody from an actual TG-format voice clip. Auto-skips
+    where the side-venv / parselmouth / clip aren't present (e.g. CI)."""
+    import glob
+    import json
+    import os
+    import subprocess
+
+    import pytest
+    bot_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    stt_py = os.path.join(bot_dir, ".venv-stt", "bin", "python")
+    clip = os.path.join(bot_dir, "temp", "test_audio", "ru_natural_memo.ogg")
+    has_pm = glob.glob(os.path.join(bot_dir, ".venv-stt", "lib", "python*",
+                                    "site-packages", "parselmouth*"))
+    if not (os.path.isfile(stt_py) and os.path.isfile(clip) and has_pm):
+        pytest.skip("STT venv / parselmouth / test clip not present")
+    r = subprocess.run([stt_py, os.path.join(bot_dir, "speech_worker.py"),
+                        clip, "prosody"],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    p = json.loads(r.stdout)["prosody"]
+    assert p["pitch_mean_hz"] > 0 and p["pitch_range_hz"] > 0
+    assert p["jitter_pct"] is not None and p["hnr_db"] is not None
 
 
 # ── upload retention (#87) ──────────────────────────────────────────

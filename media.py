@@ -101,7 +101,8 @@ class MediaHandlers:
             tg.send("❌ Download failed", chat_id, thread_id=thread_id)
             return
         tg.send_chat_action(chat_id, "typing", thread_id=thread_id)
-        result = stt.transcribe(dest)
+        result = stt.transcribe(dest,
+                                worker_analyzers=speech.active_worker_analyzers())
         if not result or not result.get("text"):
             self.ui.ephemeral(chat_id, "🎙 Could not transcribe the audio",
                               thread_id=thread_id, seconds=8)
@@ -129,7 +130,7 @@ class MediaHandlers:
         if not path:
             return ""
         return (f"[Attached file: {path}]"
-                " (speech analysis — how it was said: tempo, pauses)\n"
+                " (speech analysis — how the message was said)\n"
                 f"{rt.temp_note}")
 
     # ── video transcription + frame sampling (#84) ──────────────────
@@ -151,7 +152,8 @@ class MediaHandlers:
             return
         tg.send_chat_action(chat_id, "typing", thread_id=thread_id)
         # Audio transcript (None if the video has no audio track).
-        result = stt.transcribe(dest)
+        result = stt.transcribe(dest,
+                                worker_analyzers=speech.active_worker_analyzers())
         transcript = (result or {}).get("text", "")
         segments = (result or {}).get("segments") or []
         # Scene-change frames.

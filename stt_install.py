@@ -105,3 +105,19 @@ def install_whisper(model: str) -> bool:
             return False
         _persist_model(model)
         return True
+
+
+def install_analyzer(deps: list[str]) -> bool:
+    """Install a speech-analyzer's pip deps into ``.venv-stt`` (#126).
+
+    Used by ``speech.install`` for worker-side analyzers (e.g. prosody →
+    ``praat-parselmouth``). Pure pip, no model download — analyzers that pull
+    a model handle that themselves (and must target a roomy drive, NOT the
+    space-tight one; see the speech tooling notes). Reuses the same venv,
+    lock and runner as the whisper tiers."""
+    if not deps:
+        return False
+    with _lock:
+        if not _ensure_venv():
+            return False
+        return _run([_STT_PY, "-m", "pip", "install", "-q", *deps])

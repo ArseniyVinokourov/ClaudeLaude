@@ -7,11 +7,13 @@ process honours the project rule that the bot's venv stays light
 (requests + python-dotenv only).
 
 Usage:
-    python transcribe.py <audio_path> [model_name]
+    python transcribe.py <audio_path> [model_name] [--analyzers=id,id]
 
 Prints one JSON line to stdout:
     {"text": "...", "segments": [{"start":s,"end":e,"text":t}], "language":"ru"}
-or on failure:
+With --analyzers, each worker analyzer's section is merged in under its id
+(e.g. "prosody": {...}) — computed in this venv by speech_worker (#126).
+On failure:
     {"error": "..."}   (and exits non-zero)
 """
 import json
@@ -24,7 +26,15 @@ def main() -> None:
         print(json.dumps({"error": "no audio path given"}))
         sys.exit(1)
     audio = sys.argv[1]
-    model_name = (sys.argv[2] if len(sys.argv) > 2
+    # Positional model name + optional --analyzers= flag, order-independent.
+    analyzer_ids: list[str] = []
+    positional: list[str] = []
+    for arg in sys.argv[2:]:
+        if arg.startswith("--analyzers="):
+            analyzer_ids = [x for x in arg.split("=", 1)[1].split(",") if x]
+        else:
+            positional.append(arg)
+    model_name = (positional[0] if positional
                   else os.environ.get("WHISPER_MODEL", "small"))
     if not os.path.isfile(audio):
         print(json.dumps({"error": f"file not found: {audio}"}))
@@ -46,8 +56,19 @@ def main() -> None:
             segs.append({"start": round(s.start, 2), "end": round(s.end, 2),
                          "text": s.text.strip(), "words": words})
         text = " ".join(s["text"] for s in segs).strip()
-        print(json.dumps({"text": text, "segments": segs,
-                          "language": info.language}, ensure_ascii=False))
+        out = {"text": text, "segments": segs, "language": info.language}
+        # Worker-side speech analyzers (#126) — heavy ones live here in the
+        # side-venv. A failure inside never aborts transcription: the section
+        # is simply absent. stdout must stay the single JSON line below, so
+        # speech_worker logs only to stderr.
+        if analyzer_ids:
+            try:
+                import speech_worker
+                out.update(speech_worker.run(audio, analyzer_ids))
+            except Exception as e:  # noqa: BLE001
+                print(f"[transcribe] analyzers failed: {e}",
+                      file=sys.stderr, flush=True)
+        print(json.dumps(out, ensure_ascii=False))
     except Exception as e:  # noqa: BLE001 — report any failure as JSON
         print(json.dumps({"error": str(e)}))
         sys.exit(1)

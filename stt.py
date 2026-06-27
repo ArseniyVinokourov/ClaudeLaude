@@ -41,15 +41,23 @@ def available() -> bool:
             and pkg_present("faster_whisper"))
 
 
-def transcribe(audio_path: str) -> dict | None:
+def transcribe(audio_path: str,
+               worker_analyzers: list[str] | None = None) -> dict | None:
     """Transcribe an audio file. Returns the worker's JSON dict
-    ({"text", "segments", "language"}) or None on any failure."""
+    ({"text", "segments", "language"}) or None on any failure.
+
+    ``worker_analyzers`` (#126) are extra speech analyzers that must run in
+    the side-venv (e.g. ``prosody``); each adds its section to the dict under
+    its id. The bot computes which to pass via ``speech.active_worker_analyzers``.
+    """
     if not available() or not os.path.isfile(audio_path):
         return None
+    cmd = [_STT_PY, _TRANSCRIBE, audio_path, model_name()]
+    if worker_analyzers:
+        cmd.append("--analyzers=" + ",".join(worker_analyzers))
     try:
         r = subprocess.run(
-            [_STT_PY, _TRANSCRIBE, audio_path, model_name()],
-            capture_output=True, text=True, timeout=_TIMEOUT,
+            cmd, capture_output=True, text=True, timeout=_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
         print("[stt] transcribe timed out", file=sys.stderr, flush=True)
