@@ -15,6 +15,7 @@ imported directly.
 import threading
 
 import audit
+import speech
 import stt
 import stt_install
 import telegram as tg
@@ -49,6 +50,7 @@ class SettingsMenu:
             [{"text": "📱 Display default", "callback_data": "st:d"}],
             [{"text": "🎚 Default mode", "callback_data": "st:dm"}],
             [{"text": "🕒 Transcription timeout", "callback_data": "st:st"}],
+            [{"text": "🗣 Speech analysis", "callback_data": "st:sp"}],
             [{"text": "⬆️ Auto-update", "callback_data": "st:au"}],
             CLOSE_ROW,
         ]
@@ -63,8 +65,14 @@ class SettingsMenu:
             f"📱 Display default: <b>{tg.esc(rt.default_display)}</b>\n"
             f"🎚 Default mode: <b>{tg.esc(get_default_mode())}</b>\n"
             f"🕒 Transcription timeout: <b>{stt._TIMEOUT}s</b>\n"
+            f"🗣 Speech analysis: <b>{tg.esc(self._speech_summary())}</b>\n"
             f"⬆️ Auto-update: <b>{au}</b> ({tg.esc(rt.auto_update_policy)})"
         )
+
+    @staticmethod
+    def _speech_summary():
+        active = speech.active_analyzers()
+        return ", ".join(active) if active else "off"
 
     def menu(self, chat_id, thread_id=None):
         mid = tg.send(self._text(), chat_id, thread_id=thread_id,
@@ -139,6 +147,23 @@ class SettingsMenu:
             tg.edit(cb_msg, "⬆️ <b>Auto-update</b>\nCheck hourly and update. On "
                     "local changes: replace (back up + overwrite) or merge "
                     "(wait, /update to review).", cb_chat, buttons=rows)
+        elif which == "sp":
+            active = speech.active_analyzers()
+            rows = [[{"text": f"{'• ' if a['id'] in active else ''}{a['title']}",
+                      "callback_data": f"st:sp:{a['id']}"}]
+                    for a in speech.registry()]
+            rows.append([{"text": "◀ Back", "callback_data": "st:root"}])
+            tg.edit(cb_msg, "🗣 <b>Speech analysis</b>\nExtra signals about HOW a "
+                    "voice/video message was said (tempo, pauses…). Tap to turn "
+                    "each on or off. Results reach Claude as an attached file; "
+                    "the transcript itself is unchanged.", cb_chat, buttons=rows)
+
+    def _toggle_analyzer(self, cb_msg, cb_chat, aid):
+        if not any(a["id"] == aid for a in speech.registry()):
+            return
+        ids = speech.toggle(aid)
+        audit.log("settings", f"speech_analyzers={','.join(ids) or 'off'}")
+        self._show(cb_msg, cb_chat, "sp")
 
     def _set_warn(self, cb_msg, cb_chat, mb):
         rt.upload_warn_bytes = mb * 1024 * 1024
@@ -230,7 +255,7 @@ class SettingsMenu:
     def clicked(self, cb_msg, cb_chat, rest):
         if rest == "root":
             tg.edit(cb_msg, self._text(), cb_chat, buttons=self._root_rows())
-        elif rest in ("m", "w", "t", "d", "dm", "st", "au"):
+        elif rest in ("m", "w", "t", "d", "dm", "st", "sp", "au"):
             self._show(cb_msg, cb_chat, rest)
         elif rest.startswith("m:"):
             self._set_model(cb_msg, cb_chat, rest[2:])
@@ -251,6 +276,8 @@ class SettingsMenu:
                 self._set_stt(cb_msg, cb_chat, int(rest[3:]))
             except ValueError:
                 pass
+        elif rest.startswith("sp:"):
+            self._toggle_analyzer(cb_msg, cb_chat, rest[3:])
         elif rest.startswith("d:"):
             self._set_display(cb_msg, cb_chat, rest[2:])
         elif rest.startswith("au:"):

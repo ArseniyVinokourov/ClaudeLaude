@@ -2122,6 +2122,69 @@ def test_video_frames_only_notes_missing_whisper(bot, tmp_path, monkeypatch):
     assert any("Whisper isn't installed" in n for n in notes), notes
 
 
+# ── speech analysis (#126) ──────────────────────────────────────────
+
+def test_voice_speech_analysis_off_by_default(bot, tmp_path, monkeypatch):
+    """With no analyzers enabled (default), a voice note behaves exactly as
+    before #126: plain transcript turn, no attached analysis file."""
+    import telegram as tg_mod
+    monkeypatch.delenv("SPEECH_ANALYZERS", raising=False)
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
+    monkeypatch.setattr(bot.mod.stt, "available", lambda: True)
+    monkeypatch.setattr(bot.mod.stt, "transcribe",
+                        lambda path: {"text": "привет бот", "segments": [
+                            {"start": 0.0, "end": 1.0, "text": "привет бот",
+                             "words": [{"word": "привет", "start": 0.0, "end": 0.5},
+                                       {"word": "бот", "start": 0.6, "end": 1.0}]}],
+                            "language": "ru"})
+
+    bot.mod.media.handle_voice(sess, "v", "", bot.forum_chat_id, 1, sess.topic_id)
+
+    users = [h for h in sess.history if h.kind == "user"]
+    assert len(users) == 1
+    assert "[Attached file:" not in users[0].text
+
+
+def test_voice_speech_analysis_timing_attaches_json(bot, tmp_path, monkeypatch):
+    """With the `timing` analyzer enabled, a voice note still sends the plain
+    transcript, plus an attached JSON file holding tempo/pauses for Claude."""
+    import json
+    import telegram as tg_mod
+    from runtime import rt
+    monkeypatch.setenv("SPEECH_ANALYZERS", "timing")
+    monkeypatch.setattr(rt, "upload_dir", str(tmp_path))
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
+    monkeypatch.setattr(bot.mod.stt, "available", lambda: True)
+    # 1.5s pause between "как" (ends 0.9) and "дела" (starts 2.4); 4 words / 3.4s.
+    monkeypatch.setattr(bot.mod.stt, "transcribe",
+                        lambda path: {"text": "привет как дела друзья", "language": "ru",
+                            "segments": [{"start": 0.0, "end": 3.4,
+                                "text": "привет как дела друзья", "words": [
+                                    {"word": "привет", "start": 0.0, "end": 0.5},
+                                    {"word": "как", "start": 0.6, "end": 0.9},
+                                    {"word": "дела", "start": 2.4, "end": 2.8},
+                                    {"word": "друзья", "start": 2.9, "end": 3.4}]}]})
+
+    bot.mod.media.handle_voice(sess, "v", "", bot.forum_chat_id, 1, sess.topic_id)
+
+    users = [h for h in sess.history if h.kind == "user"]
+    assert len(users) == 1
+    text = users[0].text
+    assert "привет как дела друзья" in text          # transcript unchanged
+    assert "[Attached file:" in text and "_speech.json" in text
+    path = text.split("[Attached file:", 1)[1].split("]", 1)[0].strip()
+    with open(path) as f:
+        data = json.load(f)
+    assert data["analyzers"] == ["timing"]
+    t = data["timing"]
+    assert t["pause_count"] == 1 and t["longest_pause_sec"] == 1.5
+    assert t["word_count"] == 4 and t["speech_rate_wpm"] == 71
+
+
 # ── upload retention (#87) ──────────────────────────────────────────
 
 def _make_upload(updir, name, age_s, content=b"x"):

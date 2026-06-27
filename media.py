@@ -15,6 +15,7 @@ import time
 
 import audit
 import frames
+import speech
 import stt
 import stt_install
 import telegram as tg
@@ -108,9 +109,28 @@ class MediaHandlers:
         transcript = result["text"]
         body = f"[Voice message transcript]: {transcript}"
         user_text = f"{caption}\n{body}" if caption else body
+        block = self._analysis_block(result, dest)
+        if block:
+            user_text += f"\n{block}"
         audit.log("user_message", f"[voice] {transcript[:200]}", sid=session.sid)
         self.turnctl.enqueue_user_input(session, user_text, chat_id, msg_id,
                                         thread_id)
+
+    # ── speech analysis (#126) ──────────────────────────────────────
+    # Optional, modular "how it was said" layer. Disabled by default; when the
+    # owner enables analyzers in /settings, the full per-segment analysis is
+    # written to a JSON file and referenced as an attachment so Claude reads it
+    # on demand — the turn text stays the plain transcript.
+    def _analysis_block(self, result, audio_path):
+        analysis = speech.analyze(result, audio_path)
+        if not analysis:
+            return ""
+        path = speech.write_analysis_file(analysis, audio_path)
+        if not path:
+            return ""
+        return (f"[Attached file: {path}]"
+                " (speech analysis — how it was said: tempo, pauses)\n"
+                f"{rt.temp_note}")
 
     # ── video transcription + frame sampling (#84) ──────────────────
     # Audio is transcribed (faster-whisper reads the container's audio via
@@ -168,6 +188,9 @@ class MediaHandlers:
                               "🎬 Frames only — Whisper isn't installed, "
                               "speech not transcribed",
                               thread_id=thread_id, seconds=8)
+        block = self._analysis_block(result or {}, dest)
+        if block:
+            parts.append(block)
         user_text = "\n\n".join(parts)
         audit.log(
             "user_message",

@@ -35,9 +35,16 @@ def main() -> None:
         # ~/.cache/huggingface after first download (setup.sh pre-fetches it).
         model = WhisperModel(model_name, device="cpu", compute_type="int8")
         # vad_filter drops long silences so a quiet recording isn't padded.
-        segments, info = model.transcribe(audio, vad_filter=True)
-        segs = [{"start": round(s.start, 2), "end": round(s.end, 2),
-                 "text": s.text.strip()} for s in segments]
+        # word_timestamps gives per-word start/end — needed for pause/tempo
+        # analysis (#126) and measured to add no cost (often faster).
+        segments, info = model.transcribe(audio, vad_filter=True,
+                                          word_timestamps=True)
+        segs = []
+        for s in segments:
+            words = [{"word": w.word, "start": round(w.start, 2),
+                      "end": round(w.end, 2)} for w in (s.words or [])]
+            segs.append({"start": round(s.start, 2), "end": round(s.end, 2),
+                         "text": s.text.strip(), "words": words})
         text = " ".join(s["text"] for s in segs).strip()
         print(json.dumps({"text": text, "segments": segs,
                           "language": info.language}, ensure_ascii=False))
