@@ -12,6 +12,7 @@ Calls block for minutes (pip + model download) — callers run them on a
 daemon thread. A module lock serializes installs; ``busy()`` lets the UI
 refuse a second click instead of queueing.
 """
+import contextlib
 import os
 import subprocess
 import sys
@@ -121,3 +122,36 @@ def install_analyzer(deps: list[str]) -> bool:
         if not _ensure_venv():
             return False
         return _run([_STT_PY, "-m", "pip", "install", "-q", *deps])
+
+
+def download_model(url: str, dest: str) -> bool:
+    """Download an analyzer's model file (e.g. an ONNX SER model) into the
+    side-venv's models dir (#126).
+
+    Some worker analyzers need a model file, not just pip deps (emotion →
+    wav2vec2 ONNX). Streams to ``dest + '.part'`` then renames, so an aborted
+    download never looks complete. Uses ``requests`` (a bot-venv dep) and the
+    same lock/timeout as the pip installs, so only one heavy install runs at a
+    time and ``busy()`` can refuse a second click. The file lands on whatever
+    drive ``.venv-stt`` is on — keep that the roomy one (models are large)."""
+    if not url or not dest:
+        return False
+    if os.path.isfile(dest):
+        return True
+    import requests
+    tmp = dest + ".part"
+    with _lock:
+        try:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with requests.get(url, stream=True, timeout=_TIMEOUT) as r:
+                r.raise_for_status()
+                with open(tmp, "wb") as f:
+                    for chunk in r.iter_content(1 << 20):
+                        f.write(chunk)
+            os.replace(tmp, dest)
+            return True
+        except Exception as e:  # noqa: BLE001
+            _log(f"download_model {url[:60]}... failed: {e}")
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+            return False

@@ -63,8 +63,14 @@ def main() -> None:
         # speech_worker logs only to stderr.
         if analyzer_ids:
             try:
+                import gc
                 import speech_worker
-                out.update(speech_worker.run(audio, analyzer_ids))
+                # Free the whisper model before loading any heavy analyzer
+                # model (e.g. emotion ~200MB) — they shouldn't be co-resident
+                # on a small box. The transcript is already in `out`.
+                del model
+                gc.collect()
+                out.update(speech_worker.run(audio, analyzer_ids, text=text))
             except Exception as e:  # noqa: BLE001
                 print(f"[transcribe] analyzers failed: {e}",
                       file=sys.stderr, flush=True)

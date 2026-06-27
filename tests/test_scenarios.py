@@ -2285,6 +2285,94 @@ def test_prosody_worker_real_clip():
     assert p["jitter_pct"] is not None and p["hnr_db"] is not None
 
 
+def _force_emotion_available(monkeypatch):
+    """Pretend the EN emotion model is downloaded regardless of the host — the
+    registry holds availability by reference, so patch the entry's fn."""
+    import speech
+    for a in speech._REGISTRY:
+        if a["id"] == "emotion":
+            monkeypatch.setitem(a, "available", lambda: True)
+
+
+def test_voice_emotion_attaches_when_enabled(bot, tmp_path, monkeypatch):
+    """With the worker-side `emotion` analyzer enabled and its model present:
+    the bot asks the STT worker to run it, the section rides back in the
+    result, and it reaches Claude as the attached JSON — transcript unchanged."""
+    import json
+    import telegram as tg_mod
+    from runtime import rt
+    monkeypatch.setenv("SPEECH_ANALYZERS", "emotion")
+    monkeypatch.setattr(rt, "upload_dir", str(tmp_path))
+    _force_emotion_available(monkeypatch)
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
+    monkeypatch.setattr(bot.mod.stt, "available", lambda: True)
+    seen = {}
+
+    def fake_transcribe(path, **kw):
+        seen.update(kw)  # the worker section is computed in .venv-stt; simulate it
+        return {"text": "i am so angry right now", "language": "en",
+                "segments": [{"start": 0.0, "end": 2.0,
+                              "text": "i am so angry right now", "words": []}],
+                "emotion": {"top": "angry", "confidence": 0.9,
+                            "distribution": {"angry": 0.9, "neutral": 0.05},
+                            "lang": "en", "model": "wav2vec2-base SER (int8, EN)"}}
+    monkeypatch.setattr(bot.mod.stt, "transcribe", fake_transcribe)
+
+    bot.mod.media.handle_voice(sess, "v", "", bot.forum_chat_id, 1, sess.topic_id)
+
+    assert seen.get("worker_analyzers") == ["emotion"]
+    users = [h for h in sess.history if h.kind == "user"]
+    assert len(users) == 1
+    text = users[0].text
+    assert "i am so angry right now" in text          # transcript unchanged
+    assert "[Attached file:" in text and "_speech.json" in text
+    path = text.split("[Attached file:", 1)[1].split("]", 1)[0].strip()
+    with open(path) as f:
+        data = json.load(f)
+    assert data["analyzers"] == ["emotion"]
+    assert data["emotion"]["top"] == "angry"
+
+
+def test_emotion_worker_gates_on_non_speech(monkeypatch):
+    """The emotion analyzer skips (returns no section) when the caller passes an
+    empty transcript — the model is noise on non-speech, so we don't run it.
+    Pure gate: no model, numpy or audio decode is touched."""
+    import speech_worker
+    # text="" → whisper found no speech → skip before any heavy work.
+    assert speech_worker._emotion(None, {"text": ""}) == {}
+    assert speech_worker._emotion(None, {"text": "   "}) == {}
+
+
+def test_emotion_worker_real_clip():
+    """Real inference (regression vs. onnxruntime / model drift): the .venv-stt
+    worker classifies emotion on an actual clip. Auto-skips where the side-venv
+    / EN model / clip aren't present (e.g. CI, or model not downloaded)."""
+    import json
+    import os
+    import subprocess
+
+    import pytest
+    bot_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    stt_py = os.path.join(bot_dir, ".venv-stt", "bin", "python")
+    clip = os.path.join(bot_dir, "temp", "test_audio", "en_natural_01.ogg")
+    model = os.path.join(bot_dir, ".venv-stt", "models", "emotion", "en",
+                         "model_int8.onnx")
+    if not (os.path.isfile(stt_py) and os.path.isfile(clip)
+            and os.path.isfile(model)):
+        pytest.skip("STT venv / emotion model / test clip not present")
+    r = subprocess.run([stt_py, os.path.join(bot_dir, "speech_worker.py"),
+                        clip, "emotion"],
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stderr
+    e = json.loads(r.stdout)["emotion"]
+    labels = {"sad", "angry", "disgust", "fear", "happy", "neutral"}
+    assert e["top"] in labels
+    assert 0.0 <= e["confidence"] <= 1.0
+    assert abs(sum(e["distribution"].values()) - 1.0) < 0.05  # softmax sums to 1
+
+
 # ── upload retention (#87) ──────────────────────────────────────────
 
 def _make_upload(updir, name, age_s, content=b"x"):

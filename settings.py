@@ -154,7 +154,8 @@ class SettingsMenu:
                 if a["id"] in active:
                     label = f"• {a['title']}"
                 elif a["needs_install"] and not a["available"]:
-                    label = f"{a['title']} — install"
+                    size = f" {a['size_mb']}MB" if a.get("size_mb") else ""
+                    label = f"{a['title']} — install{size}"
                 else:
                     label = a["title"]
                 rows.append([{"text": label,

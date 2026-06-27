@@ -18,11 +18,39 @@ The first analyzer (``prosody``) reads the raw waveform, so this module owns
 same samples to every analyzer. 16k mono is also exactly what the later
 wav2vec2/PANNs ONNX analyzers consume, so the decode is shared, not repeated.
 """
+import contextlib
+import os
 import sys
 
 _TARGET_SR = 16000
 # Below this we have too little voiced signal for stable pitch/jitter stats.
 _MIN_SECONDS = 0.3
+
+_BOT_DIR = os.path.dirname(os.path.abspath(__file__))
+# Mirror of `speech._model_dir` resolved under the .venv-stt interpreter — keep
+# the layout (.venv-stt/models/<id>/<lang>/) in sync with the bot side.
+_STT_VENV = os.environ.get("STT_VENV", os.path.join(_BOT_DIR, ".venv-stt"))
+
+
+@contextlib.contextmanager
+def _heavy_lock():
+    """Serialize heavy model inference across concurrent transcribe.py spawns.
+
+    Each voice/video message spawns its own worker process, so two arriving at
+    once would load two models at the same time — an OOM risk on a small box.
+    A cross-process file lock (flock) lets only one heavy analysis run at a
+    time. POSIX-only (fcntl); this worker only ever runs on Linux/WSL/mac."""
+    import fcntl
+    os.makedirs(os.path.join(_STT_VENV, "models"), exist_ok=True)
+    lock_path = os.path.join(_STT_VENV, "models", ".heavy.lock")
+    f = open(lock_path, "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+    finally:
+        with contextlib.suppress(Exception):
+            fcntl.flock(f, fcntl.LOCK_UN)
+        f.close()
 
 
 class AudioBundle:
@@ -77,7 +105,7 @@ def _round(x, n=1):
 
 
 # ── analyzer: prosody (parselmouth / Praat, Tier A) ───────────────────
-def _prosody(bundle):
+def _prosody(bundle, ctx):
     """Voice tone & quality from the waveform: pitch (F0) level + range,
     loudness, and roughness/strain (jitter, shimmer, HNR). Cheap, no model."""
     import parselmouth
@@ -114,22 +142,84 @@ def _prosody(bundle):
     }
 
 
-_ANALYZERS = {
-    "prosody": _prosody,
+# ── analyzer: emotion (wav2vec2 ONNX, Tier B — onnxruntime, no torch) ──
+# Per-language label order is intrinsic to the model file (matches the source
+# repo's config.json), so it lives here with the inference, not in the bot.
+_EMOTION_LABELS = {
+    "en": ["sad", "angry", "disgust", "fear", "happy", "neutral"],
 }
 
 
-def run(audio_path, ids):
+def _emotion_model_path(lang):
+    return os.path.join(_STT_VENV, "models", "emotion", lang, "model_int8.onnx")
+
+
+def _emotion(bundle, ctx):
+    """Categorical emotion from the waveform via a wav2vec2 ONNX classifier.
+
+    onnxruntime + numpy only (both ship with .venv-stt) — no torch. The model
+    is garbage on non-speech audio, so when the caller passes an empty
+    transcript (``text == ""``) we skip; ``text is None`` means "unknown,
+    don't gate" (manual/CLI use). Output is a hint, not a diagnosis: the EN
+    model is English-trained and only middling on its own labels."""
+    text = ctx.get("text")
+    if text is not None and not text.strip():
+        return {}  # whisper found no speech → emotion would be noise
+    lang = os.environ.get("SPEECH_LANG", "en")
+    labels = _EMOTION_LABELS.get(lang)
+    model_path = _emotion_model_path(lang)
+    if not labels or not os.path.isfile(model_path):
+        return {}
+    samples = bundle.samples
+    if samples.size < bundle.sr * _MIN_SECONDS:
+        return {}
+
+    import numpy as np
+    import onnxruntime as ort
+    x = samples.astype("float32")
+    # Wav2Vec2FeatureExtractor do_normalize: zero-mean / unit-variance.
+    x = (x - x.mean()) / np.sqrt(x.var() + 1e-7)
+    x = x[None, :]
+    with _heavy_lock():  # one heavy model resident at a time (anti-OOM)
+        sess = ort.InferenceSession(model_path,
+                                    providers=["CPUExecutionProvider"])
+        name = sess.get_inputs()[0].name
+        logits = sess.run(None, {name: x})[0][0]
+    p = np.exp(logits - logits.max())
+    p = p / p.sum()
+    order = [int(i) for i in np.argsort(p)[::-1]]
+    return {
+        "top": labels[order[0]],
+        "confidence": _round(float(p[order[0]]), 3),
+        "distribution": {labels[i]: _round(float(p[i]), 3) for i in order},
+        "lang": lang,
+        "model": "wav2vec2-base SER (int8, EN)",
+        "note": ("acoustic hint from tone of voice, not a diagnosis; "
+                 "English-trained — weaker on other languages"),
+    }
+
+
+_ANALYZERS = {
+    "prosody": _prosody,
+    "emotion": _emotion,
+}
+
+
+def run(audio_path, ids, text=None):
     """Run each requested worker analyzer once. Returns ``{id: section}``,
-    omitting any analyzer that is unknown, errors, or yields nothing."""
+    omitting any analyzer that is unknown, errors, or yields nothing.
+
+    ``text`` is the whisper transcript, passed so speech-gated analyzers (e.g.
+    emotion) can skip non-speech audio. None means "not provided — don't gate"."""
     ids = [i for i in (ids or []) if i in _ANALYZERS]
     if not ids:
         return {}
     bundle = AudioBundle(audio_path)
+    ctx = {"text": text}
     out = {}
     for i in ids:
         try:
-            section = _ANALYZERS[i](bundle)
+            section = _ANALYZERS[i](bundle, ctx)
         except Exception as e:  # noqa: BLE001 — never block the turn
             print(f"[speech_worker] {i} failed: {e}",
                   file=sys.stderr, flush=True)
@@ -139,7 +229,7 @@ def run(audio_path, ids):
     return out
 
 
-if __name__ == "__main__":  # manual: python speech_worker.py <clip> prosody
+if __name__ == "__main__":  # manual: python speech_worker.py <clip> prosody emotion
     import json
     _ids = sys.argv[2:] or ["prosody"]
     print(json.dumps(run(sys.argv[1], _ids), ensure_ascii=False, indent=2))

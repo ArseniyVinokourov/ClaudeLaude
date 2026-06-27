@@ -87,6 +87,53 @@ def _prosody_available():
         stt._STT_VENV, "lib", "python*", "site-packages", "parselmouth*")))
 
 
+# ── analyzer: emotion (Phase 3, worker-side — wav2vec2 ONNX in .venv-stt) ─
+# Categorical emotion from the waveform (tone of feeling). The compute lives in
+# `speech_worker._emotion` (onnxruntime + numpy, no torch; both already ship
+# with .venv-stt as faster-whisper deps), so the analyzer needs no pip packages
+# — only the ONNX model file, downloaded on enable. `where: "worker"`.
+#
+# Per-language model: each entry is the int8 ONNX to fetch into
+# `.venv-stt/models/emotion/<lang>/`. EN ships first (de-risked: int8 95MB,
+# 6-class, standard wav2vec2 numpy preprocessing). RU lands later (its model
+# needs self-quantization + an input-format check). Keep the destination
+# layout in sync with `speech_worker._emotion_model_path`.
+_EMOTION_MODELS = {
+    "en": {
+        "file": "model_int8.onnx",
+        "size_mb": 95,
+        "url": ("https://huggingface.co/onnx-community/"
+                "wav2vec2-base-Speech_Emotion_Recognition-ONNX/"
+                "resolve/main/onnx/model_int8.onnx"),
+    },
+}
+
+
+def _model_dir(aid, lang):
+    """Where an analyzer's per-language model file lives inside the side-venv.
+    Mirrored by ``speech_worker`` (which resolves the same path under the
+    .venv-stt interpreter), so any change here must change there too."""
+    import stt
+    return os.path.join(stt._STT_VENV, "models", aid, lang)
+
+
+def speech_lang():
+    """Active analysis language (``SPEECH_LANG``, default en). Read live so a
+    /settings change takes effect without a restart. Currently only emotion
+    is language-specific; EN is the only model that ships today."""
+    return os.environ.get("SPEECH_LANG", "en")
+
+
+def _emotion_available():
+    """True if the active-language emotion model is downloaded. onnxruntime +
+    numpy already ship with .venv-stt (faster-whisper deps), so only the model
+    file gates availability."""
+    lang = speech_lang()
+    m = _EMOTION_MODELS.get(lang)
+    return bool(m) and os.path.isfile(os.path.join(_model_dir("emotion", lang),
+                                                   m["file"]))
+
+
 # ── registry ───────────────────────────────────────────────────────────
 # `where`: "inprocess" runs in the bot on the transcript result; "worker" runs
 # in `.venv-stt` during transcription and arrives pre-computed in `result`.
@@ -98,16 +145,24 @@ _REGISTRY = [
     {"id": "prosody", "title": "Voice tone & pitch", "needs_install": True,
      "where": "worker", "deps": ["praat-parselmouth"],
      "available": _prosody_available, "run": None},
+    {"id": "emotion", "title": "Emotion (tone of feeling)", "needs_install": True,
+     "where": "worker", "deps": [], "models": _EMOTION_MODELS,
+     "available": _emotion_available, "run": None},
 ]
 
 
 def registry():
     """Descriptors for the settings menu: id, title, needs_install, available,
-    where."""
-    return [{"id": a["id"], "title": a["title"],
-             "needs_install": a["needs_install"], "available": a["available"](),
-             "where": a.get("where", "inprocess")}
-            for a in _REGISTRY]
+    where, and (for model-backed analyzers) the active-language download size."""
+    out = []
+    for a in _REGISTRY:
+        m = (a.get("models") or {}).get(speech_lang())
+        out.append({"id": a["id"], "title": a["title"],
+                    "needs_install": a["needs_install"],
+                    "available": a["available"](),
+                    "where": a.get("where", "inprocess"),
+                    "size_mb": m["size_mb"] if m else None})
+    return out
 
 
 def _by_id(aid):
@@ -134,13 +189,31 @@ def active_worker_analyzers():
 
 
 def install(aid):
-    """Install a worker analyzer's deps into ``.venv-stt``. Blocks (pip), so
-    callers run it on a daemon thread. Returns True on success."""
+    """Install a worker analyzer's requirements into ``.venv-stt`` — pip deps
+    and/or model files. Blocks (pip + download), so callers run it on a daemon
+    thread. Returns True only if everything the analyzer needs is present.
+
+    ``deps`` → pip (e.g. prosody → praat-parselmouth). ``models`` → a model
+    file per language downloaded into ``_model_dir`` (e.g. emotion → the EN
+    ONNX). An analyzer may declare either, both, or neither."""
     a = _by_id(aid)
-    if not a or not a.get("deps"):
+    if not a:
         return False
     import stt_install
-    return stt_install.install_analyzer(a["deps"])
+    if a.get("deps") and not stt_install.install_analyzer(a["deps"]):
+        return False
+    # Fetch only the active language's model, not the whole catalog — RU is
+    # 1.27GB and there's no point pulling a language the user isn't using.
+    models = a.get("models") or {}
+    if models:
+        lang = speech_lang()
+        m = models.get(lang)
+        if not m:
+            return False
+        dest = os.path.join(_model_dir(aid, lang), m["file"])
+        if not stt_install.download_model(m["url"], dest):
+            return False
+    return bool(a.get("deps") or models)
 
 
 def set_active(ids):
