@@ -401,6 +401,16 @@ def analyze(result, audio_path):
     out["analyzers"] = ran
     out["language"] = result.get("language")
     out["transcript"] = result.get("text")
+    # Tell Claude to USE the model-based acoustic cues but not over-trust them:
+    # they're informative hints, not facts, and a confident value isn't proof.
+    # Only when such an analyzer ran (timing/fluency are mechanical counts).
+    if {"emotion", "audio_events"} & set(ran):
+        out["note"] = ("The emotion and sound-event readings are genuine cues "
+                       "about HOW this was said — take them into account. They "
+                       "are estimates, not facts: weigh them together with the "
+                       "transcript and context, and treat a confident-looking "
+                       "or extreme value as informative but still uncertain, "
+                       "not as proof.")
     return out
 
 

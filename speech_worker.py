@@ -197,10 +197,14 @@ def _emotion(bundle, ctx):
         "model": "wav2vec2-large-robust MSP-Dimensional (EN+RU)",
         "note": ("tone-of-voice dimensions from the audio, each 0..1: "
                  "arousal = energy/activation, valence = positivity, "
-                 "dominance = assertiveness. A hint, not a diagnosis — "
-                 "separates high vs low energy reliably; positivity is "
-                 "rougher; cannot cleanly tell apart similar-energy feelings "
-                 "(e.g. anger vs fear)."),
+                 "dominance = assertiveness. Use these as a real cue to HOW it "
+                 "was said and factor them into your read. They are estimates, "
+                 "though, not certainties: combine them with the words rather "
+                 "than reading them alone, and don't take a high or extreme "
+                 "value as proof — the model can be confidently wrong. Arousal "
+                 "(energy) is the most dependable dimension; pinning an exact "
+                 "emotion or separating similar-energy feelings (e.g. anger vs "
+                 "fear) is the least."),
     }
 
 
