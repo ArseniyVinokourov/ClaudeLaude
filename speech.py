@@ -215,6 +215,34 @@ def _emotion_available():
                                                    m["file"]))
 
 
+# ── analyzer: audio_events (Phase 3, worker-side — PANNs CNN14 ONNX) ─────
+# Non-speech sound events + ambience (cough, laughter, sigh, music, room tone).
+# Compute lives in `speech_worker._audio_events` (onnxruntime + numpy, no torch;
+# both already ship with .venv-stt). Language-agnostic — sound events aren't
+# tied to a language — so unlike emotion there's no per-lang model, just a fixed
+# set of files fetched on enable into `.venv-stt/models/audio_events/`:
+# the ONNX graph, its external weights (`.onnx.data`, referenced by the graph by
+# relative name, so both must land in the same dir), and the AudioSet labels.
+_PANNS_BASE = ("https://huggingface.co/pranjal-pravesh/"
+               "PANNs_CNN14_ONNX/resolve/main/")
+_AUDIO_EVENTS_FILES = [
+    {"name": "Cnn14_16k.onnx", "url": _PANNS_BASE + "Cnn14_16k.onnx"},
+    {"name": "Cnn14_16k.onnx.data", "url": _PANNS_BASE + "Cnn14_16k.onnx.data"},
+    {"name": "class_labels_indices.csv",
+     "url": ("https://raw.githubusercontent.com/qiuqiangkong/"
+             "audioset_tagging_cnn/master/metadata/class_labels_indices.csv")},
+]
+_AUDIO_EVENTS_SIZE_MB = 327
+
+
+def _audio_events_available():
+    """True once every audio_events model file is present in the side-venv.
+    onnxruntime + numpy already ship with .venv-stt, so only the files gate it."""
+    d = _model_dir("audio_events", "")
+    return all(os.path.isfile(os.path.join(d, f["name"]))
+               for f in _AUDIO_EVENTS_FILES)
+
+
 # ── registry ───────────────────────────────────────────────────────────
 # `where`: "inprocess" runs in the bot on the transcript result; "worker" runs
 # in `.venv-stt` during transcription and arrives pre-computed in `result`.
@@ -232,6 +260,10 @@ _REGISTRY = [
     {"id": "emotion", "title": "Emotion (tone of feeling)", "needs_install": True,
      "where": "worker", "deps": [], "models": _EMOTION_MODELS,
      "available": _emotion_available, "run": None},
+    {"id": "audio_events", "title": "Sounds & ambience", "needs_install": True,
+     "where": "worker", "deps": [], "files": _AUDIO_EVENTS_FILES,
+     "size_mb": _AUDIO_EVENTS_SIZE_MB,
+     "available": _audio_events_available, "run": None},
 ]
 
 
@@ -241,11 +273,14 @@ def registry():
     out = []
     for a in _REGISTRY:
         m = (a.get("models") or {}).get(speech_lang())
+        # Per-language model size (emotion) or a flat descriptor size
+        # (audio_events: one language-agnostic download).
+        size_mb = m["size_mb"] if m else a.get("size_mb")
         out.append({"id": a["id"], "title": a["title"],
                     "needs_install": a["needs_install"],
                     "available": a["available"](),
                     "where": a.get("where", "inprocess"),
-                    "size_mb": m["size_mb"] if m else None})
+                    "size_mb": size_mb})
     return out
 
 
@@ -294,8 +329,18 @@ def install(aid):
     import stt_install
     if a.get("deps") and not stt_install.install_analyzer(a["deps"]):
         return False
-    # Fetch only the active language's model, not the whole catalog — RU is
-    # 1.27GB and there's no point pulling a language the user isn't using.
+    # Language-agnostic file set (audio_events): a fixed list of files fetched
+    # into one model dir — the ONNX graph, its external weights, and labels.
+    files = a.get("files") or []
+    if files:
+        d = _model_dir(aid, "")
+        for f in files:
+            if not stt_install.download_model(f["url"],
+                                              os.path.join(d, f["name"])):
+                return False
+    # Per-language model (emotion): fetch only the active language, not the
+    # whole catalog — RU is 1.27GB and there's no point pulling a language the
+    # user isn't using.
     models = a.get("models") or {}
     if models:
         lang = speech_lang()
@@ -305,7 +350,7 @@ def install(aid):
         dest = os.path.join(_model_dir(aid, lang), m["file"])
         if not stt_install.download_model(m["url"], dest):
             return False
-    return bool(a.get("deps") or models)
+    return bool(a.get("deps") or models or files)
 
 
 def set_active(ids):

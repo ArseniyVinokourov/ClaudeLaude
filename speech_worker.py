@@ -19,6 +19,7 @@ same samples to every analyzer. 16k mono is also exactly what the later
 wav2vec2/PANNs ONNX analyzers consume, so the decode is shared, not repeated.
 """
 import contextlib
+import gc
 import os
 import sys
 
@@ -199,9 +200,88 @@ def _emotion(bundle, ctx):
     }
 
 
+# ── analyzer: audio_events (PANNs CNN14 ONNX, Tier B — onnxruntime, no torch) ─
+# Non-speech sound events + ambience over the whole clip (cough, laughter, sigh,
+# music, room tone…). The 16kHz CNN14 ONNX computes its mel spectrogram INSIDE
+# the graph, so we feed the raw 16k waveform — pure onnxruntime + numpy, no
+# torch/librosa. 527 AudioSet classes; the label order lives in the downloaded
+# class_labels_indices.csv next to the model (verified to match the model's
+# output indices). Output `clip_scores` are already sigmoid (multi-label, NOT
+# softmax — they do not sum to 1).
+#
+# NOT gated on the transcript: a clip that is only coughing has no speech but
+# still has events worth surfacing. The generic speech umbrella labels are
+# dropped (the transcript already conveys speech); everything else is kept.
+_AUDIO_EVENTS_SPEECH_UMBRELLA = {
+    "Speech", "Male speech, man speaking", "Female speech, woman speaking",
+    "Child speech, kid speaking", "Conversation", "Narration, monologue",
+}
+_AUDIO_EVENTS_MIN_SCORE = 0.10
+_AUDIO_EVENTS_MAX = 6
+
+
+def _audio_events_dir():
+    return os.path.join(_STT_VENV, "models", "audio_events")
+
+
+def _audio_events_labels():
+    """index -> display_name from the AudioSet label CSV beside the model."""
+    import csv
+    out = {}
+    path = os.path.join(_audio_events_dir(), "class_labels_indices.csv")
+    with open(path) as f:
+        for row in csv.DictReader(f):
+            out[int(row["index"])] = row["display_name"]
+    return out
+
+
+def _audio_events(bundle, ctx):
+    """Tag non-speech sounds & ambience via PANNs CNN14 (AudioSet, 16kHz ONNX).
+
+    onnxruntime + numpy only (no torch); the mel is computed in-graph, so the
+    raw 16k waveform goes straight in. Reports the highest-scoring events above
+    a threshold, minus the speech umbrella. A hint, not reliable — top-1 can be
+    wrong for short or overlapping sounds."""
+    model = os.path.join(_audio_events_dir(), "Cnn14_16k.onnx")
+    if not os.path.isfile(model):
+        return {}
+    samples = bundle.samples
+    if samples.size < bundle.sr * _MIN_SECONDS:
+        return {}
+
+    import numpy as np
+    import onnxruntime as ort
+    x = samples.astype("float32")[None, :]
+    with _heavy_lock():  # one heavy model resident at a time (anti-OOM)
+        sess = ort.InferenceSession(model,
+                                    providers=["CPUExecutionProvider"])
+        name = sess.get_inputs()[0].name
+        scores = sess.run(["clip_scores"], {name: x})[0][0]
+    labels = _audio_events_labels()
+    events = []
+    for i in (int(j) for j in np.argsort(scores)[::-1]):  # high → low
+        s = float(scores[i])
+        if s < _AUDIO_EVENTS_MIN_SCORE or len(events) >= _AUDIO_EVENTS_MAX:
+            break  # sorted descending: nothing below the threshold remains
+        label = labels.get(i, str(i))
+        if label in _AUDIO_EVENTS_SPEECH_UMBRELLA:
+            continue  # transcript already conveys speech
+        events.append({"label": label, "score": _round(s, 3)})
+    if not events:
+        return {}
+    return {
+        "events": events,
+        "model": "PANNs CNN14 (AudioSet 527, 16kHz)",
+        "note": ("acoustic event tags over the whole clip (non-speech sounds "
+                 "and ambience); a hint, not reliable — the top guess can be "
+                 "wrong for short or overlapping sounds"),
+    }
+
+
 _ANALYZERS = {
     "prosody": _prosody,
     "emotion": _emotion,
+    "audio_events": _audio_events,
 }
 
 
@@ -224,6 +304,10 @@ def run(audio_path, ids, text=None):
             print(f"[speech_worker] {i} failed: {e}",
                   file=sys.stderr, flush=True)
             continue
+        finally:
+            # Heavy analyzers load a model each; reclaim it before the next one
+            # so two model footprints are never co-resident (anti-OOM, §5).
+            gc.collect()
         if section:
             out[i] = section
     return out
