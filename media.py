@@ -101,8 +101,9 @@ class MediaHandlers:
             tg.send("❌ Download failed", chat_id, thread_id=thread_id)
             return
         tg.send_chat_action(chat_id, "typing", thread_id=thread_id)
-        result = stt.transcribe(dest,
-                                worker_analyzers=speech.active_worker_analyzers())
+        result = stt.transcribe(
+            dest, worker_analyzers=speech.active_worker_analyzers(),
+            bias_fillers=speech.fluency_active())
         if not result or not result.get("text"):
             self.ui.ephemeral(chat_id, "🎙 Could not transcribe the audio",
                               thread_id=thread_id, seconds=8)
@@ -152,8 +153,9 @@ class MediaHandlers:
             return
         tg.send_chat_action(chat_id, "typing", thread_id=thread_id)
         # Audio transcript (None if the video has no audio track).
-        result = stt.transcribe(dest,
-                                worker_analyzers=speech.active_worker_analyzers())
+        result = stt.transcribe(
+            dest, worker_analyzers=speech.active_worker_analyzers(),
+            bias_fillers=speech.fluency_active())
         transcript = (result or {}).get("text", "")
         segments = (result or {}).get("segments") or []
         # Scene-change frames.

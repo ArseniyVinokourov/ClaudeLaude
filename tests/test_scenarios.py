@@ -2133,18 +2133,23 @@ def test_voice_speech_analysis_off_by_default(bot, tmp_path, monkeypatch):
     sess = next(iter(bot.mod.mgr._sessions.values()))
     monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
     monkeypatch.setattr(bot.mod.stt, "available", lambda: True)
-    monkeypatch.setattr(bot.mod.stt, "transcribe",
-                        lambda path, **kw: {"text": "привет бот", "segments": [
+    seen = {}
+
+    def fake_transcribe(path, **kw):
+        seen.update(kw)
+        return {"text": "привет бот", "segments": [
                             {"start": 0.0, "end": 1.0, "text": "привет бот",
                              "words": [{"word": "привет", "start": 0.0, "end": 0.5},
                                        {"word": "бот", "start": 0.6, "end": 1.0}]}],
-                            "language": "ru"})
+                            "language": "ru"}
+    monkeypatch.setattr(bot.mod.stt, "transcribe", fake_transcribe)
 
     bot.mod.media.handle_voice(sess, "v", "", bot.forum_chat_id, 1, sess.topic_id)
 
     users = [h for h in sess.history if h.kind == "user"]
     assert len(users) == 1
     assert "[Attached file:" not in users[0].text
+    assert not seen.get("bias_fillers")     # fluency off → no filler bias
 
 
 def test_voice_speech_analysis_timing_attaches_json(bot, tmp_path, monkeypatch):
@@ -2183,6 +2188,115 @@ def test_voice_speech_analysis_timing_attaches_json(bot, tmp_path, monkeypatch):
     t = data["timing"]
     assert t["pause_count"] == 1 and t["longest_pause_sec"] == 1.5
     assert t["word_count"] == 4 and t["speech_rate_wpm"] == 71
+
+
+def test_fluency_run_detects_fillers_repeats_and_clean_speech():
+    """The in-process fluency analyzer: counts EN+RU fillers (incl. multiword)
+    and immediate repeats from word timestamps, stays silent on clean speech
+    (no false positives), and falls back to text when words are absent."""
+    import speech
+    # EN: 'um' + 'you know' bigram = 2 fillers; 'I I' = 1 repeat.
+    en = {"language": "en", "text": "um I I think you know it works",
+          "segments": [{"start": 0.0, "end": 2.6, "text": "", "words": [
+              {"word": "um,", "start": 0.0, "end": 0.3},
+              {"word": " I", "start": 0.5, "end": 0.6},
+              {"word": " I", "start": 0.7, "end": 0.8},
+              {"word": " think", "start": 0.9, "end": 1.2},
+              {"word": " you", "start": 1.4, "end": 1.5},
+              {"word": " know", "start": 1.6, "end": 1.8},
+              {"word": " it", "start": 2.0, "end": 2.1},
+              {"word": " works", "start": 2.2, "end": 2.6}]}]}
+    r = speech._fluency_run(en, "x")
+    assert r["filler_count"] == 2
+    assert [f["filler"] for f in r["fillers"]] == ["um", "you know"]
+    assert r["fillers"][0]["at_sec"] == 0.0           # timecode carried
+    assert r["repeat_count"] == 1 and r["repeats"][0]["word"] == "i"
+    assert r["word_count"] == 8 and r["filler_rate_per_100w"] == 25.0
+
+    # RU: 'ну' + 'э-э'(→ээ) + 'это самое' bigram = 3 fillers.
+    ru = {"language": "ru", "text": "", "segments": [{"start": 0, "end": 2,
+          "text": "", "words": [
+              {"word": "ну", "start": 0.0, "end": 0.2},
+              {"word": " э-э", "start": 0.3, "end": 0.6},
+              {"word": " это", "start": 0.8, "end": 1.0},
+              {"word": " самое", "start": 1.1, "end": 1.4},
+              {"word": " готово", "start": 1.6, "end": 2.0}]}]}
+    assert [f["filler"] for f in speech._fluency_run(ru, "x")["fillers"]] == \
+        ["ну", "ээ", "это самое"]
+
+    # Clean speech: zero fillers, zero repeats — conservative lexicon.
+    clean = {"language": "en", "text": "the quick brown fox jumps",
+             "segments": [{"start": 0, "end": 1.4, "text":
+                 "the quick brown fox jumps", "words": [
+                 {"word": "the", "start": 0, "end": 0.2},
+                 {"word": " quick", "start": 0.3, "end": 0.5},
+                 {"word": " brown", "start": 0.6, "end": 0.8},
+                 {"word": " fox", "start": 0.9, "end": 1.0},
+                 {"word": " jumps", "start": 1.1, "end": 1.4}]}]}
+    c = speech._fluency_run(clean, "x")
+    assert c["filler_count"] == 0 and c["repeat_count"] == 0
+
+    # No per-word timestamps → tokenise the text, timecodes are null.
+    nowords = {"language": "en", "text": "um so it works works",
+               "segments": [{"start": 0, "end": 2, "text": "um so it works works"}]}
+    n = speech._fluency_run(nowords, "x")
+    assert n["filler_count"] == 1 and n["repeat_count"] == 1
+    assert n["fillers"][0]["at_sec"] is None
+
+
+def test_fluency_active_drives_filler_bias(monkeypatch):
+    """`fluency_active()` reflects SPEECH_ANALYZERS — it's the switch that tells
+    the STT worker to keep fillers in the transcript."""
+    import speech
+    monkeypatch.setenv("SPEECH_ANALYZERS", "timing,prosody")
+    assert speech.fluency_active() is False
+    monkeypatch.setenv("SPEECH_ANALYZERS", "timing,fluency")
+    assert speech.fluency_active() is True
+
+
+def test_voice_fluency_attaches_json(bot, tmp_path, monkeypatch):
+    """With the in-process `fluency` analyzer enabled, a voice note sends the
+    plain transcript plus an attached JSON holding filler/repeat counts."""
+    import json
+    import telegram as tg_mod
+    from runtime import rt
+    monkeypatch.setenv("SPEECH_ANALYZERS", "fluency")
+    monkeypatch.setattr(rt, "upload_dir", str(tmp_path))
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
+    monkeypatch.setattr(bot.mod.stt, "available", lambda: True)
+    seen = {}
+
+    def fake_transcribe(path, **kw):
+        seen.update(kw)
+        return {"text": "um well it it works", "language": "en",
+            "segments": [{"start": 0.0, "end": 2.0,
+                "text": "um well it it works", "words": [
+                    {"word": "um", "start": 0.0, "end": 0.3},
+                    {"word": " well", "start": 0.5, "end": 0.8},
+                    {"word": " it", "start": 1.0, "end": 1.1},
+                    {"word": " it", "start": 1.2, "end": 1.3},
+                    {"word": " works", "start": 1.5, "end": 2.0}]}]}
+    monkeypatch.setattr(bot.mod.stt, "transcribe", fake_transcribe)
+
+    bot.mod.media.handle_voice(sess, "v", "", bot.forum_chat_id, 1, sess.topic_id)
+
+    # fluency on → the bot asks the worker to keep fillers in the transcript.
+    assert seen.get("bias_fillers") is True
+    users = [h for h in sess.history if h.kind == "user"]
+    assert len(users) == 1
+    text = users[0].text
+    assert "um well it it works" in text             # transcript unchanged
+    assert "[Attached file:" in text and "_speech.json" in text
+    path = text.split("[Attached file:", 1)[1].split("]", 1)[0].strip()
+    with open(path) as f:
+        data = json.load(f)
+    assert data["analyzers"] == ["fluency"]
+    fl = data["fluency"]
+    # 'um' is a filler; 'well' is NOT (conservative lexicon); 'it it' is a repeat.
+    assert fl["filler_count"] == 1 and fl["fillers"][0]["filler"] == "um"
+    assert fl["repeat_count"] == 1 and fl["repeats"][0]["word"] == "it"
 
 
 def _force_prosody_available(monkeypatch):

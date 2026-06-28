@@ -26,6 +26,7 @@ absent, so one failure never blocks the turn.
 import glob
 import json
 import os
+import re
 import sys
 
 # A gap between consecutive words at/above this counts as a deliberate pause.
@@ -70,6 +71,86 @@ def _timing_run(result, audio_path):
         "longest_pause_sec": max((p["len_sec"] for p in pauses), default=0.0),
         "total_pause_sec": round(sum(p["len_sec"] for p in pauses), 2),
         "pauses": pauses,
+    }
+
+
+# ── analyzer: fluency (Phase 3, in-process, no deps) ──────────────────
+# Fillers / hesitations / immediate repeats from the transcript ALONE — no
+# audio decode, no model (Tier A), so it runs here in the bot like `timing`.
+# The lexicon is deliberately CONSERVATIVE: only high-precision hesitation
+# markers (EN + RU), so the signal under-counts rather than flagging ordinary
+# words ("like", "well", "so", "вот", "значит") as fillers. Output is a hint
+# for Claude (counts + where), not a verdict on the speaker.
+_FLUENCY_FILLERS = {
+    # EN non-lexical hesitations
+    "um", "umm", "ummm", "uh", "uhh", "uhhh", "uhm", "uhmm",
+    "er", "err", "erm", "ermm", "hmm", "hmmm", "mhm", "mm", "mmm",
+    # RU non-lexical hesitations + the dominant RU particle fillers
+    "э", "ээ", "эээ", "эм", "эмм", "эммм", "мм", "ммм",
+    "аа", "ааа", "ну", "нуу", "нууу", "типа",
+}
+# Multiword fillers, matched on the normalized token-bigram stream. Kept small
+# and high-precision (leading-position discourse markers, rarely literal).
+_FLUENCY_MULTIWORD = {
+    "you know",                 # EN
+    "как бы", "это самое",      # RU
+}
+
+
+def _norm(word):
+    """Lowercase + strip everything but letters/digits, so 'Um,' → 'um' and
+    'э-э' → 'ээ'. `\\w` matches Cyrillic too (str patterns are Unicode)."""
+    return re.sub(r"[^\w]", "", (word or "").lower())
+
+
+def _fluency_tokens(result):
+    """(normalized_token, start_sec | None) stream. Prefer per-word timestamps;
+    fall back to splitting the transcript text (no timecodes) when segments
+    carry no word detail. Empty tokens (pure punctuation) are dropped."""
+    words = _flatten_words(result.get("segments"))
+    if words:
+        out = [(_norm(w["word"]), w["start"]) for w in words]
+    else:
+        out = [(_norm(t), None) for t in (result.get("text") or "").split()]
+    return [(n, s) for (n, s) in out if n]
+
+
+def _fluency_available():
+    return True
+
+
+def _fluency_run(result, audio_path):
+    """Count filler words / hesitations / immediate word repeats. Pure
+    text+timestamp rules — no audio, no model."""
+    toks = _fluency_tokens(result)
+    wc = len(toks)
+    if not wc:
+        return {}
+    fillers, repeats = [], []
+    i = 0
+    while i < wc:
+        norm, at = toks[i]
+        at_sec = round(at, 2) if at is not None else None
+        if i + 1 < wc and f"{norm} {toks[i + 1][0]}" in _FLUENCY_MULTIWORD:
+            fillers.append({"filler": f"{norm} {toks[i + 1][0]}",
+                            "at_sec": at_sec})
+            i += 2
+            continue
+        if norm in _FLUENCY_FILLERS:
+            fillers.append({"filler": norm, "at_sec": at_sec})
+        elif i > 0 and norm == toks[i - 1][0]:
+            repeats.append({"word": norm, "at_sec": at_sec})
+        i += 1
+    return {
+        "word_count": wc,
+        "filler_count": len(fillers),
+        "filler_rate_per_100w": round(len(fillers) / wc * 100, 1),
+        "fillers": fillers,
+        "repeat_count": len(repeats),
+        "repeats": repeats,
+        "note": ("rule-based on the transcript, no model; conservative EN+RU "
+                 "hesitation lexicon (under-counts rather than over-flags). "
+                 "Repeats may be emphatic, not disfluent."),
     }
 
 
@@ -142,6 +223,9 @@ _REGISTRY = [
     {"id": "timing", "title": "Tempo & pauses", "needs_install": False,
      "where": "inprocess", "deps": [],
      "available": _timing_available, "run": _timing_run},
+    {"id": "fluency", "title": "Fillers & hesitation", "needs_install": False,
+     "where": "inprocess", "deps": [],
+     "available": _fluency_available, "run": _fluency_run},
     {"id": "prosody", "title": "Voice tone & pitch", "needs_install": True,
      "where": "worker", "deps": ["praat-parselmouth"],
      "available": _prosody_available, "run": None},
@@ -174,6 +258,14 @@ def active_analyzers():
     /settings toggle takes effect without a restart."""
     raw = os.environ.get("SPEECH_ANALYZERS", "")
     return [x for x in (s.strip() for s in raw.split(",")) if x]
+
+
+def fluency_active():
+    """True if the in-process ``fluency`` analyzer is enabled. The STT worker
+    reads this to bias Whisper toward keeping fillers (um/uh/э-э) in the
+    transcript — Whisper normalizes them out by default, so without the bias the
+    fluency analyzer has almost nothing to count (#126, measured on real clips)."""
+    return "fluency" in active_analyzers()
 
 
 def active_worker_analyzers():

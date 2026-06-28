@@ -8,11 +8,14 @@ process honours the project rule that the bot's venv stays light
 
 Usage:
     python transcribe.py <audio_path> [model_name] [--analyzers=id,id]
+                         [--bias-fillers]
 
 Prints one JSON line to stdout:
     {"text": "...", "segments": [{"start":s,"end":e,"text":t}], "language":"ru"}
 With --analyzers, each worker analyzer's section is merged in under its id
 (e.g. "prosody": {...}) — computed in this venv by speech_worker (#126).
+With --bias-fillers, Whisper is nudged to keep filler words in the transcript
+(see _FILLER_BIAS_PROMPT) — used when the fluency analyzer is on.
 On failure:
     {"error": "..."}   (and exits non-zero)
 """
@@ -20,18 +23,29 @@ import json
 import os
 import sys
 
+# Whisper smooths filler words (um/uh/э-э) out of the transcript by default.
+# When the fluency analyzer (#126) is on, this priming text biases the decoder
+# to keep them. Measured on real clips: recovers disfluencies (e.g. "er") in
+# spontaneous speech WITHOUT hallucinating fillers into clean speech, and does
+# not break RU language detection (a deliberately bilingual EN+RU prime).
+_FILLER_BIAS_PROMPT = ("Okay so, um, uh, er, hmm, like, you know, I mean... "
+                       "Ну вот, э-э, эм, мм, как бы, типа, значит, это самое...")
+
 
 def main() -> None:
     if len(sys.argv) < 2:
         print(json.dumps({"error": "no audio path given"}))
         sys.exit(1)
     audio = sys.argv[1]
-    # Positional model name + optional --analyzers= flag, order-independent.
+    # Positional model name + optional flags, order-independent.
     analyzer_ids: list[str] = []
+    bias_fillers = False
     positional: list[str] = []
     for arg in sys.argv[2:]:
         if arg.startswith("--analyzers="):
             analyzer_ids = [x for x in arg.split("=", 1)[1].split(",") if x]
+        elif arg == "--bias-fillers":
+            bias_fillers = True
         else:
             positional.append(arg)
     model_name = (positional[0] if positional
@@ -47,8 +61,9 @@ def main() -> None:
         # vad_filter drops long silences so a quiet recording isn't padded.
         # word_timestamps gives per-word start/end — needed for pause/tempo
         # analysis (#126) and measured to add no cost (often faster).
-        segments, info = model.transcribe(audio, vad_filter=True,
-                                          word_timestamps=True)
+        segments, info = model.transcribe(
+            audio, vad_filter=True, word_timestamps=True,
+            initial_prompt=_FILLER_BIAS_PROMPT if bias_fillers else None)
         segs = []
         for s in segments:
             words = [{"word": w.word, "start": round(w.start, 2),
