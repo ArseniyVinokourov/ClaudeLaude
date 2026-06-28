@@ -143,33 +143,32 @@ def _prosody(bundle, ctx):
     }
 
 
-# ── analyzer: emotion (wav2vec2 ONNX, Tier B — onnxruntime, no torch) ──
-# Per-language label order is intrinsic to the model file (matches the source
-# repo's config.json), so it lives here with the inference, not in the bot.
-_EMOTION_LABELS = {
-    "en": ["sad", "angry", "disgust", "fear", "happy", "neutral"],
-}
-
-
-def _emotion_model_path(lang):
-    return os.path.join(_STT_VENV, "models", "emotion", lang, "model_int8.onnx")
+# ── analyzer: emotion (wav2vec2-large MSP-Dimensional ONNX, EN+RU) ─────
+# Tone-of-voice as 3 continuous dimensions, NOT categories: audeering's
+# wav2vec2-large-robust trained on MSP-Podcast (spontaneous speech). The
+# acoustic dimensions transfer across languages (verified usable on EN + RU),
+# unlike categorical SER which is language-bound. onnxruntime + numpy only
+# (no torch). The model emits two outputs — a [1,1024] embedding and the
+# [1,3] dimension scores (index order 0=arousal, 1=dominance, 2=valence).
+def _emotion_model_path():
+    return os.path.join(_STT_VENV, "models", "emotion", "model.onnx")
 
 
 def _emotion(bundle, ctx):
-    """Categorical emotion from the waveform via a wav2vec2 ONNX classifier.
+    """Tone-of-voice emotion as 3 dimensions in 0..1: arousal (energy /
+    activation), dominance (assertiveness), valence (positivity).
 
-    onnxruntime + numpy only (both ship with .venv-stt) — no torch. The model
-    is garbage on non-speech audio, so when the caller passes an empty
-    transcript (``text == ""``) we skip; ``text is None`` means "unknown,
-    don't gate" (manual/CLI use). Output is a hint, not a diagnosis: the EN
-    model is English-trained and only middling on its own labels."""
+    onnxruntime + numpy only (both ship with .venv-stt) — no torch. Gated on the
+    transcript: the dimensions are meaningless on non-speech, so an empty
+    transcript (``text == ""``) skips it; ``text is None`` means "unknown,
+    don't gate" (manual/CLI use). A hint, not a diagnosis — separates high vs
+    low energy reliably; positivity is rougher; it cannot cleanly tell apart
+    similar-energy feelings (e.g. anger vs fear)."""
     text = ctx.get("text")
     if text is not None and not text.strip():
-        return {}  # whisper found no speech → emotion would be noise
-    lang = os.environ.get("SPEECH_LANG", "en")
-    labels = _EMOTION_LABELS.get(lang)
-    model_path = _emotion_model_path(lang)
-    if not labels or not os.path.isfile(model_path):
+        return {}  # whisper found no speech → the dimensions would be noise
+    model_path = _emotion_model_path()
+    if not os.path.isfile(model_path):
         return {}
     samples = bundle.samples
     if samples.size < bundle.sr * _MIN_SECONDS:
@@ -180,23 +179,28 @@ def _emotion(bundle, ctx):
     x = samples.astype("float32")
     # Wav2Vec2FeatureExtractor do_normalize: zero-mean / unit-variance.
     x = (x - x.mean()) / np.sqrt(x.var() + 1e-7)
-    x = x[None, :]
     with _heavy_lock():  # one heavy model resident at a time (anti-OOM)
         sess = ort.InferenceSession(model_path,
                                     providers=["CPUExecutionProvider"])
         name = sess.get_inputs()[0].name
-        logits = sess.run(None, {name: x})[0][0]
-    p = np.exp(logits - logits.max())
-    p = p / p.sum()
-    order = [int(i) for i in np.argsort(p)[::-1]]
+        outs = sess.run(None, {name: x[None, :]})
+    # Pick the [1,3] dimension output (the other output is a [1,1024] embedding).
+    dims = next(np.asarray(o)[0] for o in outs
+                if np.asarray(o).ndim == 2 and np.asarray(o).shape[1] == 3)
+
+    def clamp01(v):
+        return _round(min(1.0, max(0.0, float(v))), 2)
     return {
-        "top": labels[order[0]],
-        "confidence": _round(float(p[order[0]]), 3),
-        "distribution": {labels[i]: _round(float(p[i]), 3) for i in order},
-        "lang": lang,
-        "model": "wav2vec2-base SER (int8, EN)",
-        "note": ("acoustic hint from tone of voice, not a diagnosis; "
-                 "English-trained — weaker on other languages"),
+        "arousal": clamp01(dims[0]),
+        "dominance": clamp01(dims[1]),
+        "valence": clamp01(dims[2]),
+        "model": "wav2vec2-large-robust MSP-Dimensional (EN+RU)",
+        "note": ("tone-of-voice dimensions from the audio, each 0..1: "
+                 "arousal = energy/activation, valence = positivity, "
+                 "dominance = assertiveness. A hint, not a diagnosis — "
+                 "separates high vs low energy reliably; positivity is "
+                 "rougher; cannot cleanly tell apart similar-energy feelings "
+                 "(e.g. anger vs fear)."),
     }
 
 

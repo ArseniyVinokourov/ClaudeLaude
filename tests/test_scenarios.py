@@ -2429,9 +2429,8 @@ def test_voice_emotion_attaches_when_enabled(bot, tmp_path, monkeypatch):
         return {"text": "i am so angry right now", "language": "en",
                 "segments": [{"start": 0.0, "end": 2.0,
                               "text": "i am so angry right now", "words": []}],
-                "emotion": {"top": "angry", "confidence": 0.9,
-                            "distribution": {"angry": 0.9, "neutral": 0.05},
-                            "lang": "en", "model": "wav2vec2-base SER (int8, EN)"}}
+                "emotion": {"arousal": 0.87, "dominance": 0.86, "valence": 0.21,
+                            "model": "wav2vec2-large-robust MSP-Dimensional (EN+RU)"}}
     monkeypatch.setattr(bot.mod.stt, "transcribe", fake_transcribe)
 
     bot.mod.media.handle_voice(sess, "v", "", bot.forum_chat_id, 1, sess.topic_id)
@@ -2446,7 +2445,7 @@ def test_voice_emotion_attaches_when_enabled(bot, tmp_path, monkeypatch):
     with open(path) as f:
         data = json.load(f)
     assert data["analyzers"] == ["emotion"]
-    assert data["emotion"]["top"] == "angry"
+    assert data["emotion"]["arousal"] == 0.87 and data["emotion"]["valence"] == 0.21
 
 
 def test_emotion_worker_gates_on_non_speech(monkeypatch):
@@ -2461,8 +2460,9 @@ def test_emotion_worker_gates_on_non_speech(monkeypatch):
 
 def test_emotion_worker_real_clip():
     """Real inference (regression vs. onnxruntime / model drift): the .venv-stt
-    worker classifies emotion on an actual clip. Auto-skips where the side-venv
-    / EN model / clip aren't present (e.g. CI, or model not downloaded)."""
+    worker emits tone-of-voice dimensions on actual clips, and an angry clip
+    reads as higher-arousal than a sad one (the model's core, language-robust
+    signal). Auto-skips where the side-venv / model / clips aren't present."""
     import json
     import os
     import subprocess
@@ -2470,21 +2470,39 @@ def test_emotion_worker_real_clip():
     import pytest
     bot_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     stt_py = os.path.join(bot_dir, ".venv-stt", "bin", "python")
-    clip = os.path.join(bot_dir, "temp", "test_audio", "en_natural_01.ogg")
-    model = os.path.join(bot_dir, ".venv-stt", "models", "emotion", "en",
-                         "model_int8.onnx")
-    if not (os.path.isfile(stt_py) and os.path.isfile(clip)
-            and os.path.isfile(model)):
-        pytest.skip("STT venv / emotion model / test clip not present")
-    r = subprocess.run([stt_py, os.path.join(bot_dir, "speech_worker.py"),
-                        clip, "emotion"],
-                       capture_output=True, text=True, timeout=120)
-    assert r.returncode == 0, r.stderr
-    e = json.loads(r.stdout)["emotion"]
-    labels = {"sad", "angry", "disgust", "fear", "happy", "neutral"}
-    assert e["top"] in labels
-    assert 0.0 <= e["confidence"] <= 1.0
-    assert abs(sum(e["distribution"].values()) - 1.0) < 0.05  # softmax sums to 1
+    audio = os.path.join(bot_dir, "temp", "test_audio")
+    model = os.path.join(bot_dir, ".venv-stt", "models", "emotion", "model.onnx")
+    manifest = os.path.join(audio, "manifest.json")
+    if not (os.path.isfile(stt_py) and os.path.isfile(model)
+            and os.path.isfile(manifest)):
+        pytest.skip("STT venv / emotion model / test clips not present")
+
+    man = json.load(open(manifest))
+
+    def pick(label):
+        for m in man:
+            if m["category"] == "emotion" and m["claimed"] in label:
+                p = os.path.join(audio, m["file"])
+                if os.path.isfile(p):
+                    return p
+        return None
+
+    angry, sad = pick({"anger", "angry"}), pick({"sad", "sadness"})
+    if not (angry and sad):
+        pytest.skip("labelled anger/sad clips not present")
+
+    def dims(clip):
+        r = subprocess.run([stt_py, os.path.join(bot_dir, "speech_worker.py"),
+                            clip, "emotion"],
+                           capture_output=True, text=True, timeout=120)
+        assert r.returncode == 0, r.stderr
+        return json.loads(r.stdout)["emotion"]
+
+    a, s = dims(angry), dims(sad)
+    for e in (a, s):
+        for k in ("arousal", "dominance", "valence"):
+            assert 0.0 <= e[k] <= 1.0
+    assert a["arousal"] > s["arousal"]  # anger is higher-energy than sadness
 
 
 def _force_audio_events_available(monkeypatch):

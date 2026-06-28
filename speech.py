@@ -168,26 +168,25 @@ def _prosody_available():
         stt._STT_VENV, "lib", "python*", "site-packages", "parselmouth*")))
 
 
-# ── analyzer: emotion (Phase 3, worker-side — wav2vec2 ONNX in .venv-stt) ─
-# Categorical emotion from the waveform (tone of feeling). The compute lives in
-# `speech_worker._emotion` (onnxruntime + numpy, no torch; both already ship
-# with .venv-stt as faster-whisper deps), so the analyzer needs no pip packages
-# — only the ONNX model file, downloaded on enable. `where: "worker"`.
+# ── analyzer: emotion (Phase 3, worker-side — wav2vec2-large MSP-dim ONNX) ─
+# Tone-of-voice as continuous dimensions (arousal/dominance/valence), NOT
+# categories. The compute lives in `speech_worker._emotion` (onnxruntime + numpy,
+# no torch; both already ship with .venv-stt as faster-whisper deps), so the
+# analyzer needs no pip packages — only the ONNX model, downloaded on enable.
 #
-# Per-language model: each entry is the int8 ONNX to fetch into
-# `.venv-stt/models/emotion/<lang>/`. EN ships first (de-risked: int8 95MB,
-# 6-class, standard wav2vec2 numpy preprocessing). RU lands later (its model
-# needs self-quantization + an input-format check). Keep the destination
-# layout in sync with `speech_worker._emotion_model_path`.
-_EMOTION_MODELS = {
-    "en": {
-        "file": "model_int8.onnx",
-        "size_mb": 95,
-        "url": ("https://huggingface.co/onnx-community/"
-                "wav2vec2-base-Speech_Emotion_Recognition-ONNX/"
-                "resolve/main/onnx/model_int8.onnx"),
-    },
-}
+# ONE language-agnostic model (audeering wav2vec2-large-robust, trained on
+# spontaneous English but the acoustic dimensions transfer — verified usable on
+# EN + RU, far better than the old EN-only categorical model which scored 50% and
+# couldn't touch Russian). Single-file ONNX (no external data), so it uses the
+# same lang-agnostic `files` mechanism as audio_events; keep the destination
+# name in sync with `speech_worker._emotion_model_path`.
+_EMOTION_FILES = [
+    {"name": "model.onnx",
+     "url": ("https://huggingface.co/steveway/"
+             "wav2vec2-large-robust-12-ft-emotion-msp-dim_onnx/resolve/main/"
+             "wav2vec2-large-robust-12-ft-emotion-msp-dim.onnx")},
+]
+_EMOTION_SIZE_MB = 631
 
 
 def _model_dir(aid, lang):
@@ -206,13 +205,9 @@ def speech_lang():
 
 
 def _emotion_available():
-    """True if the active-language emotion model is downloaded. onnxruntime +
-    numpy already ship with .venv-stt (faster-whisper deps), so only the model
-    file gates availability."""
-    lang = speech_lang()
-    m = _EMOTION_MODELS.get(lang)
-    return bool(m) and os.path.isfile(os.path.join(_model_dir("emotion", lang),
-                                                   m["file"]))
+    """True once the emotion model file is present. onnxruntime + numpy already
+    ship with .venv-stt (faster-whisper deps), so only the file gates it."""
+    return os.path.isfile(os.path.join(_model_dir("emotion", ""), "model.onnx"))
 
 
 # ── analyzer: audio_events (Phase 3, worker-side — PANNs CNN14 ONNX) ─────
@@ -258,7 +253,8 @@ _REGISTRY = [
      "where": "worker", "deps": ["praat-parselmouth"],
      "available": _prosody_available, "run": None},
     {"id": "emotion", "title": "Emotion (tone of feeling)", "needs_install": True,
-     "where": "worker", "deps": [], "models": _EMOTION_MODELS,
+     "where": "worker", "deps": [], "files": _EMOTION_FILES,
+     "size_mb": _EMOTION_SIZE_MB,
      "available": _emotion_available, "run": None},
     {"id": "audio_events", "title": "Sounds & ambience", "needs_install": True,
      "where": "worker", "deps": [], "files": _AUDIO_EVENTS_FILES,
