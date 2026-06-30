@@ -194,8 +194,9 @@ _EMOTION_MODELS = {
     },
     "accurate": {
         "title": "Accurate · multilingual (RU) · 4 GB",
-        "size_mb": 4000, "venv": "ser", "deps": ["torch", "transformers==4.48.3",
-                                                  "torchaudio", "omegaconf"],
+        "size_mb": 4000, "venv": "ser",
+        "deps": ["torch", "transformers==4.48.3", "torchaudio", "omegaconf",
+                 "peft", "accelerate"],  # MERaLiON's custom modeling imports peft
         "repo": "MERaLiON/MERaLiON-SER-v1",
     },
 }
