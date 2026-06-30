@@ -151,6 +151,16 @@ class SettingsMenu:
             active = speech.active_analyzers()
             rows = []
             for a in speech.registry():
+                if a.get("model_choice"):       # emotion: a model picker
+                    m = speech.emotion_model()
+                    if not m:
+                        label = f"{a['title']} — off"
+                    elif a["available"]:
+                        label = f"• {a['title']}: {m}"
+                    else:
+                        label = f"• {a['title']}: {m} — installing…"
+                    rows.append([{"text": label, "callback_data": "st:spm"}])
+                    continue
                 if a["id"] in active:
                     label = f"• {a['title']}"
                 elif a["needs_install"] and not a["available"]:
@@ -165,6 +175,21 @@ class SettingsMenu:
                     "voice/video message was said (tempo, pauses, tone…). Tap to "
                     "turn each on or off. Results reach Claude as an attached "
                     "file; the transcript itself is unchanged.", cb_chat,
+                    buttons=rows)
+        elif which == "spm":
+            cur = speech.emotion_model()
+            rows = []
+            for mid, spec in speech.emotion_models().items():
+                mark = "• " if mid == cur else ""
+                rows.append([{"text": f"{mark}{spec['title']}",
+                              "callback_data": f"st:spm:{mid}"}])
+            rows.append([{"text": f"{'• ' if not cur else ''}Off",
+                          "callback_data": "st:spm:off"}])
+            rows.append([{"text": "◀ Back", "callback_data": "st:sp"}])
+            tg.edit(cb_msg, "🗣 <b>Emotion model</b>\nWhich model names the "
+                    "emotion. <b>Light</b> — English, 0.4 GB, no extra deps. "
+                    "<b>Accurate</b> — multilingual incl. Russian, ~4 GB (extra "
+                    "download). <b>Off</b> — no emotion analysis.", cb_chat,
                     buttons=rows)
 
     def _toggle_analyzer(self, cb_msg, cb_chat, aid):
@@ -193,6 +218,39 @@ class SettingsMenu:
         audit.log("settings",
                   f"speech_install {'ok' if ok else 'FAILED'} aid={aid}")
         self._show(cb_msg, cb_chat, "sp")
+
+    def _set_emotion_model(self, cb_msg, cb_chat, model):
+        """Pick the emotion model (or 'off'). Sets the choice, then installs in
+        the background if that model isn't present yet (the menu refreshes when
+        done)."""
+        if model == "off":
+            speech.set_emotion_model("")
+            audit.log("settings", "emotion_model=off")
+            self._show(cb_msg, cb_chat, "spm")
+            return
+        if model not in speech.emotion_models():
+            return
+        speech.set_emotion_model(model)
+        if not speech.emotion_ready():
+            if stt_install.busy():
+                self._show(cb_msg, cb_chat, "spm")
+                return
+            tg.edit(cb_msg, f"⬇️ Installing emotion model <b>{tg.esc(model)}</b>…"
+                    "\nThis can take a while — the menu refreshes when it's done.",
+                    cb_chat)
+            threading.Thread(target=self._install_emotion_done,
+                             args=(cb_msg, cb_chat, model), daemon=True).start()
+            return
+        audit.log("settings", f"emotion_model={model}")
+        self._show(cb_msg, cb_chat, "spm")
+
+    def _install_emotion_done(self, cb_msg, cb_chat, model):
+        ok = speech.install("emotion")
+        if not ok:
+            speech.set_emotion_model("")   # roll back the choice on failure
+        audit.log("settings",
+                  f"emotion_install {'ok' if ok else 'FAILED'} model={model}")
+        self._show(cb_msg, cb_chat, "spm")
 
     def _set_warn(self, cb_msg, cb_chat, mb):
         rt.upload_warn_bytes = mb * 1024 * 1024
@@ -284,7 +342,7 @@ class SettingsMenu:
     def clicked(self, cb_msg, cb_chat, rest):
         if rest == "root":
             tg.edit(cb_msg, self._text(), cb_chat, buttons=self._root_rows())
-        elif rest in ("m", "w", "t", "d", "dm", "st", "sp", "au"):
+        elif rest in ("m", "w", "t", "d", "dm", "st", "sp", "spm", "au"):
             self._show(cb_msg, cb_chat, rest)
         elif rest.startswith("m:"):
             self._set_model(cb_msg, cb_chat, rest[2:])
@@ -305,6 +363,8 @@ class SettingsMenu:
                 self._set_stt(cb_msg, cb_chat, int(rest[3:]))
             except ValueError:
                 pass
+        elif rest.startswith("spm:"):
+            self._set_emotion_model(cb_msg, cb_chat, rest[4:])
         elif rest.startswith("sp:"):
             self._toggle_analyzer(cb_msg, cb_chat, rest[3:])
         elif rest.startswith("d:"):

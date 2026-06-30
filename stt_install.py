@@ -155,3 +155,43 @@ def download_model(url: str, dest: str) -> bool:
             with contextlib.suppress(OSError):
                 os.remove(tmp)
             return False
+
+
+def install_ser(ser_venv: str, deps: list[str], repo: str,
+                marker_dir: str) -> bool:
+    """Build the SEPARATE torch venv for the 'accurate' emotion model and fetch
+    the model into the HF cache (#126). Heavy (~4 GB) — kept out of .venv-stt so
+    the light path stays torch-free. Writes a ``.ready`` marker in ``marker_dir``
+    on success. CPU torch (small wheel) via the pytorch CPU index; everything
+    else from PyPI. Reuses the module lock + timeout, so only one heavy install
+    runs at a time and ``busy()`` can refuse a second click."""
+    ser_py = os.path.join(ser_venv, "bin", "python")
+    with _lock:
+        if not os.path.isfile(ser_py):
+            if not _run([sys.executable, "-m", "venv", ser_venv]):
+                return False
+            _run([ser_py, "-m", "pip", "install", "-q", "--upgrade", "pip"])
+        torch_pkgs = [d for d in deps if d.split("==")[0] in ("torch", "torchaudio")]
+        other = [d for d in deps if d not in torch_pkgs]
+        if torch_pkgs and not _run([ser_py, "-m", "pip", "install", "-q",
+                                    *torch_pkgs, "--index-url",
+                                    "https://download.pytorch.org/whl/cpu"]):
+            return False
+        if other and not _run([ser_py, "-m", "pip", "install", "-q", *other]):
+            return False
+        # Trigger the model download AND verify it loads (executes the repo's
+        # custom code via trust_remote_code — the owner opted into this model).
+        code = ("from transformers import AutoModelForAudioClassification,"
+                " AutoProcessor;"
+                f"AutoProcessor.from_pretrained('{repo}', trust_remote_code=True);"
+                f"AutoModelForAudioClassification.from_pretrained('{repo}',"
+                " trust_remote_code=True, low_cpu_mem_usage=False)")
+        if not _run([ser_py, "-c", code]):
+            return False
+        try:
+            os.makedirs(marker_dir, exist_ok=True)
+            open(os.path.join(marker_dir, ".ready"), "w").close()
+        except OSError as e:
+            _log(f"marker write failed: {e}")
+            return False
+        return True

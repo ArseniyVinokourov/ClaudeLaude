@@ -2400,9 +2400,11 @@ def test_prosody_worker_real_clip():
 
 
 def _force_emotion_available(monkeypatch):
-    """Pretend the EN emotion model is downloaded regardless of the host — the
-    registry holds availability by reference, so patch the entry's fn."""
+    """Pick the light emotion model and pretend it's installed regardless of the
+    host — emotion is governed by SPEECH_EMOTION_MODEL, and the registry holds
+    availability by reference, so set the knob and patch the entry's fn."""
     import speech
+    monkeypatch.setenv("SPEECH_EMOTION_MODEL", "light")
     for a in speech._REGISTRY:
         if a["id"] == "emotion":
             monkeypatch.setitem(a, "available", lambda: True)
@@ -2415,9 +2417,8 @@ def test_voice_emotion_attaches_when_enabled(bot, tmp_path, monkeypatch):
     import json
     import telegram as tg_mod
     from runtime import rt
-    monkeypatch.setenv("SPEECH_ANALYZERS", "emotion")
     monkeypatch.setattr(rt, "upload_dir", str(tmp_path))
-    _force_emotion_available(monkeypatch)
+    _force_emotion_available(monkeypatch)   # sets SPEECH_EMOTION_MODEL=light
     _start_bot_session(bot, tmp_path)
     sess = next(iter(bot.mod.mgr._sessions.values()))
     monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
@@ -2429,8 +2430,10 @@ def test_voice_emotion_attaches_when_enabled(bot, tmp_path, monkeypatch):
         return {"text": "i am so angry right now", "language": "en",
                 "segments": [{"start": 0.0, "end": 2.0,
                               "text": "i am so angry right now", "words": []}],
-                "emotion": {"arousal": 0.87, "dominance": 0.86, "valence": 0.21,
-                            "model": "wav2vec2-large-robust MSP-Dimensional (EN+RU)"}}
+                "emotion": {"label": "anger", "confidence": 0.82,
+                            "top": [{"emotion": "anger", "p": 0.82},
+                                    {"emotion": "disgust", "p": 0.1}],
+                            "model": "wav2vec2-base SER (English, 6-class)"}}
     monkeypatch.setattr(bot.mod.stt, "transcribe", fake_transcribe)
 
     bot.mod.media.handle_voice(sess, "v", "", bot.forum_chat_id, 1, sess.topic_id)
@@ -2445,7 +2448,7 @@ def test_voice_emotion_attaches_when_enabled(bot, tmp_path, monkeypatch):
     with open(path) as f:
         data = json.load(f)
     assert data["analyzers"] == ["emotion"]
-    assert data["emotion"]["arousal"] == 0.87 and data["emotion"]["valence"] == 0.21
+    assert data["emotion"]["label"] == "anger" and data["emotion"]["confidence"] == 0.82
 
 
 def test_emotion_worker_gates_on_non_speech(monkeypatch):
@@ -2453,6 +2456,7 @@ def test_emotion_worker_gates_on_non_speech(monkeypatch):
     empty transcript — the model is noise on non-speech, so we don't run it.
     Pure gate: no model, numpy or audio decode is touched."""
     import speech_worker
+    monkeypatch.setenv("SPEECH_EMOTION_MODEL", "light")   # pick a model to dispatch
     # text="" → whisper found no speech → skip before any heavy work.
     assert speech_worker._emotion(None, {"text": ""}) == {}
     assert speech_worker._emotion(None, {"text": "   "}) == {}
@@ -2460,9 +2464,9 @@ def test_emotion_worker_gates_on_non_speech(monkeypatch):
 
 def test_emotion_worker_real_clip():
     """Real inference (regression vs. onnxruntime / model drift): the .venv-stt
-    worker emits tone-of-voice dimensions on actual clips, and an angry clip
-    reads as higher-arousal than a sad one (the model's core, language-robust
-    signal). Auto-skips where the side-venv / model / clips aren't present."""
+    worker NAMES the emotion on actual clips via the light categorical model — an
+    angry clip reads as 'anger'. Auto-skips where the side-venv / light model /
+    clips aren't present."""
     import json
     import os
     import subprocess
@@ -2471,11 +2475,12 @@ def test_emotion_worker_real_clip():
     bot_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     stt_py = os.path.join(bot_dir, ".venv-stt", "bin", "python")
     audio = os.path.join(bot_dir, "temp", "test_audio")
-    model = os.path.join(bot_dir, ".venv-stt", "models", "emotion", "model.onnx")
+    model = os.path.join(bot_dir, ".venv-stt", "models", "emotion", "light",
+                         "model.onnx")
     manifest = os.path.join(audio, "manifest.json")
     if not (os.path.isfile(stt_py) and os.path.isfile(model)
             and os.path.isfile(manifest)):
-        pytest.skip("STT venv / emotion model / test clips not present")
+        pytest.skip("STT venv / light emotion model / test clips not present")
 
     man = json.load(open(manifest))
 
@@ -2487,22 +2492,22 @@ def test_emotion_worker_real_clip():
                     return p
         return None
 
-    angry, sad = pick({"anger", "angry"}), pick({"sad", "sadness"})
-    if not (angry and sad):
-        pytest.skip("labelled anger/sad clips not present")
+    angry = pick({"anger", "angry"})
+    if not angry:
+        pytest.skip("labelled anger clip not present")
 
-    def dims(clip):
+    def predict(clip):
+        env = {**os.environ, "SPEECH_EMOTION_MODEL": "light"}
         r = subprocess.run([stt_py, os.path.join(bot_dir, "speech_worker.py"),
                             clip, "emotion"],
-                           capture_output=True, text=True, timeout=120)
+                           capture_output=True, text=True, timeout=120, env=env)
         assert r.returncode == 0, r.stderr
         return json.loads(r.stdout)["emotion"]
 
-    a, s = dims(angry), dims(sad)
-    for e in (a, s):
-        for k in ("arousal", "dominance", "valence"):
-            assert 0.0 <= e[k] <= 1.0
-    assert a["arousal"] > s["arousal"]  # anger is higher-energy than sadness
+    a = predict(angry)
+    assert a["label"] == "anger"               # categorical: names the emotion
+    assert 0.0 <= a["confidence"] <= 1.0
+    assert a["top"] and a["top"][0]["emotion"] == "anger"
 
 
 def _force_audio_events_available(monkeypatch):

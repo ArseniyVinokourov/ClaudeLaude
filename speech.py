@@ -168,25 +168,45 @@ def _prosody_available():
         stt._STT_VENV, "lib", "python*", "site-packages", "parselmouth*")))
 
 
-# ── analyzer: emotion (Phase 3, worker-side — wav2vec2-large MSP-dim ONNX) ─
-# Tone-of-voice as continuous dimensions (arousal/dominance/valence), NOT
-# categories. The compute lives in `speech_worker._emotion` (onnxruntime + numpy,
-# no torch; both already ship with .venv-stt as faster-whisper deps), so the
-# analyzer needs no pip packages — only the ONNX model, downloaded on enable.
+# ── analyzer: emotion (Phase 3, worker-side) ────────────────────────────
+# Emotion is the one analyzer with a USER-CHOSEN model (``SPEECH_EMOTION_MODEL``);
+# there is no default — the owner picks one in /settings, or leaves it off.
+# Measured on a hand-labelled EN+RU set (#126): naming the emotion with a
+# CATEGORICAL classifier beats the old dimensional model by far (EN 85% vs 33%);
+# the dimensional "valence" axis carries almost no signal from audio, so we drop
+# it and let Claude read positivity from the transcript words instead (decision-
+# level text+audio fusion — see the note in ``analyze``).
 #
-# ONE language-agnostic model (audeering wav2vec2-large-robust, trained on
-# spontaneous English but the acoustic dimensions transfer — verified usable on
-# EN + RU, far better than the old EN-only categorical model which scored 50% and
-# couldn't touch Russian). Single-file ONNX (no external data), so it uses the
-# same lang-agnostic `files` mechanism as audio_events; keep the destination
-# name in sync with `speech_worker._emotion_model_path`.
-_EMOTION_FILES = [
-    {"name": "model.onnx",
-     "url": ("https://huggingface.co/steveway/"
-             "wav2vec2-large-robust-12-ft-emotion-msp-dim_onnx/resolve/main/"
-             "wav2vec2-large-robust-12-ft-emotion-msp-dim.onnx")},
-]
-_EMOTION_SIZE_MB = 631
+#   light    — wav2vec2-base SER (ONNX, 6 classes, English). Runs in the existing
+#              .venv-stt on onnxruntime — NO torch, ~0.4 GB. Great EN, weak RU.
+#   accurate — MERaLiON-SER (7 classes + VAD, multilingual incl. RU). Needs torch,
+#              so it lives in a SEPARATE venv (.venv-ser) and is ~4 GB total.
+# Keep ids/paths in sync with ``speech_worker`` (which resolves them under its
+# own interpreter).
+_EMOTION_MODELS = {
+    "light": {
+        "title": "Light · English · 0.4 GB",
+        "size_mb": 379, "venv": "stt", "deps": [],
+        "files": [{"name": "model.onnx",
+                   "url": ("https://huggingface.co/onnx-community/"
+                           "wav2vec2-base-Speech_Emotion_Recognition-ONNX/"
+                           "resolve/main/onnx/model.onnx")}],
+    },
+    "accurate": {
+        "title": "Accurate · multilingual (RU) · 4 GB",
+        "size_mb": 4000, "venv": "ser", "deps": ["torch", "transformers==4.48.3",
+                                                  "torchaudio", "omegaconf"],
+        "repo": "MERaLiON/MERaLiON-SER-v1",
+    },
+}
+
+
+def emotion_model():
+    """The user-chosen emotion model id (``SPEECH_EMOTION_MODEL``: light/accurate),
+    or "" when emotion analysis is off. Read live so a /settings change applies
+    without a restart."""
+    m = os.environ.get("SPEECH_EMOTION_MODEL", "")
+    return m if m in _EMOTION_MODELS else ""
 
 
 def _model_dir(aid, lang):
@@ -197,17 +217,30 @@ def _model_dir(aid, lang):
     return os.path.join(stt._STT_VENV, "models", aid, lang)
 
 
-def speech_lang():
-    """Active analysis language (``SPEECH_LANG``, default en). Read live so a
-    /settings change takes effect without a restart. Currently only emotion
-    is language-specific; EN is the only model that ships today."""
-    return os.environ.get("SPEECH_LANG", "en")
+def _ser_venv():
+    """Separate venv for the torch-based ``accurate`` model, so the light path
+    (and the rest of the bot) never sees torch. Sits next to .venv-stt."""
+    import stt
+    return os.path.join(os.path.dirname(stt._STT_VENV), ".venv-ser")
+
+
+def _emotion_dir(model):
+    """Where a chosen emotion model is stored: ``light`` → a single ONNX file in
+    .venv-stt/models/emotion/light/; ``accurate`` → HF cache under .venv-ser."""
+    import stt
+    return os.path.join(stt._STT_VENV, "models", "emotion", model)
 
 
 def _emotion_available():
-    """True once the emotion model file is present. onnxruntime + numpy already
-    ship with .venv-stt (faster-whisper deps), so only the file gates it."""
-    return os.path.isfile(os.path.join(_model_dir("emotion", ""), "model.onnx"))
+    """True once the CHOSEN model is installed. ``light`` = its ONNX file present;
+    ``accurate`` = the .venv-ser python + a download marker present."""
+    m = emotion_model()
+    if m == "light":
+        return os.path.isfile(os.path.join(_emotion_dir("light"), "model.onnx"))
+    if m == "accurate":
+        return (os.path.isfile(os.path.join(_ser_venv(), "bin", "python"))
+                and os.path.isfile(os.path.join(_emotion_dir("accurate"), ".ready")))
+    return False
 
 
 # ── analyzer: audio_events (Phase 3, worker-side — PANNs CNN14 ONNX) ─────
@@ -253,8 +286,7 @@ _REGISTRY = [
      "where": "worker", "deps": ["praat-parselmouth"],
      "available": _prosody_available, "run": None},
     {"id": "emotion", "title": "Emotion (tone of feeling)", "needs_install": True,
-     "where": "worker", "deps": [], "files": _EMOTION_FILES,
-     "size_mb": _EMOTION_SIZE_MB,
+     "where": "worker", "deps": [], "model_choice": True,
      "available": _emotion_available, "run": None},
     {"id": "audio_events", "title": "Sounds & ambience", "needs_install": True,
      "where": "worker", "deps": [], "files": _AUDIO_EVENTS_FILES,
@@ -268,15 +300,17 @@ def registry():
     where, and (for model-backed analyzers) the active-language download size."""
     out = []
     for a in _REGISTRY:
-        m = (a.get("models") or {}).get(speech_lang())
-        # Per-language model size (emotion) or a flat descriptor size
-        # (audio_events: one language-agnostic download).
-        size_mb = m["size_mb"] if m else a.get("size_mb")
+        if a.get("model_choice"):           # emotion: size of the CHOSEN model
+            spec = _EMOTION_MODELS.get(emotion_model())
+            size_mb = spec["size_mb"] if spec else None
+        else:
+            size_mb = a.get("size_mb")
         out.append({"id": a["id"], "title": a["title"],
                     "needs_install": a["needs_install"],
                     "available": a["available"](),
                     "where": a.get("where", "inprocess"),
-                    "size_mb": size_mb})
+                    "size_mb": size_mb,
+                    "model_choice": a.get("model_choice", False)})
     return out
 
 
@@ -285,10 +319,15 @@ def _by_id(aid):
 
 
 def active_analyzers():
-    """Enabled analyzer ids from SPEECH_ANALYZERS (.env, csv). Read live so a
-    /settings toggle takes effect without a restart."""
+    """Enabled analyzer ids. The on/off analyzers come from SPEECH_ANALYZERS
+    (.env, csv); ``emotion`` is governed by its own knob (``SPEECH_EMOTION_MODEL``)
+    so it's appended only when the owner picked a model. Read live so a /settings
+    change takes effect without a restart."""
     raw = os.environ.get("SPEECH_ANALYZERS", "")
-    return [x for x in (s.strip() for s in raw.split(",")) if x]
+    ids = [x for x in (s.strip() for s in raw.split(",")) if x and x != "emotion"]
+    if emotion_model():
+        ids.append("emotion")
+    return ids
 
 
 def fluency_active():
@@ -312,21 +351,23 @@ def active_worker_analyzers():
 
 
 def install(aid):
-    """Install a worker analyzer's requirements into ``.venv-stt`` — pip deps
-    and/or model files. Blocks (pip + download), so callers run it on a daemon
-    thread. Returns True only if everything the analyzer needs is present.
+    """Install a worker analyzer's requirements. Blocks (pip + download), so
+    callers run it on a daemon thread. Returns True only if everything needed is
+    present.
 
-    ``deps`` → pip (e.g. prosody → praat-parselmouth). ``models`` → a model
-    file per language downloaded into ``_model_dir`` (e.g. emotion → the EN
-    ONNX). An analyzer may declare either, both, or neither."""
+    Most analyzers install pip ``deps`` and/or ``files`` into ``.venv-stt``
+    (e.g. prosody → praat-parselmouth; audio_events → the PANNs ONNX + labels).
+    ``emotion`` is special — it installs the user-CHOSEN model (light into
+    .venv-stt, accurate into the separate .venv-ser); see ``_install_emotion``."""
     a = _by_id(aid)
     if not a:
         return False
+    if a.get("model_choice"):
+        return _install_emotion()
     import stt_install
     if a.get("deps") and not stt_install.install_analyzer(a["deps"]):
         return False
-    # Language-agnostic file set (audio_events): a fixed list of files fetched
-    # into one model dir — the ONNX graph, its external weights, and labels.
+    # Fixed file set (audio_events): the ONNX graph, its external weights, labels.
     files = a.get("files") or []
     if files:
         d = _model_dir(aid, "")
@@ -334,35 +375,63 @@ def install(aid):
             if not stt_install.download_model(f["url"],
                                               os.path.join(d, f["name"])):
                 return False
-    # Per-language model (emotion): fetch only the active language, not the
-    # whole catalog — RU is 1.27GB and there's no point pulling a language the
-    # user isn't using.
-    models = a.get("models") or {}
-    if models:
-        lang = speech_lang()
-        m = models.get(lang)
-        if not m:
-            return False
-        dest = os.path.join(_model_dir(aid, lang), m["file"])
-        if not stt_install.download_model(m["url"], dest):
-            return False
-    return bool(a.get("deps") or models or files)
+    return bool(a.get("deps") or files)
+
+
+def _install_emotion():
+    """Install the chosen emotion model. ``light`` → a single ONNX file into
+    .venv-stt (reuses onnxruntime, NO torch). ``accurate`` → torch + the MERaLiON
+    model into a SEPARATE .venv-ser, so the light path stays torch-free."""
+    import stt_install
+    spec = _EMOTION_MODELS.get(emotion_model())
+    if not spec:
+        return False
+    if spec["venv"] == "stt":
+        f = spec["files"][0]
+        return stt_install.download_model(
+            f["url"], os.path.join(_emotion_dir("light"), f["name"]))
+    # accurate: build the side venv, then download the model into it (marker
+    # file .ready written on success — see _emotion_available).
+    return stt_install.install_ser(_ser_venv(), spec["deps"], spec["repo"],
+                                   _emotion_dir("accurate"))
 
 
 def set_active(ids):
     import config
-    config.set_env("SPEECH_ANALYZERS", ",".join(ids))
+    config.set_env("SPEECH_ANALYZERS", ",".join(x for x in ids if x != "emotion"))
 
 
 def toggle(aid):
-    """Flip one analyzer on/off; returns the new active list."""
-    ids = active_analyzers()
+    """Flip one on/off analyzer; returns the new active list. ``emotion`` is NOT
+    toggled here — it's a model choice (see ``set_emotion_model``)."""
+    if aid == "emotion":
+        return active_analyzers()
+    ids = [x for x in active_analyzers() if x != "emotion"]
     if aid in ids:
         ids = [x for x in ids if x != aid]
     elif _by_id(aid):
         ids.append(aid)
     set_active(ids)
-    return ids
+    return active_analyzers()
+
+
+def set_emotion_model(model):
+    """Pick the emotion model ('' = off). Persists to .env + live env so the
+    change applies without a restart."""
+    import config
+    config.set_env("SPEECH_EMOTION_MODEL",
+                   model if model in _EMOTION_MODELS else "")
+
+
+def emotion_models():
+    """{id: {title, size_mb}} for the settings model picker, in declared order."""
+    return {mid: {"title": s["title"], "size_mb": s["size_mb"]}
+            for mid, s in _EMOTION_MODELS.items()}
+
+
+def emotion_ready():
+    """True if the currently-chosen emotion model is installed (public wrapper)."""
+    return _emotion_available()
 
 
 def analyze(result, audio_path):
@@ -401,16 +470,21 @@ def analyze(result, audio_path):
     out["analyzers"] = ran
     out["language"] = result.get("language")
     out["transcript"] = result.get("text")
-    # Tell Claude to USE the model-based acoustic cues but not over-trust them:
-    # they're informative hints, not facts, and a confident value isn't proof.
-    # Only when such an analyzer ran (timing/fluency are mechanical counts).
+    # Text+audio fusion guidance for Claude (#126). The acoustic model is good at
+    # the SOUND of an emotion and its energy, but poor at positive-vs-negative
+    # (valence) — that lives in the words. So: take energy/intensity and the
+    # named emotion as a real cue, but read positivity from the transcript, and
+    # when tone and words disagree on whether it's positive or negative, trust the
+    # words. Only when a model-based analyzer ran (timing/fluency are exact counts).
     if {"emotion", "audio_events"} & set(ran):
-        out["note"] = ("The emotion and sound-event readings are genuine cues "
-                       "about HOW this was said — take them into account. They "
-                       "are estimates, not facts: weigh them together with the "
-                       "transcript and context, and treat a confident-looking "
-                       "or extreme value as informative but still uncertain, "
-                       "not as proof.")
+        out["note"] = ("These are acoustic cues about HOW it was said — factor "
+                       "them in, but they are estimates, not facts. The emotion "
+                       "model hears energy and intensity well; it is weak at "
+                       "positive-vs-negative, and can confuse similar-energy "
+                       "feelings (anger/fear/excitement). Read positivity from "
+                       "the words: when the tone and the transcript disagree on "
+                       "whether it's positive or negative, trust the words. Treat "
+                       "a confident or extreme value as informative but uncertain.")
     return out
 
 

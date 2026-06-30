@@ -143,31 +143,39 @@ def _prosody(bundle, ctx):
     }
 
 
-# ── analyzer: emotion (wav2vec2-large MSP-Dimensional ONNX, EN+RU) ─────
-# Tone-of-voice as 3 continuous dimensions, NOT categories: audeering's
-# wav2vec2-large-robust trained on MSP-Podcast (spontaneous speech). The
-# acoustic dimensions transfer across languages (verified usable on EN + RU),
-# unlike categorical SER which is language-bound. onnxruntime + numpy only
-# (no torch). The model emits two outputs — a [1,1024] embedding and the
-# [1,3] dimension scores (index order 0=arousal, 1=dominance, 2=valence).
-def _emotion_model_path():
-    return os.path.join(_STT_VENV, "models", "emotion", "model.onnx")
+# ── analyzer: emotion (CATEGORICAL, user-chosen model) ────────────────
+# Measured (#126): naming the emotion with a categorical classifier beats the old
+# dimensional model by far, and audio "valence" (positive vs negative) is near-
+# useless — that signal lives in the words, so we leave positivity to Claude and
+# only emit the named emotion + energy here. Dispatch on SPEECH_EMOTION_MODEL:
+#   light    → wav2vec2-base SER ONNX, run right here on onnxruntime (no torch).
+#   accurate → MERaLiON-SER in the separate .venv-ser (torch); we can't import
+#              torch here, so hand it the decoded samples and read back JSON.
+# Both gate on the transcript: empty text (non-speech) → skip; None → don't gate.
+_EMOTION_LIGHT_LABELS = {0: "sad", 1: "anger", 2: "disgust", 3: "fear",
+                         4: "happy", 5: "neutral"}
+_EMOTION_NOTE = ("the emotion the VOICE sounds like, from acoustics — a real cue "
+                 "to HOW it was said, but an estimate, not a fact. Reliable on "
+                 "energy/intensity; weak at positive-vs-negative and at telling "
+                 "apart similar-energy feelings (anger/fear/excitement). Read "
+                 "positivity from the words, not this label.")
 
 
 def _emotion(bundle, ctx):
-    """Tone-of-voice emotion as 3 dimensions in 0..1: arousal (energy /
-    activation), dominance (assertiveness), valence (positivity).
+    model = os.environ.get("SPEECH_EMOTION_MODEL", "")
+    if model == "light":
+        return _emotion_light(bundle, ctx)
+    if model == "accurate":
+        return _emotion_accurate(bundle, ctx)
+    return {}
 
-    onnxruntime + numpy only (both ship with .venv-stt) — no torch. Gated on the
-    transcript: the dimensions are meaningless on non-speech, so an empty
-    transcript (``text == ""``) skips it; ``text is None`` means "unknown,
-    don't gate" (manual/CLI use). A hint, not a diagnosis — separates high vs
-    low energy reliably; positivity is rougher; it cannot cleanly tell apart
-    similar-energy feelings (e.g. anger vs fear)."""
+
+def _emotion_light(bundle, ctx):
+    """wav2vec2-base SER (ONNX, 6-class, English). onnxruntime + numpy only."""
     text = ctx.get("text")
     if text is not None and not text.strip():
-        return {}  # whisper found no speech → the dimensions would be noise
-    model_path = _emotion_model_path()
+        return {}
+    model_path = os.path.join(_STT_VENV, "models", "emotion", "light", "model.onnx")
     if not os.path.isfile(model_path):
         return {}
     samples = bundle.samples
@@ -177,35 +185,59 @@ def _emotion(bundle, ctx):
     import numpy as np
     import onnxruntime as ort
     x = samples.astype("float32")
-    # Wav2Vec2FeatureExtractor do_normalize: zero-mean / unit-variance.
-    x = (x - x.mean()) / np.sqrt(x.var() + 1e-7)
-    with _heavy_lock():  # one heavy model resident at a time (anti-OOM)
-        sess = ort.InferenceSession(model_path,
-                                    providers=["CPUExecutionProvider"])
+    x = (x - x.mean()) / np.sqrt(x.var() + 1e-7)   # do_normalize=True
+    with _heavy_lock():
+        sess = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
         name = sess.get_inputs()[0].name
-        outs = sess.run(None, {name: x[None, :]})
-    # Pick the [1,3] dimension output (the other output is a [1,1024] embedding).
-    dims = next(np.asarray(o)[0] for o in outs
-                if np.asarray(o).ndim == 2 and np.asarray(o).shape[1] == 3)
+        logits = sess.run(None, {name: x[None, :]})[0][0]
+    e = np.exp(logits - logits.max())
+    probs = e / e.sum()
+    order = [int(i) for i in np.argsort(probs)[::-1]]
+    top = [{"emotion": _EMOTION_LIGHT_LABELS.get(i, str(i)),
+            "p": _round(float(probs[i]), 2)} for i in order[:3]]
+    return {"label": top[0]["emotion"], "confidence": top[0]["p"], "top": top,
+            "model": "wav2vec2-base SER (English, 6-class)", "note": _EMOTION_NOTE}
 
-    def clamp01(v):
-        return _round(min(1.0, max(0.0, float(v))), 2)
-    return {
-        "arousal": clamp01(dims[0]),
-        "dominance": clamp01(dims[1]),
-        "valence": clamp01(dims[2]),
-        "model": "wav2vec2-large-robust MSP-Dimensional (EN+RU)",
-        "note": ("tone-of-voice dimensions from the audio, each 0..1: "
-                 "arousal = energy/activation, valence = positivity, "
-                 "dominance = assertiveness. Use these as a real cue to HOW it "
-                 "was said and factor them into your read. They are estimates, "
-                 "though, not certainties: combine them with the words rather "
-                 "than reading them alone, and don't take a high or extreme "
-                 "value as proof — the model can be confidently wrong. Arousal "
-                 "(energy) is the most dependable dimension; pinning an exact "
-                 "emotion or separating similar-energy feelings (e.g. anger vs "
-                 "fear) is the least."),
-    }
+
+def _emotion_accurate(bundle, ctx):
+    """MERaLiON-SER in the separate .venv-ser (torch). We can't import torch in
+    .venv-stt, so dump the decoded samples to a temp .npy and run speech_ser.py
+    under that venv, reading back one JSON line."""
+    text = ctx.get("text")
+    if text is not None and not text.strip():
+        return {}
+    ser_py = os.path.join(os.path.dirname(_STT_VENV), ".venv-ser", "bin", "python")
+    script = os.path.join(_BOT_DIR, "speech_ser.py")
+    if not (os.path.isfile(ser_py) and os.path.isfile(script)):
+        return {}
+    samples = bundle.samples
+    if samples.size < bundle.sr * _MIN_SECONDS:
+        return {}
+
+    import json as _json
+    import subprocess
+    import tempfile
+    import numpy as np
+    with _heavy_lock():
+        with tempfile.NamedTemporaryFile(suffix=".npy", delete=False) as tf:
+            np.save(tf, samples.astype("float32"))
+            npy = tf.name
+        try:
+            r = subprocess.run([ser_py, script, npy],
+                               capture_output=True, text=True, timeout=300)
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(npy)
+    if r.returncode != 0:
+        print(f"[speech_worker] accurate emotion failed: {r.stderr[-300:]}",
+              file=sys.stderr, flush=True)
+        return {}
+    try:
+        sec = _json.loads(r.stdout.strip().splitlines()[-1])
+    except Exception:  # noqa: BLE001
+        return {}
+    sec.setdefault("note", _EMOTION_NOTE)
+    return sec
 
 
 # ── analyzer: audio_events (PANNs CNN14 ONNX, Tier B — onnxruntime, no torch) ─
