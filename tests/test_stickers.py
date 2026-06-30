@@ -3,6 +3,14 @@
 State is redirected to a per-test tempdir so the live .state.json is never
 touched. Telegram network calls (getStickerSet) are monkeypatched.
 """
+import os
+
+# config.py reads these from the env at import time (no .env in CI), so seed
+# them before importing it — matches how the scenario fixtures set the env
+# before their first config import.
+os.environ.setdefault("BOT_TOKEN", "test-token")
+os.environ.setdefault("OWNER_ID", "1")
+
 import config
 import stickers
 
