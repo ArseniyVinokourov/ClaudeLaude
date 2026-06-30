@@ -371,11 +371,75 @@ def _speaker(bundle, ctx):
     }
 
 
+# ── analyzer: diarization (who & how many speakers, Tier B — sherpa-onnx) ─
+# "Who spoke when" via sherpa-onnx: a pyannote segmentation ONNX + a 3dspeaker
+# embedding ONNX, clustered. NO torch, NO gated token, ~0.3GB RAM. The threshold
+# is tuned on sherpa's 4-speaker sample (-> 4) while keeping 1 voice -> 1 and a
+# female+male concat -> 2 (#126). Gated on the transcript: silence has no
+# speakers. Speaker ids are arbitrary labels, not identities. sherpa-onnx may
+# log to stdout, so its calls run under a stdout->stderr redirect — the worker's
+# stdout must stay a single JSON line for stt.py to parse.
+_DIAR_THRESHOLD = 0.9
+_DIAR_MAX_TURNS = 20
+
+
+def _diarization_dir():
+    return os.path.join(_STT_VENV, "models", "diarization")
+
+
+def _diarization(bundle, ctx):
+    """Estimate how many distinct voices and when each speaks (sherpa-onnx,
+    pyannote-seg + 3dspeaker embedding, no torch). A hint — short clips and
+    overlapping/similar voices can miscount; speaker ids are labels, not names."""
+    text = ctx.get("text")
+    if text is not None and not text.strip():
+        return {}  # gate on speech: silence has no speakers to separate
+    d = _diarization_dir()
+    seg = os.path.join(d, "segmentation.onnx")
+    emb = os.path.join(d, "embedding.onnx")
+    if not (os.path.isfile(seg) and os.path.isfile(emb)):
+        return {}
+    samples = bundle.samples
+    if samples.size < bundle.sr * _MIN_SECONDS:
+        return {}
+
+    import sherpa_onnx
+    cfg = sherpa_onnx.OfflineSpeakerDiarizationConfig(
+        segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
+            pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(
+                model=seg)),
+        embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=emb),
+        clustering=sherpa_onnx.FastClusteringConfig(
+            num_clusters=-1, threshold=_DIAR_THRESHOLD),
+    )
+    with _heavy_lock(), contextlib.redirect_stdout(sys.stderr):
+        sd = sherpa_onnx.OfflineSpeakerDiarization(cfg)
+        if bundle.sr != sd.sample_rate:
+            return {}                    # decode is 16k and so is the model
+        res = sd.process(samples.astype("float32")).sort_by_start_time()
+    turns = [{"speaker": int(s.speaker), "start": _round(s.start, 1),
+              "end": _round(s.end, 1)} for s in res]
+    if not turns:
+        return {}
+    out = {
+        "num_speakers": len({t["speaker"] for t in turns}),
+        "turns": turns[:_DIAR_MAX_TURNS],
+        "model": "sherpa-onnx pyannote-segmentation-3.0 + 3dspeaker eres2net",
+        "note": ("estimate of how many distinct voices and when each speaks; "
+                 "speaker ids are arbitrary labels, not identities. A hint — "
+                 "short clips and overlapping/similar voices can miscount."),
+    }
+    if len(turns) > _DIAR_MAX_TURNS:
+        out["turns_truncated_total"] = len(turns)
+    return out
+
+
 _ANALYZERS = {
     "prosody": _prosody,
     "emotion": _emotion,
     "audio_events": _audio_events,
     "speaker": _speaker,
+    "diarization": _diarization,
 }
 
 

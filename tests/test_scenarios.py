@@ -2697,6 +2697,103 @@ def test_speaker_worker_real_clip():
     assert isinstance(sp["age_years_est"], int | float)
 
 
+def _force_diarization_available(monkeypatch):
+    """Pretend sherpa-onnx + the two diarization models are present regardless of
+    the host — the registry holds availability by reference, so patch the fn."""
+    import speech
+    for a in speech._REGISTRY:
+        if a["id"] == "diarization":
+            monkeypatch.setitem(a, "available", lambda: True)
+
+
+def test_voice_diarization_attaches_when_enabled(bot, tmp_path, monkeypatch):
+    """With the worker-side `diarization` analyzer enabled and its models present:
+    the bot asks the STT worker to run it, the section rides back in the result,
+    and it reaches Claude as the attached JSON — transcript unchanged."""
+    import json
+    import telegram as tg_mod
+    from runtime import rt
+    monkeypatch.setenv("SPEECH_ANALYZERS", "diarization")
+    monkeypatch.setattr(rt, "upload_dir", str(tmp_path))
+    _force_diarization_available(monkeypatch)
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
+    monkeypatch.setattr(bot.mod.stt, "available", lambda: True)
+    seen = {}
+
+    def fake_transcribe(path, **kw):
+        seen.update(kw)  # the worker section is computed in .venv-stt; simulate it
+        return {"text": "hi there", "language": "en",
+                "segments": [{"start": 0.0, "end": 1.0, "text": "hi there",
+                              "words": []}],
+                "diarization": {"num_speakers": 2,
+                                "turns": [{"speaker": 0, "start": 0.0, "end": 1.0},
+                                          {"speaker": 1, "start": 1.2, "end": 2.0}]}}
+    monkeypatch.setattr(bot.mod.stt, "transcribe", fake_transcribe)
+
+    bot.mod.media.handle_voice(sess, "v", "", bot.forum_chat_id, 1, sess.topic_id)
+
+    assert seen.get("worker_analyzers") == ["diarization"]
+    users = [h for h in sess.history if h.kind == "user"]
+    assert len(users) == 1
+    text = users[0].text
+    assert "hi there" in text                           # transcript unchanged
+    assert "[Attached file:" in text and "_speech.json" in text
+    path = text.split("[Attached file:", 1)[1].split("]", 1)[0].strip()
+    with open(path) as f:
+        data = json.load(f)
+    assert data["analyzers"] == ["diarization"]
+    assert data["diarization"]["num_speakers"] == 2
+
+
+def test_diarization_worker_degrades_without_model(monkeypatch, tmp_path):
+    """The diarization analyzer returns no section (never crashes, never imports
+    sherpa-onnx) when the models aren't installed — the model check runs before
+    the waveform is read, so a missing model degrades cleanly."""
+    import speech_worker
+    monkeypatch.setattr(speech_worker, "_diarization_dir", lambda: str(tmp_path))
+    assert speech_worker._diarization(None, {"text": "hi"}) == {}
+
+
+def test_diarization_worker_gates_on_non_speech(monkeypatch):
+    """The diarization analyzer skips (no section) on an empty transcript —
+    silence has no speakers to separate. The gate runs before the model/waveform,
+    so bundle=None is safe."""
+    import speech_worker
+    assert speech_worker._diarization(None, {"text": ""}) == {}
+    assert speech_worker._diarization(None, {"text": "   "}) == {}
+
+
+def test_diarization_worker_real_two_speakers():
+    """Real inference (regression vs. sherpa-onnx / model drift): a female+male
+    clip diarizes to exactly 2 speakers, and the worker's stdout stays a single
+    clean JSON line (sherpa-onnx logging is redirected). Auto-skips where the
+    side-venv / sherpa-onnx / models / clip aren't present (e.g. CI)."""
+    import glob
+    import json
+    import os
+    import subprocess
+
+    import pytest
+    bot_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    stt_py = os.path.join(bot_dir, ".venv-stt", "bin", "python")
+    clip = os.path.join(bot_dir, "temp", "test_audio", "feat_two_speakers.wav")
+    seg = os.path.join(bot_dir, ".venv-stt", "models", "diarization",
+                       "segmentation.onnx")
+    has_pkg = bool(glob.glob(os.path.join(
+        bot_dir, ".venv-stt", "lib", "python*", "site-packages", "sherpa_onnx*")))
+    if not (os.path.isfile(stt_py) and os.path.isfile(clip)
+            and os.path.isfile(seg) and has_pkg):
+        pytest.skip("STT venv / sherpa-onnx / model / 2-speaker clip not present")
+    r = subprocess.run([stt_py, os.path.join(bot_dir, "speech_worker.py"),
+                        clip, "diarization"],
+                       capture_output=True, text=True, timeout=180)
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)["diarization"]      # stdout is clean JSON
+    assert out["num_speakers"] == 2
+
+
 # ── upload retention (#87) ──────────────────────────────────────────
 
 def _make_upload(updir, name, age_s, content=b"x"):

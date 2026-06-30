@@ -158,18 +158,20 @@ def download_model(url: str, dest: str) -> bool:
 
 
 def download_archive(url: str, member: str, dest: str) -> bool:
-    """Download a .zip model archive and extract one member to ``dest`` (#126).
+    """Download a model archive (.zip or .tar.*) and extract one member to
+    ``dest`` (#126).
 
     Same contract as ``download_model`` but for analyzers whose only published
-    source is a zip (speaker → audeering's age-gender ZIP on Zenodo). Streams the
-    zip to a temp file, extracts ``member`` (a path inside it) to ``dest +
-    '.part'`` then renames, and always removes the zip — so an aborted download
-    never looks complete. Reuses the module lock/timeout like the other
-    installs."""
+    source is an archive (speaker → audeering's age-gender ZIP on Zenodo;
+    diarization → sherpa-onnx's segmentation tar.bz2). Streams the archive to a
+    temp file, extracts ``member`` (a path inside it) to ``dest + '.part'`` then
+    renames, and always removes the archive — so an aborted download never looks
+    complete. Reuses the module lock/timeout like the other installs."""
     if not url or not dest:
         return False
     if os.path.isfile(dest):
         return True
+    import tarfile
     import zipfile
 
     import requests
@@ -183,8 +185,14 @@ def download_archive(url: str, member: str, dest: str) -> bool:
                 with open(apath, "wb") as f:
                     for chunk in r.iter_content(1 << 20):
                         f.write(chunk)
-            with zipfile.ZipFile(apath) as z, z.open(member) as src, \
-                    open(tmp, "wb") as out:
+            if zipfile.is_zipfile(apath):
+                with zipfile.ZipFile(apath) as z:
+                    src = z.open(member)
+            else:                                   # .tar / .tar.bz2 / .tar.gz
+                src = tarfile.open(apath).extractfile(member)
+            if src is None:
+                raise KeyError(f"member not found: {member}")
+            with src, open(tmp, "wb") as out:
                 while True:
                     buf = src.read(1 << 20)
                     if not buf:

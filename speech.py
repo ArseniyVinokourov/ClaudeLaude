@@ -293,6 +293,44 @@ def _speaker_available():
     return os.path.isfile(os.path.join(_model_dir("speaker", ""), "model.onnx"))
 
 
+# ── analyzer: diarization (Phase 3, worker-side — sherpa-onnx, no torch) ─
+# "Who spoke when / how many voices" from the waveform. Compute lives in
+# `speech_worker._diarization` via sherpa-onnx (a pip dep), which runs two small
+# ONNX models — a pyannote segmentation export + a 3dspeaker embedding extractor
+# — with NO torch and NO gated HF token (the usual pyannote path needs both).
+# Language-agnostic. The segmentation ships as a tar.bz2 (extract one member);
+# the embedding is a single .onnx. Output is an ESTIMATE; speaker ids are
+# arbitrary labels, not identities.
+_DIAR_SEG_ARCHIVE = {
+    "url": ("https://github.com/k2-fsa/sherpa-onnx/releases/download/"
+            "speaker-segmentation-models/"
+            "sherpa-onnx-pyannote-segmentation-3-0.tar.bz2"),
+    "member": "sherpa-onnx-pyannote-segmentation-3-0/model.onnx",
+    "name": "segmentation.onnx",
+}
+_DIAR_FILES = [
+    {"name": "embedding.onnx",
+     "url": ("https://github.com/k2-fsa/sherpa-onnx/releases/download/"
+             "speaker-recongition-models/"
+             "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx")},
+]
+_DIAR_SIZE_MB = 46
+
+
+def _diarization_available():
+    """True once sherpa-onnx is installed in the side-venv AND both ONNX models
+    are present. sherpa-onnx is an extra pip dep (unlike onnxruntime, which ships
+    with .venv-stt), so check for its package dir from the bot side like prosody
+    does for parselmouth."""
+    import stt
+    has_pkg = bool(glob.glob(os.path.join(
+        stt._STT_VENV, "lib", "python*", "site-packages", "sherpa_onnx*")))
+    d = _model_dir("diarization", "")
+    return (has_pkg
+            and os.path.isfile(os.path.join(d, "segmentation.onnx"))
+            and os.path.isfile(os.path.join(d, "embedding.onnx")))
+
+
 # ── registry ───────────────────────────────────────────────────────────
 # `where`: "inprocess" runs in the bot on the transcript result; "worker" runs
 # in `.venv-stt` during transcription and arrives pre-computed in `result`.
@@ -318,6 +356,10 @@ _REGISTRY = [
      "where": "worker", "deps": [], "archive": _SPEAKER_ARCHIVE,
      "size_mb": _SPEAKER_SIZE_MB,
      "available": _speaker_available, "run": None},
+    {"id": "diarization", "title": "Speakers (who & how many)",
+     "needs_install": True, "where": "worker", "deps": ["sherpa-onnx"],
+     "files": _DIAR_FILES, "archive": _DIAR_SEG_ARCHIVE, "size_mb": _DIAR_SIZE_MB,
+     "available": _diarization_available, "run": None},
 ]
 
 
