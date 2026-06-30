@@ -7,16 +7,29 @@ process honours the project rule that the bot's venv stays light
 (requests + python-dotenv only).
 
 Usage:
-    python transcribe.py <audio_path> [model_name]
+    python transcribe.py <audio_path> [model_name] [--analyzers=id,id]
+                         [--bias-fillers]
 
 Prints one JSON line to stdout:
     {"text": "...", "segments": [{"start":s,"end":e,"text":t}], "language":"ru"}
-or on failure:
+With --analyzers, each worker analyzer's section is merged in under its id
+(e.g. "prosody": {...}) — computed in this venv by speech_worker (#126).
+With --bias-fillers, Whisper is nudged to keep filler words in the transcript
+(see _FILLER_BIAS_PROMPT) — used when the fluency analyzer is on.
+On failure:
     {"error": "..."}   (and exits non-zero)
 """
 import json
 import os
 import sys
+
+# Whisper smooths filler words (um/uh/э-э) out of the transcript by default.
+# When the fluency analyzer (#126) is on, this priming text biases the decoder
+# to keep them. Measured on real clips: recovers disfluencies (e.g. "er") in
+# spontaneous speech WITHOUT hallucinating fillers into clean speech, and does
+# not break RU language detection (a deliberately bilingual EN+RU prime).
+_FILLER_BIAS_PROMPT = ("Okay so, um, uh, er, hmm, like, you know, I mean... "
+                       "Ну вот, э-э, эм, мм, как бы, типа, значит, это самое...")
 
 
 def main() -> None:
@@ -24,7 +37,18 @@ def main() -> None:
         print(json.dumps({"error": "no audio path given"}))
         sys.exit(1)
     audio = sys.argv[1]
-    model_name = (sys.argv[2] if len(sys.argv) > 2
+    # Positional model name + optional flags, order-independent.
+    analyzer_ids: list[str] = []
+    bias_fillers = False
+    positional: list[str] = []
+    for arg in sys.argv[2:]:
+        if arg.startswith("--analyzers="):
+            analyzer_ids = [x for x in arg.split("=", 1)[1].split(",") if x]
+        elif arg == "--bias-fillers":
+            bias_fillers = True
+        else:
+            positional.append(arg)
+    model_name = (positional[0] if positional
                   else os.environ.get("WHISPER_MODEL", "small"))
     if not os.path.isfile(audio):
         print(json.dumps({"error": f"file not found: {audio}"}))
@@ -35,12 +59,37 @@ def main() -> None:
         # ~/.cache/huggingface after first download (setup.sh pre-fetches it).
         model = WhisperModel(model_name, device="cpu", compute_type="int8")
         # vad_filter drops long silences so a quiet recording isn't padded.
-        segments, info = model.transcribe(audio, vad_filter=True)
-        segs = [{"start": round(s.start, 2), "end": round(s.end, 2),
-                 "text": s.text.strip()} for s in segments]
+        # word_timestamps gives per-word start/end — needed for pause/tempo
+        # analysis (#126) and measured to add no cost (often faster).
+        segments, info = model.transcribe(
+            audio, vad_filter=True, word_timestamps=True,
+            initial_prompt=_FILLER_BIAS_PROMPT if bias_fillers else None)
+        segs = []
+        for s in segments:
+            words = [{"word": w.word, "start": round(w.start, 2),
+                      "end": round(w.end, 2)} for w in (s.words or [])]
+            segs.append({"start": round(s.start, 2), "end": round(s.end, 2),
+                         "text": s.text.strip(), "words": words})
         text = " ".join(s["text"] for s in segs).strip()
-        print(json.dumps({"text": text, "segments": segs,
-                          "language": info.language}, ensure_ascii=False))
+        out = {"text": text, "segments": segs, "language": info.language}
+        # Worker-side speech analyzers (#126) — heavy ones live here in the
+        # side-venv. A failure inside never aborts transcription: the section
+        # is simply absent. stdout must stay the single JSON line below, so
+        # speech_worker logs only to stderr.
+        if analyzer_ids:
+            try:
+                import gc
+                import speech_worker
+                # Free the whisper model before loading any heavy analyzer
+                # model (e.g. emotion ~200MB) — they shouldn't be co-resident
+                # on a small box. The transcript is already in `out`.
+                del model
+                gc.collect()
+                out.update(speech_worker.run(audio, analyzer_ids, text=text))
+            except Exception as e:  # noqa: BLE001
+                print(f"[transcribe] analyzers failed: {e}",
+                      file=sys.stderr, flush=True)
+        print(json.dumps(out, ensure_ascii=False))
     except Exception as e:  # noqa: BLE001 — report any failure as JSON
         print(json.dumps({"error": str(e)}))
         sys.exit(1)

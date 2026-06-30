@@ -7,6 +7,7 @@
 # Python
 .venv/
 .venv-stt/
+.venv-ser/
 __pycache__/
 *.pyc
 *.egg-info/

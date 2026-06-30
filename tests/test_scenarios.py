@@ -1925,7 +1925,7 @@ def test_voice_message_transcribed_into_turn(bot, tmp_path, monkeypatch):
     monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
     monkeypatch.setattr(bot.mod.stt, "available", lambda: True)
     monkeypatch.setattr(bot.mod.stt, "transcribe",
-                        lambda path: {"text": "привет бот как дела",
+                        lambda path, **kw: {"text": "привет бот как дела",
                                       "segments": [], "language": "ru"})
 
     bot.mod.media.handle_voice(sess, "voice-fid", "", bot.forum_chat_id,
@@ -1995,7 +1995,7 @@ def test_voice_install_click_installs_and_replays(bot, tmp_path, monkeypatch):
                         lambda m: installed.append(m) or True)
     monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
     monkeypatch.setattr(bot.mod.stt, "transcribe",
-                        lambda path: {"text": "after install",
+                        lambda path, **kw: {"text": "after install",
                                       "segments": [], "language": "en"})
     # The success path schedules an 8s delete of the "✓ Installed" notice;
     # that timer would outlive the fixture and hit the real API. Stub it.
@@ -2046,7 +2046,7 @@ def test_video_transcript_and_frames_in_one_turn(bot, tmp_path, monkeypatch):
     sess = next(iter(bot.mod.mgr._sessions.values()))
 
     monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
-    monkeypatch.setattr(bot.mod.stt, "transcribe", lambda path: {
+    monkeypatch.setattr(bot.mod.stt, "transcribe", lambda path, **kw: {
         "text": "intro then demo",
         "segments": [{"start": 0.0, "end": 2.0, "text": "intro"},
                      {"start": 6.0, "end": 8.0, "text": "then demo"}],
@@ -2107,7 +2107,7 @@ def test_video_frames_only_notes_missing_whisper(bot, tmp_path, monkeypatch):
 
     monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
     monkeypatch.setattr(bot.mod.stt, "available", lambda: False)
-    monkeypatch.setattr(bot.mod.stt, "transcribe", lambda path: None)
+    monkeypatch.setattr(bot.mod.stt, "transcribe", lambda path, **kw: None)
     monkeypatch.setattr(bot.mod.frames, "extract", lambda v, d: [
         {"path": "/tmp/f0.jpg", "t": 0.0}])
     notes = []
@@ -2120,6 +2120,678 @@ def test_video_frames_only_notes_missing_whisper(bot, tmp_path, monkeypatch):
     users = [h for h in sess.history if h.kind == "user"]
     assert len(users) == 1 and "[Attached file:" in users[0].text
     assert any("Whisper isn't installed" in n for n in notes), notes
+
+
+# ── speech analysis (#126) ──────────────────────────────────────────
+
+def test_voice_speech_analysis_off_by_default(bot, tmp_path, monkeypatch):
+    """With no analyzers enabled (default), a voice note behaves exactly as
+    before #126: plain transcript turn, no attached analysis file."""
+    import telegram as tg_mod
+    monkeypatch.delenv("SPEECH_ANALYZERS", raising=False)
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
+    monkeypatch.setattr(bot.mod.stt, "available", lambda: True)
+    seen = {}
+
+    def fake_transcribe(path, **kw):
+        seen.update(kw)
+        return {"text": "привет бот", "segments": [
+                            {"start": 0.0, "end": 1.0, "text": "привет бот",
+                             "words": [{"word": "привет", "start": 0.0, "end": 0.5},
+                                       {"word": "бот", "start": 0.6, "end": 1.0}]}],
+                            "language": "ru"}
+    monkeypatch.setattr(bot.mod.stt, "transcribe", fake_transcribe)
+
+    bot.mod.media.handle_voice(sess, "v", "", bot.forum_chat_id, 1, sess.topic_id)
+
+    users = [h for h in sess.history if h.kind == "user"]
+    assert len(users) == 1
+    assert "[Attached file:" not in users[0].text
+    assert not seen.get("bias_fillers")     # fluency off → no filler bias
+
+
+def test_voice_speech_analysis_timing_attaches_json(bot, tmp_path, monkeypatch):
+    """With the `timing` analyzer enabled, a voice note still sends the plain
+    transcript, plus an attached JSON file holding tempo/pauses for Claude."""
+    import json
+    import telegram as tg_mod
+    from runtime import rt
+    monkeypatch.setenv("SPEECH_ANALYZERS", "timing")
+    monkeypatch.setattr(rt, "upload_dir", str(tmp_path))
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
+    monkeypatch.setattr(bot.mod.stt, "available", lambda: True)
+    # 1.5s pause between "как" (ends 0.9) and "дела" (starts 2.4); 4 words / 3.4s.
+    monkeypatch.setattr(bot.mod.stt, "transcribe",
+                        lambda path, **kw: {"text": "привет как дела друзья", "language": "ru",
+                            "segments": [{"start": 0.0, "end": 3.4,
+                                "text": "привет как дела друзья", "words": [
+                                    {"word": "привет", "start": 0.0, "end": 0.5},
+                                    {"word": "как", "start": 0.6, "end": 0.9},
+                                    {"word": "дела", "start": 2.4, "end": 2.8},
+                                    {"word": "друзья", "start": 2.9, "end": 3.4}]}]})
+
+    bot.mod.media.handle_voice(sess, "v", "", bot.forum_chat_id, 1, sess.topic_id)
+
+    users = [h for h in sess.history if h.kind == "user"]
+    assert len(users) == 1
+    text = users[0].text
+    assert "привет как дела друзья" in text          # transcript unchanged
+    assert "[Attached file:" in text and "_speech.json" in text
+    path = text.split("[Attached file:", 1)[1].split("]", 1)[0].strip()
+    with open(path) as f:
+        data = json.load(f)
+    assert data["analyzers"] == ["timing"]
+    t = data["timing"]
+    assert t["pause_count"] == 1 and t["longest_pause_sec"] == 1.5
+    assert t["word_count"] == 4 and t["speech_rate_wpm"] == 71
+
+
+def test_fluency_run_detects_fillers_repeats_and_clean_speech():
+    """The in-process fluency analyzer: counts EN+RU fillers (incl. multiword)
+    and immediate repeats from word timestamps, stays silent on clean speech
+    (no false positives), and falls back to text when words are absent."""
+    import speech
+    # EN: 'um' + 'you know' bigram = 2 fillers; 'I I' = 1 repeat.
+    en = {"language": "en", "text": "um I I think you know it works",
+          "segments": [{"start": 0.0, "end": 2.6, "text": "", "words": [
+              {"word": "um,", "start": 0.0, "end": 0.3},
+              {"word": " I", "start": 0.5, "end": 0.6},
+              {"word": " I", "start": 0.7, "end": 0.8},
+              {"word": " think", "start": 0.9, "end": 1.2},
+              {"word": " you", "start": 1.4, "end": 1.5},
+              {"word": " know", "start": 1.6, "end": 1.8},
+              {"word": " it", "start": 2.0, "end": 2.1},
+              {"word": " works", "start": 2.2, "end": 2.6}]}]}
+    r = speech._fluency_run(en, "x")
+    assert r["filler_count"] == 2
+    assert [f["filler"] for f in r["fillers"]] == ["um", "you know"]
+    assert r["fillers"][0]["at_sec"] == 0.0           # timecode carried
+    assert r["repeat_count"] == 1 and r["repeats"][0]["word"] == "i"
+    assert r["word_count"] == 8 and r["filler_rate_per_100w"] == 25.0
+
+    # RU: 'ну' + 'э-э'(→ээ) + 'это самое' bigram = 3 fillers.
+    ru = {"language": "ru", "text": "", "segments": [{"start": 0, "end": 2,
+          "text": "", "words": [
+              {"word": "ну", "start": 0.0, "end": 0.2},
+              {"word": " э-э", "start": 0.3, "end": 0.6},
+              {"word": " это", "start": 0.8, "end": 1.0},
+              {"word": " самое", "start": 1.1, "end": 1.4},
+              {"word": " готово", "start": 1.6, "end": 2.0}]}]}
+    assert [f["filler"] for f in speech._fluency_run(ru, "x")["fillers"]] == \
+        ["ну", "ээ", "это самое"]
+
+    # Clean speech: zero fillers, zero repeats — conservative lexicon.
+    clean = {"language": "en", "text": "the quick brown fox jumps",
+             "segments": [{"start": 0, "end": 1.4, "text":
+                 "the quick brown fox jumps", "words": [
+                 {"word": "the", "start": 0, "end": 0.2},
+                 {"word": " quick", "start": 0.3, "end": 0.5},
+                 {"word": " brown", "start": 0.6, "end": 0.8},
+                 {"word": " fox", "start": 0.9, "end": 1.0},
+                 {"word": " jumps", "start": 1.1, "end": 1.4}]}]}
+    c = speech._fluency_run(clean, "x")
+    assert c["filler_count"] == 0 and c["repeat_count"] == 0
+
+    # No per-word timestamps → tokenise the text, timecodes are null.
+    nowords = {"language": "en", "text": "um so it works works",
+               "segments": [{"start": 0, "end": 2, "text": "um so it works works"}]}
+    n = speech._fluency_run(nowords, "x")
+    assert n["filler_count"] == 1 and n["repeat_count"] == 1
+    assert n["fillers"][0]["at_sec"] is None
+
+
+def test_fluency_active_drives_filler_bias(monkeypatch):
+    """`fluency_active()` reflects SPEECH_ANALYZERS — it's the switch that tells
+    the STT worker to keep fillers in the transcript."""
+    import speech
+    monkeypatch.setenv("SPEECH_ANALYZERS", "timing,prosody")
+    assert speech.fluency_active() is False
+    monkeypatch.setenv("SPEECH_ANALYZERS", "timing,fluency")
+    assert speech.fluency_active() is True
+
+
+def test_voice_fluency_attaches_json(bot, tmp_path, monkeypatch):
+    """With the in-process `fluency` analyzer enabled, a voice note sends the
+    plain transcript plus an attached JSON holding filler/repeat counts."""
+    import json
+    import telegram as tg_mod
+    from runtime import rt
+    monkeypatch.setenv("SPEECH_ANALYZERS", "fluency")
+    monkeypatch.setattr(rt, "upload_dir", str(tmp_path))
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
+    monkeypatch.setattr(bot.mod.stt, "available", lambda: True)
+    seen = {}
+
+    def fake_transcribe(path, **kw):
+        seen.update(kw)
+        return {"text": "um well it it works", "language": "en",
+            "segments": [{"start": 0.0, "end": 2.0,
+                "text": "um well it it works", "words": [
+                    {"word": "um", "start": 0.0, "end": 0.3},
+                    {"word": " well", "start": 0.5, "end": 0.8},
+                    {"word": " it", "start": 1.0, "end": 1.1},
+                    {"word": " it", "start": 1.2, "end": 1.3},
+                    {"word": " works", "start": 1.5, "end": 2.0}]}]}
+    monkeypatch.setattr(bot.mod.stt, "transcribe", fake_transcribe)
+
+    bot.mod.media.handle_voice(sess, "v", "", bot.forum_chat_id, 1, sess.topic_id)
+
+    # fluency on → the bot asks the worker to keep fillers in the transcript.
+    assert seen.get("bias_fillers") is True
+    users = [h for h in sess.history if h.kind == "user"]
+    assert len(users) == 1
+    text = users[0].text
+    assert "um well it it works" in text             # transcript unchanged
+    assert "[Attached file:" in text and "_speech.json" in text
+    path = text.split("[Attached file:", 1)[1].split("]", 1)[0].strip()
+    with open(path) as f:
+        data = json.load(f)
+    assert data["analyzers"] == ["fluency"]
+    fl = data["fluency"]
+    # 'um' is a filler; 'well' is NOT (conservative lexicon); 'it it' is a repeat.
+    assert fl["filler_count"] == 1 and fl["fillers"][0]["filler"] == "um"
+    assert fl["repeat_count"] == 1 and fl["repeats"][0]["word"] == "it"
+
+
+def _force_prosody_available(monkeypatch):
+    """Pretend parselmouth is installed in .venv-stt regardless of the host —
+    the registry holds the availability fn by reference, so patch the entry."""
+    import speech
+    for a in speech._REGISTRY:
+        if a["id"] == "prosody":
+            monkeypatch.setitem(a, "available", lambda: True)
+
+
+def test_voice_prosody_attaches_when_enabled(bot, tmp_path, monkeypatch):
+    """With the worker-side `prosody` analyzer enabled: the bot tells the STT
+    worker to run it (worker_analyzers), the worker's section rides back in the
+    result, and it reaches Claude as the attached JSON — transcript unchanged."""
+    import json
+    import telegram as tg_mod
+    from runtime import rt
+    monkeypatch.setenv("SPEECH_ANALYZERS", "prosody")
+    monkeypatch.setattr(rt, "upload_dir", str(tmp_path))
+    _force_prosody_available(monkeypatch)
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
+    monkeypatch.setattr(bot.mod.stt, "available", lambda: True)
+    seen = {}
+
+    def fake_transcribe(path, **kw):
+        seen.update(kw)  # the worker section is computed in .venv-stt; simulate it
+        return {"text": "привет бот", "language": "ru",
+                "segments": [{"start": 0.0, "end": 1.0, "text": "привет бот",
+                              "words": []}],
+                "prosody": {"pitch_mean_hz": 142.0, "pitch_range_hz": 210.0,
+                            "jitter_pct": 2.1, "hnr_db": 11.5}}
+    monkeypatch.setattr(bot.mod.stt, "transcribe", fake_transcribe)
+
+    bot.mod.media.handle_voice(sess, "v", "", bot.forum_chat_id, 1, sess.topic_id)
+
+    assert seen.get("worker_analyzers") == ["prosody"]
+    users = [h for h in sess.history if h.kind == "user"]
+    assert len(users) == 1
+    text = users[0].text
+    assert "привет бот" in text                       # transcript unchanged
+    assert "[Attached file:" in text and "_speech.json" in text
+    path = text.split("[Attached file:", 1)[1].split("]", 1)[0].strip()
+    with open(path) as f:
+        data = json.load(f)
+    assert data["analyzers"] == ["prosody"]
+    assert data["prosody"]["pitch_mean_hz"] == 142.0
+
+
+def test_voice_prosody_missing_section_degrades(bot, tmp_path, monkeypatch):
+    """prosody enabled + installed, but the worker produced no section (clip too
+    short / parselmouth errored). The turn is the plain transcript with NO
+    attachment — never a broken or empty analysis file."""
+    import telegram as tg_mod
+    from runtime import rt
+    monkeypatch.setenv("SPEECH_ANALYZERS", "prosody")
+    monkeypatch.setattr(rt, "upload_dir", str(tmp_path))
+    _force_prosody_available(monkeypatch)
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
+    monkeypatch.setattr(bot.mod.stt, "available", lambda: True)
+    monkeypatch.setattr(bot.mod.stt, "transcribe",
+                        lambda path, **kw: {"text": "привет бот", "language": "ru",
+                            "segments": [{"start": 0.0, "end": 1.0,
+                                          "text": "привет бот", "words": []}]})
+
+    bot.mod.media.handle_voice(sess, "v", "", bot.forum_chat_id, 1, sess.topic_id)
+
+    users = [h for h in sess.history if h.kind == "user"]
+    assert len(users) == 1
+    assert "[Attached file:" not in users[0].text
+
+
+def test_prosody_worker_real_clip():
+    """Real compute (regression vs. parselmouth/PyAV drift): the .venv-stt
+    worker extracts prosody from an actual TG-format voice clip. Auto-skips
+    where the side-venv / parselmouth / clip aren't present (e.g. CI)."""
+    import glob
+    import json
+    import os
+    import subprocess
+
+    import pytest
+    bot_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    stt_py = os.path.join(bot_dir, ".venv-stt", "bin", "python")
+    clip = os.path.join(bot_dir, "temp", "test_audio", "ru_natural_memo.ogg")
+    has_pm = glob.glob(os.path.join(bot_dir, ".venv-stt", "lib", "python*",
+                                    "site-packages", "parselmouth*"))
+    if not (os.path.isfile(stt_py) and os.path.isfile(clip) and has_pm):
+        pytest.skip("STT venv / parselmouth / test clip not present")
+    r = subprocess.run([stt_py, os.path.join(bot_dir, "speech_worker.py"),
+                        clip, "prosody"],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    p = json.loads(r.stdout)["prosody"]
+    assert p["pitch_mean_hz"] > 0 and p["pitch_range_hz"] > 0
+    assert p["jitter_pct"] is not None and p["hnr_db"] is not None
+
+
+def _force_emotion_available(monkeypatch):
+    """Pick the light emotion model and pretend it's installed regardless of the
+    host — emotion is governed by SPEECH_EMOTION_MODEL, and the registry holds
+    availability by reference, so set the knob and patch the entry's fn."""
+    import speech
+    monkeypatch.setenv("SPEECH_EMOTION_MODEL", "light")
+    for a in speech._REGISTRY:
+        if a["id"] == "emotion":
+            monkeypatch.setitem(a, "available", lambda: True)
+
+
+def test_voice_emotion_attaches_when_enabled(bot, tmp_path, monkeypatch):
+    """With the worker-side `emotion` analyzer enabled and its model present:
+    the bot asks the STT worker to run it, the section rides back in the
+    result, and it reaches Claude as the attached JSON — transcript unchanged."""
+    import json
+    import telegram as tg_mod
+    from runtime import rt
+    monkeypatch.setattr(rt, "upload_dir", str(tmp_path))
+    _force_emotion_available(monkeypatch)   # sets SPEECH_EMOTION_MODEL=light
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
+    monkeypatch.setattr(bot.mod.stt, "available", lambda: True)
+    seen = {}
+
+    def fake_transcribe(path, **kw):
+        seen.update(kw)  # the worker section is computed in .venv-stt; simulate it
+        return {"text": "i am so angry right now", "language": "en",
+                "segments": [{"start": 0.0, "end": 2.0,
+                              "text": "i am so angry right now", "words": []}],
+                "emotion": {"label": "anger", "confidence": 0.82,
+                            "top": [{"emotion": "anger", "p": 0.82},
+                                    {"emotion": "disgust", "p": 0.1}],
+                            "model": "wav2vec2-base SER (English, 6-class)"}}
+    monkeypatch.setattr(bot.mod.stt, "transcribe", fake_transcribe)
+
+    bot.mod.media.handle_voice(sess, "v", "", bot.forum_chat_id, 1, sess.topic_id)
+
+    assert seen.get("worker_analyzers") == ["emotion"]
+    users = [h for h in sess.history if h.kind == "user"]
+    assert len(users) == 1
+    text = users[0].text
+    assert "i am so angry right now" in text          # transcript unchanged
+    assert "[Attached file:" in text and "_speech.json" in text
+    path = text.split("[Attached file:", 1)[1].split("]", 1)[0].strip()
+    with open(path) as f:
+        data = json.load(f)
+    assert data["analyzers"] == ["emotion"]
+    assert data["emotion"]["label"] == "anger" and data["emotion"]["confidence"] == 0.82
+
+
+def test_emotion_worker_gates_on_non_speech(monkeypatch):
+    """The emotion analyzer skips (returns no section) when the caller passes an
+    empty transcript — the model is noise on non-speech, so we don't run it.
+    Pure gate: no model, numpy or audio decode is touched."""
+    import speech_worker
+    monkeypatch.setenv("SPEECH_EMOTION_MODEL", "light")   # pick a model to dispatch
+    # text="" → whisper found no speech → skip before any heavy work.
+    assert speech_worker._emotion(None, {"text": ""}) == {}
+    assert speech_worker._emotion(None, {"text": "   "}) == {}
+
+
+def test_emotion_worker_real_clip():
+    """Real inference (regression vs. onnxruntime / model drift): the .venv-stt
+    worker NAMES the emotion on actual clips via the light categorical model — an
+    angry clip reads as 'anger'. Auto-skips where the side-venv / light model /
+    clips aren't present."""
+    import json
+    import os
+    import subprocess
+
+    import pytest
+    bot_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    stt_py = os.path.join(bot_dir, ".venv-stt", "bin", "python")
+    audio = os.path.join(bot_dir, "temp", "test_audio")
+    model = os.path.join(bot_dir, ".venv-stt", "models", "emotion", "light",
+                         "model.onnx")
+    manifest = os.path.join(audio, "manifest.json")
+    if not (os.path.isfile(stt_py) and os.path.isfile(model)
+            and os.path.isfile(manifest)):
+        pytest.skip("STT venv / light emotion model / test clips not present")
+
+    man = json.load(open(manifest))
+
+    def pick(label):
+        for m in man:
+            if m["category"] == "emotion" and m["claimed"] in label:
+                p = os.path.join(audio, m["file"])
+                if os.path.isfile(p):
+                    return p
+        return None
+
+    angry = pick({"anger", "angry"})
+    if not angry:
+        pytest.skip("labelled anger clip not present")
+
+    def predict(clip):
+        env = {**os.environ, "SPEECH_EMOTION_MODEL": "light"}
+        r = subprocess.run([stt_py, os.path.join(bot_dir, "speech_worker.py"),
+                            clip, "emotion"],
+                           capture_output=True, text=True, timeout=120, env=env)
+        assert r.returncode == 0, r.stderr
+        return json.loads(r.stdout)["emotion"]
+
+    a = predict(angry)
+    assert a["label"] == "anger"               # categorical: names the emotion
+    assert 0.0 <= a["confidence"] <= 1.0
+    assert a["top"] and a["top"][0]["emotion"] == "anger"
+
+
+def _force_audio_events_available(monkeypatch):
+    """Pretend the PANNs model files are downloaded regardless of the host —
+    the registry holds availability by reference, so patch the entry's fn."""
+    import speech
+    for a in speech._REGISTRY:
+        if a["id"] == "audio_events":
+            monkeypatch.setitem(a, "available", lambda: True)
+
+
+def test_voice_audio_events_attaches_when_enabled(bot, tmp_path, monkeypatch):
+    """With the worker-side `audio_events` analyzer enabled and its model
+    present: the bot asks the STT worker to run it, the section rides back in
+    the result, and it reaches Claude as the attached JSON — transcript
+    unchanged."""
+    import json
+    import telegram as tg_mod
+    from runtime import rt
+    monkeypatch.setenv("SPEECH_ANALYZERS", "audio_events")
+    monkeypatch.setattr(rt, "upload_dir", str(tmp_path))
+    _force_audio_events_available(monkeypatch)
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
+    monkeypatch.setattr(bot.mod.stt, "available", lambda: True)
+    seen = {}
+
+    def fake_transcribe(path, **kw):
+        seen.update(kw)  # the worker section is computed in .venv-stt; simulate it
+        return {"text": "ahem sorry", "language": "en",
+                "segments": [{"start": 0.0, "end": 1.0, "text": "ahem sorry",
+                              "words": []}],
+                "audio_events": {"events": [{"label": "Cough", "score": 0.73},
+                                            {"label": "Throat clearing",
+                                             "score": 0.30}],
+                                 "model": "PANNs CNN14 (AudioSet 527, 16kHz)"}}
+    monkeypatch.setattr(bot.mod.stt, "transcribe", fake_transcribe)
+
+    bot.mod.media.handle_voice(sess, "v", "", bot.forum_chat_id, 1, sess.topic_id)
+
+    assert seen.get("worker_analyzers") == ["audio_events"]
+    users = [h for h in sess.history if h.kind == "user"]
+    assert len(users) == 1
+    text = users[0].text
+    assert "ahem sorry" in text                        # transcript unchanged
+    assert "[Attached file:" in text and "_speech.json" in text
+    path = text.split("[Attached file:", 1)[1].split("]", 1)[0].strip()
+    with open(path) as f:
+        data = json.load(f)
+    assert data["analyzers"] == ["audio_events"]
+    assert data["audio_events"]["events"][0]["label"] == "Cough"
+
+
+def test_audio_events_worker_degrades_without_model(monkeypatch, tmp_path):
+    """The audio_events analyzer returns no section (never crashes, never loads
+    onnxruntime) when the model file isn't installed — the model check is first,
+    before the waveform is even read, so a missing model degrades cleanly."""
+    import speech_worker
+    monkeypatch.setattr(speech_worker, "_audio_events_dir", lambda: str(tmp_path))
+    # bundle=None is safe: the model-missing check returns before touching it.
+    assert speech_worker._audio_events(None, {"text": ""}) == {}
+
+
+def test_audio_events_worker_real_clip():
+    """Real inference (regression vs. onnxruntime / model drift): the .venv-stt
+    worker tags sound events on an actual non-speech clip. Auto-skips where the
+    side-venv / PANNs model / clip aren't present (e.g. CI, or not downloaded)."""
+    import json
+    import os
+    import subprocess
+
+    import pytest
+    bot_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    stt_py = os.path.join(bot_dir, ".venv-stt", "bin", "python")
+    clip = os.path.join(bot_dir, "temp", "test_audio", "feat_vocal_cough.ogg")
+    model = os.path.join(bot_dir, ".venv-stt", "models", "audio_events",
+                         "Cnn14_16k.onnx")
+    if not (os.path.isfile(stt_py) and os.path.isfile(clip)
+            and os.path.isfile(model)):
+        pytest.skip("STT venv / PANNs model / test clip not present")
+    r = subprocess.run([stt_py, os.path.join(bot_dir, "speech_worker.py"),
+                        clip, "audio_events"],
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stderr
+    ev = json.loads(r.stdout)["audio_events"]["events"]
+    labels = [e["label"] for e in ev]
+    assert "Cough" in labels                           # the clip is a cough
+    assert all(0.0 <= e["score"] <= 1.0 for e in ev)   # sigmoid probabilities
+
+
+def _force_speaker_available(monkeypatch):
+    """Pretend the age-gender ONNX is downloaded regardless of the host — the
+    registry holds availability by reference, so patch the entry's fn."""
+    import speech
+    for a in speech._REGISTRY:
+        if a["id"] == "speaker":
+            monkeypatch.setitem(a, "available", lambda: True)
+
+
+def test_voice_speaker_attaches_when_enabled(bot, tmp_path, monkeypatch):
+    """With the worker-side `speaker` analyzer enabled and its model present: the
+    bot asks the STT worker to run it, the section rides back in the result, and
+    it reaches Claude as the attached JSON — transcript unchanged."""
+    import json
+    import telegram as tg_mod
+    from runtime import rt
+    monkeypatch.setenv("SPEECH_ANALYZERS", "speaker")
+    monkeypatch.setattr(rt, "upload_dir", str(tmp_path))
+    _force_speaker_available(monkeypatch)
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
+    monkeypatch.setattr(bot.mod.stt, "available", lambda: True)
+    seen = {}
+
+    def fake_transcribe(path, **kw):
+        seen.update(kw)  # the worker section is computed in .venv-stt; simulate it
+        return {"text": "hello there", "language": "en",
+                "segments": [{"start": 0.0, "end": 1.0, "text": "hello there",
+                              "words": []}],
+                "speaker": {"gender": "male",
+                            "gender_probs": {"female": 0.04, "male": 0.96,
+                                             "child": 0.0},
+                            "age_years_est": 54.0}}
+    monkeypatch.setattr(bot.mod.stt, "transcribe", fake_transcribe)
+
+    bot.mod.media.handle_voice(sess, "v", "", bot.forum_chat_id, 1, sess.topic_id)
+
+    assert seen.get("worker_analyzers") == ["speaker"]
+    users = [h for h in sess.history if h.kind == "user"]
+    assert len(users) == 1
+    text = users[0].text
+    assert "hello there" in text                        # transcript unchanged
+    assert "[Attached file:" in text and "_speech.json" in text
+    path = text.split("[Attached file:", 1)[1].split("]", 1)[0].strip()
+    with open(path) as f:
+        data = json.load(f)
+    assert data["analyzers"] == ["speaker"]
+    assert data["speaker"]["gender"] == "male"
+    assert data["speaker"]["age_years_est"] == 54.0
+
+
+def test_speaker_worker_degrades_without_model(monkeypatch, tmp_path):
+    """The speaker analyzer returns no section (never crashes, never loads
+    onnxruntime) when the model file isn't installed — the model check runs
+    before the waveform is read, so a missing model degrades cleanly."""
+    import speech_worker
+    monkeypatch.setattr(speech_worker, "_speaker_dir", lambda: str(tmp_path))
+    # bundle=None is safe: the model-missing check returns before touching it.
+    assert speech_worker._speaker(None, {"text": "hello"}) == {}
+
+
+def test_speaker_worker_gates_on_non_speech(monkeypatch):
+    """The speaker analyzer skips (no section) when the caller passes an empty
+    transcript — silence/non-speech has no speaker to estimate. The gate runs
+    before the model/waveform, so bundle=None is safe."""
+    import speech_worker
+    assert speech_worker._speaker(None, {"text": ""}) == {}
+    assert speech_worker._speaker(None, {"text": "   "}) == {}
+
+
+def test_speaker_worker_real_clip():
+    """Real inference (regression vs. onnxruntime / model drift): the .venv-stt
+    worker estimates age & gender on an actual voice clip. Auto-skips where the
+    side-venv / age-gender model / clip aren't present (e.g. CI, or not
+    downloaded)."""
+    import json
+    import os
+    import subprocess
+
+    import pytest
+    bot_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    stt_py = os.path.join(bot_dir, ".venv-stt", "bin", "python")
+    clip = os.path.join(bot_dir, "temp", "test_audio", "ru_emotion_29.ogg")
+    model = os.path.join(bot_dir, ".venv-stt", "models", "speaker", "model.onnx")
+    if not (os.path.isfile(stt_py) and os.path.isfile(clip)
+            and os.path.isfile(model)):
+        pytest.skip("STT venv / age-gender model / test clip not present")
+    r = subprocess.run([stt_py, os.path.join(bot_dir, "speech_worker.py"),
+                        clip, "speaker"],
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stderr
+    sp = json.loads(r.stdout)["speaker"]
+    assert sp["gender"] in ("female", "male", "child")
+    assert abs(sum(sp["gender_probs"].values()) - 1.0) < 0.02   # softmax probs
+    assert isinstance(sp["age_years_est"], int | float)
+
+
+def _force_diarization_available(monkeypatch):
+    """Pretend sherpa-onnx + the two diarization models are present regardless of
+    the host — the registry holds availability by reference, so patch the fn."""
+    import speech
+    for a in speech._REGISTRY:
+        if a["id"] == "diarization":
+            monkeypatch.setitem(a, "available", lambda: True)
+
+
+def test_voice_diarization_attaches_when_enabled(bot, tmp_path, monkeypatch):
+    """With the worker-side `diarization` analyzer enabled and its models present:
+    the bot asks the STT worker to run it, the section rides back in the result,
+    and it reaches Claude as the attached JSON — transcript unchanged."""
+    import json
+    import telegram as tg_mod
+    from runtime import rt
+    monkeypatch.setenv("SPEECH_ANALYZERS", "diarization")
+    monkeypatch.setattr(rt, "upload_dir", str(tmp_path))
+    _force_diarization_available(monkeypatch)
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
+    monkeypatch.setattr(bot.mod.stt, "available", lambda: True)
+    seen = {}
+
+    def fake_transcribe(path, **kw):
+        seen.update(kw)  # the worker section is computed in .venv-stt; simulate it
+        return {"text": "hi there", "language": "en",
+                "segments": [{"start": 0.0, "end": 1.0, "text": "hi there",
+                              "words": []}],
+                "diarization": {"num_speakers": 2,
+                                "turns": [{"speaker": 0, "start": 0.0, "end": 1.0},
+                                          {"speaker": 1, "start": 1.2, "end": 2.0}]}}
+    monkeypatch.setattr(bot.mod.stt, "transcribe", fake_transcribe)
+
+    bot.mod.media.handle_voice(sess, "v", "", bot.forum_chat_id, 1, sess.topic_id)
+
+    assert seen.get("worker_analyzers") == ["diarization"]
+    users = [h for h in sess.history if h.kind == "user"]
+    assert len(users) == 1
+    text = users[0].text
+    assert "hi there" in text                           # transcript unchanged
+    assert "[Attached file:" in text and "_speech.json" in text
+    path = text.split("[Attached file:", 1)[1].split("]", 1)[0].strip()
+    with open(path) as f:
+        data = json.load(f)
+    assert data["analyzers"] == ["diarization"]
+    assert data["diarization"]["num_speakers"] == 2
+
+
+def test_diarization_worker_degrades_without_model(monkeypatch, tmp_path):
+    """The diarization analyzer returns no section (never crashes, never imports
+    sherpa-onnx) when the models aren't installed — the model check runs before
+    the waveform is read, so a missing model degrades cleanly."""
+    import speech_worker
+    monkeypatch.setattr(speech_worker, "_diarization_dir", lambda: str(tmp_path))
+    assert speech_worker._diarization(None, {"text": "hi"}) == {}
+
+
+def test_diarization_worker_gates_on_non_speech(monkeypatch):
+    """The diarization analyzer skips (no section) on an empty transcript —
+    silence has no speakers to separate. The gate runs before the model/waveform,
+    so bundle=None is safe."""
+    import speech_worker
+    assert speech_worker._diarization(None, {"text": ""}) == {}
+    assert speech_worker._diarization(None, {"text": "   "}) == {}
+
+
+def test_diarization_worker_real_two_speakers():
+    """Real inference (regression vs. sherpa-onnx / model drift): a female+male
+    clip diarizes to exactly 2 speakers, and the worker's stdout stays a single
+    clean JSON line (sherpa-onnx logging is redirected). Auto-skips where the
+    side-venv / sherpa-onnx / models / clip aren't present (e.g. CI)."""
+    import glob
+    import json
+    import os
+    import subprocess
+
+    import pytest
+    bot_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    stt_py = os.path.join(bot_dir, ".venv-stt", "bin", "python")
+    clip = os.path.join(bot_dir, "temp", "test_audio", "feat_two_speakers.wav")
+    seg = os.path.join(bot_dir, ".venv-stt", "models", "diarization",
+                       "segmentation.onnx")
+    has_pkg = bool(glob.glob(os.path.join(
+        bot_dir, ".venv-stt", "lib", "python*", "site-packages", "sherpa_onnx*")))
+    if not (os.path.isfile(stt_py) and os.path.isfile(clip)
+            and os.path.isfile(seg) and has_pkg):
+        pytest.skip("STT venv / sherpa-onnx / model / 2-speaker clip not present")
+    r = subprocess.run([stt_py, os.path.join(bot_dir, "speech_worker.py"),
+                        clip, "diarization"],
+                       capture_output=True, text=True, timeout=180)
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)["diarization"]      # stdout is clean JSON
+    assert out["num_speakers"] == 2
 
 
 # ── upload retention (#87) ──────────────────────────────────────────

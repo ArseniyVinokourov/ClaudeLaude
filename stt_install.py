@@ -12,6 +12,7 @@ Calls block for minutes (pip + model download) — callers run them on a
 daemon thread. A module lock serializes installs; ``busy()`` lets the UI
 refuse a second click instead of queueing.
 """
+import contextlib
 import os
 import subprocess
 import sys
@@ -104,4 +105,145 @@ def install_whisper(model: str) -> bool:
                      "compute_type='int8')"]):
             return False
         _persist_model(model)
+        return True
+
+
+def install_analyzer(deps: list[str]) -> bool:
+    """Install a speech-analyzer's pip deps into ``.venv-stt`` (#126).
+
+    Used by ``speech.install`` for worker-side analyzers (e.g. prosody →
+    ``praat-parselmouth``). Pure pip, no model download — analyzers that pull
+    a model handle that themselves (and must target a roomy drive, NOT the
+    space-tight one; see the speech tooling notes). Reuses the same venv,
+    lock and runner as the whisper tiers."""
+    if not deps:
+        return False
+    with _lock:
+        if not _ensure_venv():
+            return False
+        return _run([_STT_PY, "-m", "pip", "install", "-q", *deps])
+
+
+def download_model(url: str, dest: str) -> bool:
+    """Download an analyzer's model file (e.g. an ONNX SER model) into the
+    side-venv's models dir (#126).
+
+    Some worker analyzers need a model file, not just pip deps (emotion →
+    wav2vec2 ONNX). Streams to ``dest + '.part'`` then renames, so an aborted
+    download never looks complete. Uses ``requests`` (a bot-venv dep) and the
+    same lock/timeout as the pip installs, so only one heavy install runs at a
+    time and ``busy()`` can refuse a second click. The file lands on whatever
+    drive ``.venv-stt`` is on — keep that the roomy one (models are large)."""
+    if not url or not dest:
+        return False
+    if os.path.isfile(dest):
+        return True
+    import requests
+    tmp = dest + ".part"
+    with _lock:
+        try:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with requests.get(url, stream=True, timeout=_TIMEOUT) as r:
+                r.raise_for_status()
+                with open(tmp, "wb") as f:
+                    for chunk in r.iter_content(1 << 20):
+                        f.write(chunk)
+            os.replace(tmp, dest)
+            return True
+        except Exception as e:  # noqa: BLE001
+            _log(f"download_model {url[:60]}... failed: {e}")
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+            return False
+
+
+def download_archive(url: str, member: str, dest: str) -> bool:
+    """Download a model archive (.zip or .tar.*) and extract one member to
+    ``dest`` (#126).
+
+    Same contract as ``download_model`` but for analyzers whose only published
+    source is an archive (speaker → audeering's age-gender ZIP on Zenodo;
+    diarization → sherpa-onnx's segmentation tar.bz2). Streams the archive to a
+    temp file, extracts ``member`` (a path inside it) to ``dest + '.part'`` then
+    renames, and always removes the archive — so an aborted download never looks
+    complete. Reuses the module lock/timeout like the other installs."""
+    if not url or not dest:
+        return False
+    if os.path.isfile(dest):
+        return True
+    import tarfile
+    import zipfile
+
+    import requests
+    apath = dest + ".arc.part"
+    tmp = dest + ".part"
+    with _lock:
+        try:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with requests.get(url, stream=True, timeout=_TIMEOUT) as r:
+                r.raise_for_status()
+                with open(apath, "wb") as f:
+                    for chunk in r.iter_content(1 << 20):
+                        f.write(chunk)
+            if zipfile.is_zipfile(apath):
+                with zipfile.ZipFile(apath) as z:
+                    src = z.open(member)
+            else:                                   # .tar / .tar.bz2 / .tar.gz
+                src = tarfile.open(apath).extractfile(member)
+            if src is None:
+                raise KeyError(f"member not found: {member}")
+            with src, open(tmp, "wb") as out:
+                while True:
+                    buf = src.read(1 << 20)
+                    if not buf:
+                        break
+                    out.write(buf)
+            os.replace(tmp, dest)
+            return True
+        except Exception as e:  # noqa: BLE001
+            _log(f"download_archive {url[:60]}... failed: {e}")
+            return False
+        finally:
+            for p in (apath, tmp):
+                with contextlib.suppress(OSError):
+                    os.remove(p)
+
+
+def install_ser(ser_venv: str, deps: list[str], repo: str,
+                marker_dir: str) -> bool:
+    """Build the SEPARATE torch venv for the 'accurate' emotion model and fetch
+    the model into the HF cache (#126). Heavy (~4 GB) — kept out of .venv-stt so
+    the light path stays torch-free. Writes a ``.ready`` marker in ``marker_dir``
+    on success. CPU torch (small wheel) via the pytorch CPU index; everything
+    else from PyPI. Reuses the module lock + timeout, so only one heavy install
+    runs at a time and ``busy()`` can refuse a second click."""
+    ser_py = os.path.join(ser_venv, "bin", "python")
+    with _lock:
+        if not os.path.isfile(ser_py):
+            if not _run([sys.executable, "-m", "venv", ser_venv]):
+                return False
+            _run([ser_py, "-m", "pip", "install", "-q", "--upgrade", "pip"])
+        torch_pkgs = [d for d in deps if d.split("==")[0] in ("torch", "torchaudio")]
+        other = [d for d in deps if d not in torch_pkgs]
+        if torch_pkgs and not _run([ser_py, "-m", "pip", "install", "-q",
+                                    *torch_pkgs, "--index-url",
+                                    "https://download.pytorch.org/whl/cpu"]):
+            return False
+        if other and not _run([ser_py, "-m", "pip", "install", "-q", *other]):
+            return False
+        # Trigger the model download AND verify it loads (executes the repo's
+        # custom code via trust_remote_code — the owner opted into this model).
+        code = ("from transformers import AutoModelForAudioClassification,"
+                " AutoProcessor;"
+                f"AutoProcessor.from_pretrained('{repo}', trust_remote_code=True);"
+                f"AutoModelForAudioClassification.from_pretrained('{repo}',"
+                " trust_remote_code=True, low_cpu_mem_usage=False)")
+        if not _run([ser_py, "-c", code]):
+            return False
+        try:
+            os.makedirs(marker_dir, exist_ok=True)
+            open(os.path.join(marker_dir, ".ready"), "w").close()
+        except OSError as e:
+            _log(f"marker write failed: {e}")
+            return False
         return True
