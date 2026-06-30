@@ -318,10 +318,64 @@ def _audio_events(bundle, ctx):
     }
 
 
+# ── analyzer: speaker (age & gender, Tier B — wav2vec2 ONNX, no torch) ──
+# Rough speaker traits from the waveform via audeering's age-gender ONNX (6-layer
+# wav2vec2-large-robust, 363MB, ~0.5GB RAM). Input `signal` [1, time] = raw 16k,
+# zero-mean/unit-var normalized (the audeering preprocessing). Outputs: logits_age
+# (0..1 -> 0..100 years) and logits_gender (raw logits over female/male/child, per
+# model.yaml). Gated on the transcript: no speech -> no speaker estimate. The
+# result is an ESTIMATE (age is rough), framed as such for Claude.
+_SPEAKER_GENDER = ["female", "male", "child"]   # logits_gender order (model.yaml)
+
+
+def _speaker_dir():
+    return os.path.join(_STT_VENV, "models", "speaker")
+
+
+def _speaker(bundle, ctx):
+    """Estimate age & gender from the voice (audeering wav2vec2 age-gender ONNX,
+    onnxruntime + numpy, no torch). A hint, not a fact — gender as a probability,
+    age only roughly."""
+    text = ctx.get("text")
+    if text is not None and not text.strip():
+        return {}  # gate on speech: silence/non-speech has no speaker to estimate
+    model = os.path.join(_speaker_dir(), "model.onnx")
+    if not os.path.isfile(model):
+        return {}
+    samples = bundle.samples
+    if samples.size < bundle.sr * _MIN_SECONDS:
+        return {}
+
+    import numpy as np
+    import onnxruntime as ort
+    x = samples.astype("float32")
+    x = (x - x.mean()) / (x.std() + 1e-7)        # audeering: zero-mean unit-var
+    with _heavy_lock():  # one heavy model resident at a time (anti-OOM)
+        sess = ort.InferenceSession(model, providers=["CPUExecutionProvider"])
+        age, gender = sess.run(["logits_age", "logits_gender"],
+                               {"signal": x[None, :]})
+    g = gender[0]
+    e = np.exp(g - g.max())
+    p = e / e.sum()                              # softmax: logits_gender are raw
+    top = int(np.argmax(p))
+    return {
+        "gender": _SPEAKER_GENDER[top],
+        "gender_probs": {_SPEAKER_GENDER[i]: _round(float(p[i]), 2)
+                         for i in range(len(_SPEAKER_GENDER))},
+        "age_years_est": _round(float(age[0][0]) * 100, 0),
+        "model": "audeering wav2vec2-large-robust age-gender (6-layer, 16k)",
+        "note": ("acoustic ESTIMATE from the voice: gender as a probability, age "
+                 "only roughly (often off by 10+ years, and acted/atypical voices "
+                 "fool it). A hint, not a fact — do not state it as the speaker's "
+                 "real age or gender."),
+    }
+
+
 _ANALYZERS = {
     "prosody": _prosody,
     "emotion": _emotion,
     "audio_events": _audio_events,
+    "speaker": _speaker,
 }
 
 

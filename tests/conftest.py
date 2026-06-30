@@ -57,8 +57,11 @@ def bot_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     # at import with override=False, so any knob the fixture doesn't pin leaks
     # in from the developer's real .env — a local SPEECH_ANALYZERS=timing toggle
     # would otherwise add an analysis attachment that count-asserting media
-    # tests don't expect. The two dedicated speech tests override this.
+    # tests don't expect. The dedicated speech tests override these. emotion has
+    # its OWN knob (SPEECH_EMOTION_MODEL), so pin it too or a developer's
+    # emotion=light .env leaks an extra worker analyzer into every test.
     monkeypatch.setenv("SPEECH_ANALYZERS", "")
+    monkeypatch.setenv("SPEECH_EMOTION_MODEL", "")
     monkeypatch.setenv("BOT_STATE_FILE", str(state_file))
     monkeypatch.setenv("BOT_SESSIONS_FILE", str(sessions_file))
     monkeypatch.setenv("BOT_MIRRORS_FILE", str(mirrors_file))

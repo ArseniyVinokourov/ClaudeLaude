@@ -157,6 +157,50 @@ def download_model(url: str, dest: str) -> bool:
             return False
 
 
+def download_archive(url: str, member: str, dest: str) -> bool:
+    """Download a .zip model archive and extract one member to ``dest`` (#126).
+
+    Same contract as ``download_model`` but for analyzers whose only published
+    source is a zip (speaker → audeering's age-gender ZIP on Zenodo). Streams the
+    zip to a temp file, extracts ``member`` (a path inside it) to ``dest +
+    '.part'`` then renames, and always removes the zip — so an aborted download
+    never looks complete. Reuses the module lock/timeout like the other
+    installs."""
+    if not url or not dest:
+        return False
+    if os.path.isfile(dest):
+        return True
+    import zipfile
+
+    import requests
+    apath = dest + ".arc.part"
+    tmp = dest + ".part"
+    with _lock:
+        try:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with requests.get(url, stream=True, timeout=_TIMEOUT) as r:
+                r.raise_for_status()
+                with open(apath, "wb") as f:
+                    for chunk in r.iter_content(1 << 20):
+                        f.write(chunk)
+            with zipfile.ZipFile(apath) as z, z.open(member) as src, \
+                    open(tmp, "wb") as out:
+                while True:
+                    buf = src.read(1 << 20)
+                    if not buf:
+                        break
+                    out.write(buf)
+            os.replace(tmp, dest)
+            return True
+        except Exception as e:  # noqa: BLE001
+            _log(f"download_archive {url[:60]}... failed: {e}")
+            return False
+        finally:
+            for p in (apath, tmp):
+                with contextlib.suppress(OSError):
+                    os.remove(p)
+
+
 def install_ser(ser_venv: str, deps: list[str], repo: str,
                 marker_dir: str) -> bool:
     """Build the SEPARATE torch venv for the 'accurate' emotion model and fetch

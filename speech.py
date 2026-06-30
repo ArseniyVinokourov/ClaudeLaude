@@ -271,6 +271,28 @@ def _audio_events_available():
                for f in _AUDIO_EVENTS_FILES)
 
 
+# ── analyzer: speaker (Phase 3, worker-side — wav2vec2 age-gender ONNX) ──
+# Rough speaker traits (age estimate + gender probability) from the waveform.
+# Compute lives in `speech_worker._speaker` (onnxruntime + numpy, no torch).
+# audeering's official ONNX export (wav2vec2-large-robust fine-tuned on aGender/
+# CommonVoice/TIMIT/VoxCeleb2); the SMALL 6-layer variant — 363 MB, ~0.5 GB RAM,
+# language-agnostic — so, like audio_events, it's a fixed `archive` (the only
+# source is a Zenodo .zip) fetched on enable into `.venv-stt/models/speaker/`.
+# The output is an ESTIMATE, never a fact (age is rough); framed as such to Claude.
+_SPEAKER_ARCHIVE = {
+    "url": ("https://zenodo.org/records/7761387/files/"
+            "w2v2-L-robust-6-age-gender.25c844af-1.1.1.zip?download=1"),
+    "member": "model.onnx", "name": "model.onnx",
+}
+_SPEAKER_SIZE_MB = 363
+
+
+def _speaker_available():
+    """True once the age-gender ONNX is extracted into the side-venv. onnxruntime
+    + numpy already ship with .venv-stt, so only the model file gates it."""
+    return os.path.isfile(os.path.join(_model_dir("speaker", ""), "model.onnx"))
+
+
 # ── registry ───────────────────────────────────────────────────────────
 # `where`: "inprocess" runs in the bot on the transcript result; "worker" runs
 # in `.venv-stt` during transcription and arrives pre-computed in `result`.
@@ -292,6 +314,10 @@ _REGISTRY = [
      "where": "worker", "deps": [], "files": _AUDIO_EVENTS_FILES,
      "size_mb": _AUDIO_EVENTS_SIZE_MB,
      "available": _audio_events_available, "run": None},
+    {"id": "speaker", "title": "Age & gender (estimate)", "needs_install": True,
+     "where": "worker", "deps": [], "archive": _SPEAKER_ARCHIVE,
+     "size_mb": _SPEAKER_SIZE_MB,
+     "available": _speaker_available, "run": None},
 ]
 
 
@@ -375,7 +401,14 @@ def install(aid):
             if not stt_install.download_model(f["url"],
                                               os.path.join(d, f["name"])):
                 return False
-    return bool(a.get("deps") or files)
+    # Zip archive (speaker): the only source is a .zip, so fetch + extract one
+    # member into the model dir.
+    arch = a.get("archive")
+    if arch:
+        dest = os.path.join(_model_dir(aid, ""), arch["name"])
+        if not stt_install.download_archive(arch["url"], arch["member"], dest):
+            return False
+    return bool(a.get("deps") or files or arch)
 
 
 def _install_emotion():

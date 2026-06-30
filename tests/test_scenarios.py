@@ -2599,6 +2599,104 @@ def test_audio_events_worker_real_clip():
     assert all(0.0 <= e["score"] <= 1.0 for e in ev)   # sigmoid probabilities
 
 
+def _force_speaker_available(monkeypatch):
+    """Pretend the age-gender ONNX is downloaded regardless of the host — the
+    registry holds availability by reference, so patch the entry's fn."""
+    import speech
+    for a in speech._REGISTRY:
+        if a["id"] == "speaker":
+            monkeypatch.setitem(a, "available", lambda: True)
+
+
+def test_voice_speaker_attaches_when_enabled(bot, tmp_path, monkeypatch):
+    """With the worker-side `speaker` analyzer enabled and its model present: the
+    bot asks the STT worker to run it, the section rides back in the result, and
+    it reaches Claude as the attached JSON — transcript unchanged."""
+    import json
+    import telegram as tg_mod
+    from runtime import rt
+    monkeypatch.setenv("SPEECH_ANALYZERS", "speaker")
+    monkeypatch.setattr(rt, "upload_dir", str(tmp_path))
+    _force_speaker_available(monkeypatch)
+    _start_bot_session(bot, tmp_path)
+    sess = next(iter(bot.mod.mgr._sessions.values()))
+    monkeypatch.setattr(tg_mod, "download_file", lambda fid, dest: True)
+    monkeypatch.setattr(bot.mod.stt, "available", lambda: True)
+    seen = {}
+
+    def fake_transcribe(path, **kw):
+        seen.update(kw)  # the worker section is computed in .venv-stt; simulate it
+        return {"text": "hello there", "language": "en",
+                "segments": [{"start": 0.0, "end": 1.0, "text": "hello there",
+                              "words": []}],
+                "speaker": {"gender": "male",
+                            "gender_probs": {"female": 0.04, "male": 0.96,
+                                             "child": 0.0},
+                            "age_years_est": 54.0}}
+    monkeypatch.setattr(bot.mod.stt, "transcribe", fake_transcribe)
+
+    bot.mod.media.handle_voice(sess, "v", "", bot.forum_chat_id, 1, sess.topic_id)
+
+    assert seen.get("worker_analyzers") == ["speaker"]
+    users = [h for h in sess.history if h.kind == "user"]
+    assert len(users) == 1
+    text = users[0].text
+    assert "hello there" in text                        # transcript unchanged
+    assert "[Attached file:" in text and "_speech.json" in text
+    path = text.split("[Attached file:", 1)[1].split("]", 1)[0].strip()
+    with open(path) as f:
+        data = json.load(f)
+    assert data["analyzers"] == ["speaker"]
+    assert data["speaker"]["gender"] == "male"
+    assert data["speaker"]["age_years_est"] == 54.0
+
+
+def test_speaker_worker_degrades_without_model(monkeypatch, tmp_path):
+    """The speaker analyzer returns no section (never crashes, never loads
+    onnxruntime) when the model file isn't installed — the model check runs
+    before the waveform is read, so a missing model degrades cleanly."""
+    import speech_worker
+    monkeypatch.setattr(speech_worker, "_speaker_dir", lambda: str(tmp_path))
+    # bundle=None is safe: the model-missing check returns before touching it.
+    assert speech_worker._speaker(None, {"text": "hello"}) == {}
+
+
+def test_speaker_worker_gates_on_non_speech(monkeypatch):
+    """The speaker analyzer skips (no section) when the caller passes an empty
+    transcript — silence/non-speech has no speaker to estimate. The gate runs
+    before the model/waveform, so bundle=None is safe."""
+    import speech_worker
+    assert speech_worker._speaker(None, {"text": ""}) == {}
+    assert speech_worker._speaker(None, {"text": "   "}) == {}
+
+
+def test_speaker_worker_real_clip():
+    """Real inference (regression vs. onnxruntime / model drift): the .venv-stt
+    worker estimates age & gender on an actual voice clip. Auto-skips where the
+    side-venv / age-gender model / clip aren't present (e.g. CI, or not
+    downloaded)."""
+    import json
+    import os
+    import subprocess
+
+    import pytest
+    bot_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    stt_py = os.path.join(bot_dir, ".venv-stt", "bin", "python")
+    clip = os.path.join(bot_dir, "temp", "test_audio", "ru_emotion_29.ogg")
+    model = os.path.join(bot_dir, ".venv-stt", "models", "speaker", "model.onnx")
+    if not (os.path.isfile(stt_py) and os.path.isfile(clip)
+            and os.path.isfile(model)):
+        pytest.skip("STT venv / age-gender model / test clip not present")
+    r = subprocess.run([stt_py, os.path.join(bot_dir, "speech_worker.py"),
+                        clip, "speaker"],
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stderr
+    sp = json.loads(r.stdout)["speaker"]
+    assert sp["gender"] in ("female", "male", "child")
+    assert abs(sum(sp["gender_probs"].values()) - 1.0) < 0.02   # softmax probs
+    assert isinstance(sp["age_years_est"], int | float)
+
+
 # ── upload retention (#87) ──────────────────────────────────────────
 
 def _make_upload(updir, name, age_s, content=b"x"):
