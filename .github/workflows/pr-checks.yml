@@ -1,7 +1,14 @@
 name: pr-checks
 
+# pull_request_target (not pull_request) so the GITHUB_TOKEN keeps write
+# access on PRs from forks — otherwise the feedback comment can't be posted
+# (fork PRs get a read-only token on the plain pull_request event).
+# Safe here: this workflow only inspects PR metadata (branch/title/body/diff
+# names) and never executes fork code. checkout defaults to the trusted base
+# ref, so pr-validate.sh and this workflow run from main, not the PR.
+# Code-executing jobs (pytest) live in tests.yml and MUST stay on pull_request.
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, edited, synchronize, reopened]
 
 permissions:
