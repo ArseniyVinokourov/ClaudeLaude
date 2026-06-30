@@ -26,6 +26,7 @@ import time
 from dataclasses import dataclass, field
 
 import audit
+import stickers
 import telegram as tg
 from branding import PRODUCT_NAME
 from config import get_forum_chat_id
@@ -362,6 +363,12 @@ class TurnController:
                 session.topic_id, self._default_display)
         if mode == "mobile":
             text = _md_table_to_list(text)
+        # Pull any ⟦sticker:id⟧ markers out of the text; matching stickers are
+        # sent as their own messages right after the reply. No marker → cheap
+        # regex, no catalog read.
+        sticker_file_ids: list[str] = []
+        if stickers.has_marker(text):
+            text, sticker_file_ids = stickers.extract(text)
         fid = get_forum_chat_id()
         if fid:
             # Drop the "⏳ Thinking…"/⚙️ status right before the reply lands so
@@ -369,12 +376,19 @@ class TurnController:
             # If more work follows (a tool after this text), on_tool_use
             # recreates the status; end_turn is the final fallback.
             self._finish_status(session, turn)
-            ids = tg.send_long(text, fid, thread_id=session.topic_id,
-                               markdown=True)
-            turn.msg_ids.extend(ids)
-            turn.msg_texts.append(text)
-            for mid in ids:
-                self._record_topic_msg(session.topic_id, mid)
+            if text:
+                ids = tg.send_long(text, fid, thread_id=session.topic_id,
+                                   markdown=True)
+                turn.msg_ids.extend(ids)
+                turn.msg_texts.append(text)
+                for mid in ids:
+                    self._record_topic_msg(session.topic_id, mid)
+            for st_file_id in sticker_file_ids:
+                smid = tg.send_sticker(fid, st_file_id,
+                                       thread_id=session.topic_id)
+                if smid:
+                    turn.msg_ids.append(smid)
+                    self._record_topic_msg(session.topic_id, smid)
 
     def on_result(self, session, result_text, summary):
         if not session.topic_id:

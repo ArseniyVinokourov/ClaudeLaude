@@ -21,6 +21,7 @@ from config import (OWNER_ID, BOT_DIR,
                     is_killed, activate_kill, deactivate_kill)
 import audit
 import frames
+import stickers
 import stt
 import telegram as tg
 import tour
@@ -815,6 +816,10 @@ def main():
     threading.Thread(target=_device_monitor_loop, daemon=True).start()
     tg.set_my_commands(_BOT_COMMANDS)
     threading.Thread(target=_auto_update_loop, daemon=True).start()
+    # Seed the sticker catalog from STICKER_SETS (off the startup path —
+    # getStickerSet hits the network; a no-op when no sets are configured).
+    threading.Thread(target=stickers.seed_from_env, daemon=True,
+                     name="bot-bg-stickerseed").start()
     dashboard.refresh_usage()
     dashboard.sync()
     _admin_sanity_check()
@@ -1040,6 +1045,10 @@ def _handle_update(u):
             return
         emoji = sticker.get("emoji") or ""
         set_name = sticker.get("set_name") or ""
+        # Auto-learn: remember this sticker's file_id so the bot can send it
+        # back later (the catalog grows toward stickers actually in use).
+        stickers.learn(sticker.get("file_id", ""), emoji=emoji,
+                       set_name=set_name)
         if set_name and emoji:
             ident = f" {emoji} (from pack \"{set_name}\")"
         elif set_name:

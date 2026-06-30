@@ -17,6 +17,7 @@ import uuid
 from dataclasses import dataclass, field
 from collections.abc import Callable
 
+import stickers
 from config import CLAUDE_BIN as _CLAUDE_BIN
 from formatting import IMAGE_EXTS as _IMAGE_EXTS
 
@@ -548,6 +549,12 @@ class SessionManager:
                       file=sys.stderr, flush=True)
         if preset["style"]:
             append_parts.append(preset["style"])
+        # Bot sessions only: catalog of sendable stickers + how to use them.
+        # No-op (empty suffix) when the feature is off or the catalog is empty.
+        if session.is_bot_spawned:
+            sticker_suffix = stickers.session_suffix()
+            if sticker_suffix:
+                append_parts.append(sticker_suffix)
         if append_parts:
             cmd.extend(["--append-system-prompt", "\n\n".join(append_parts)])
         if session.claude_session_id:
